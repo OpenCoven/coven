@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(trash:*)",
+      "Bash(mkdir:*)",
+      "Bash(touch:*)",
+      "Bash(cp:*)",
+      "Bash(mv:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ],
+    "ask": [],
+    "deny": [
+      "Bash(rm:*)",
+      "Bash(git push:*)",
+      "Bash(git tag:*)"
+    ],
+    "additionalDirectories": []
+  }
+}

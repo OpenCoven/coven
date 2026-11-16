@@ -242,7 +242,6 @@ pub(crate) fn create_dir_all(path: &Path) -> Result<()> {
     // creator's retained registry. Child basenames preserve filesystem case and
     // normalization rules, unlike hashes of raw filename bytes.
     let registry = parent_dir.open_dir_nofollow(PUBLICATION_DIRECTORY)?;
-    let registry_path = parent.join(PUBLICATION_DIRECTORY);
     #[cfg(windows)]
     ensure_matching_case_rules(&parent_dir, &registry)?;
     let name = path.file_name().context("directory has no component")?;
@@ -311,7 +310,7 @@ pub(crate) fn create_dir_all(path: &Path) -> Result<()> {
         // must not let the next attempt skip its failed publication barrier.
         return Err(error);
     }
-    remove_completed_marker(&registry, &registry_path, name, &publication)
+    remove_completed_marker(&registry, name, &publication)
 }
 
 /// The marker needs no independent sync: process death retains it, and after
@@ -320,18 +319,16 @@ pub(crate) fn create_dir_all(path: &Path) -> Result<()> {
 /// power loss merely repeats a successful publication.
 fn remove_completed_marker(
     registry: &cap_std::fs::Dir,
-    registry_path: &Path,
     name: &std::ffi::OsStr,
     publication: &File,
 ) -> Result<()> {
     #[cfg(windows)]
     {
         let _ = name;
-        remove_completed_windows_marker(registry, registry_path, publication)
+        remove_completed_windows_marker(registry, publication)
     }
     #[cfg(not(windows))]
     {
-        let _ = registry_path;
         let _ = publication;
         match registry.remove_file(name) {
             Ok(()) => Ok(()),
@@ -342,11 +339,7 @@ fn remove_completed_marker(
 }
 
 #[cfg(windows)]
-fn remove_completed_windows_marker(
-    registry: &cap_std::fs::Dir,
-    registry_path: &Path,
-    publication: &File,
-) -> Result<()> {
+fn remove_completed_windows_marker(registry: &cap_std::fs::Dir, publication: &File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
@@ -359,7 +352,7 @@ fn remove_completed_windows_marker(
     // while any creator retains the old file. A crash after this rename leaves
     // only a harmless completed-file name; a crash before it repeats barriers.
     let retired = std::ffi::OsString::from(format!(".completed-{}", uuid::Uuid::new_v4()));
-    if let Err(error) = rename_marker_handle(registry_path, registry, publication, &retired) {
+    if let Err(error) = rename_marker_handle(registry, publication, &retired) {
         if marker_already_removed(publication) {
             return Ok(());
         }
@@ -396,135 +389,62 @@ fn remove_completed_windows_marker(
 /// Rename this retained file, never whichever file now has its original name.
 #[cfg(windows)]
 fn rename_marker_handle(
-    registry_path: &Path,
     registry: &cap_std::fs::Dir,
     publication: &File,
     destination: &std::ffi::OsStr,
 ) -> Result<()> {
-    use cap_fs_ext::DirExt;
-    use std::{
-        os::windows::{ffi::OsStrExt, io::AsRawHandle},
-        path::{Component, PathBuf},
+    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileRenameInformation, NtSetInformationFile, FILE_RENAME_INFORMATION,
+        FILE_RENAME_INFORMATION_0,
     };
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileRenameInfo, GetFileInformationByHandle, SetFileInformationByHandle,
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_RENAME_INFO,
-    };
-    // The absolute-name form is more widely supported than a
-    // RootDirectory-relative FILE_RENAME_INFO. Windows cap-std directory
-    // handles omit FILE_SHARE_DELETE, so retaining every no-follow ancestor
-    // prevents the absolute destination from being redirected during rename.
-    let absolute_path =
-        std::path::absolute(registry_path).context("resolving directory publication registry")?;
-    let mut components = absolute_path.components();
-    let Some(Component::Prefix(_)) = components.next() else {
-        anyhow::bail!("directory publication registry path has no prefix");
-    };
-    let Some(Component::RootDir) = components.next() else {
-        anyhow::bail!("directory publication registry path is not absolute");
-    };
-    let root = absolute_path.components().take(2).collect::<PathBuf>();
-    let mut resolved_path = root.clone();
-    let mut directories =
-        vec![
-            cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority())
-                .context("opening directory publication registry root")?,
-        ];
-    for component in components {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                anyhow::ensure!(
-                    directories.len() > 1,
-                    "directory publication registry escaped its root"
-                );
-                drop(directories.pop());
-                resolved_path.pop();
-            }
-            Component::Normal(name) => {
-                let child = directories
-                    .last()
-                    .expect("registry root is open")
-                    .open_dir_nofollow(name)
-                    .context("opening directory publication registry ancestor")?;
-                directories.push(child);
-                resolved_path.push(name);
-            }
-            Component::Prefix(_) | Component::RootDir => {
-                anyhow::bail!("directory publication registry path has an invalid component")
-            }
-        }
-    }
-    let mut named_info = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: both live directory handles and the correctly sized output
-    // structure remain valid through each identity query.
-    let named_result = unsafe {
-        GetFileInformationByHandle(
-            directories
-                .last()
-                .expect("registry root is open")
-                .as_raw_handle(),
-            &mut named_info,
-        )
-    };
-    if named_result == 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("checking directory publication registry path");
-    }
-    let mut retained_info = BY_HANDLE_FILE_INFORMATION::default();
-    let retained_result =
-        unsafe { GetFileInformationByHandle(registry.as_raw_handle(), &mut retained_info) };
-    if retained_result == 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("checking retained directory publication registry");
-    }
-    anyhow::ensure!(
-        named_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
-            && named_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
-            && named_info.dwVolumeSerialNumber == retained_info.dwVolumeSerialNumber
-            && named_info.nFileIndexHigh == retained_info.nFileIndexHigh
-            && named_info.nFileIndexLow == retained_info.nFileIndexLow,
-        "directory publication registry path identity changed"
-    );
-    let destination_path = resolved_path.join(destination);
-    let encoded: Vec<u16> = destination_path.as_os_str().encode_wide().collect();
-    anyhow::ensure!(!encoded.is_empty(), "completed marker path is empty");
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    let encoded: Vec<u16> = destination.encode_wide().collect();
+    anyhow::ensure!(!encoded.is_empty(), "completed marker name is empty");
     let name_bytes = encoded
         .len()
         .checked_mul(std::mem::size_of::<u16>())
-        .context("completed marker path is too long")?;
-    let name_length = u32::try_from(name_bytes).context("completed marker path is too long")?;
-    // Include the complete native structure, including trailing alignment
-    // padding, in addition to the variable-length filename.
-    let bytes = std::mem::size_of::<FILE_RENAME_INFO>()
+        .context("completed marker name is too long")?;
+    let name_length = u32::try_from(name_bytes).context("completed marker name is too long")?;
+    let offset = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+    let bytes = offset
         .checked_add(name_bytes)
         .context("completed marker rename buffer is too large")?;
     let buffer_length =
         u32::try_from(bytes).context("completed marker rename buffer is too large")?;
-    let mut buffer = vec![0_u64; bytes.div_ceil(std::mem::size_of::<u64>())];
-    let header = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // NtSetInformationFile requires an aligned FILE_RENAME_INFORMATION buffer.
+    const {
+        assert!(std::mem::align_of::<usize>() >= std::mem::align_of::<FILE_RENAME_INFORMATION>());
+    }
+    let mut buffer = vec![0_usize; bytes.div_ceil(std::mem::size_of::<usize>())];
+    let header = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let mut io_status = IO_STATUS_BLOCK::default();
     // SAFETY: buffer has native-header alignment and enough initialized bytes
-    // for the header, every UTF-16 unit and its terminator. The source handle
-    // remains live through the call. Refuse any existing destination.
-    let renamed = unsafe {
-        (*header).Anonymous.ReplaceIfExists = false;
-        (*header).RootDirectory = std::ptr::null_mut();
+    // for the header and every UTF-16 unit. Both borrowed handles remain live
+    // through the call. Refuse any existing destination.
+    let status = unsafe {
+        (*header).Anonymous = FILE_RENAME_INFORMATION_0 {
+            ReplaceIfExists: false,
+        };
+        (*header).RootDirectory = registry.as_raw_handle();
         (*header).FileNameLength = name_length;
         std::ptr::copy_nonoverlapping(
             encoded.as_ptr(),
-            std::ptr::addr_of_mut!((*header).FileName).cast::<u16>(),
+            buffer.as_mut_ptr().cast::<u8>().add(offset).cast::<u16>(),
             encoded.len(),
         );
-        SetFileInformationByHandle(
+        NtSetInformationFile(
             publication.as_raw_handle(),
-            FileRenameInfo,
-            header.cast(),
+            &mut io_status,
+            buffer.as_ptr().cast(),
             buffer_length,
+            FileRenameInformation,
         )
     };
-    if renamed == 0 {
-        return Err(std::io::Error::last_os_error())
+    if status < 0 {
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        return Err(std::io::Error::from_raw_os_error(error as i32))
             .context("retiring completed directory publication marker");
     }
     Ok(())
@@ -980,14 +900,14 @@ mod tests {
         let by_name = registry.remove_file(name).unwrap_err();
         assert_eq!(by_name.kind(), std::io::ErrorKind::PermissionDenied);
 
-        remove_completed_marker(&registry, temp.path(), name, &ours)?;
+        remove_completed_marker(&registry, name, &ours)?;
         drop(removing);
         assert!(!path.exists());
 
         // A marker that is still ours is retired and removed by its handle.
         std::fs::write(&path, b"")?;
         let ours = open_marker_for_retirement(&path)?;
-        remove_completed_marker(&registry, temp.path(), name, &ours)?;
+        remove_completed_marker(&registry, name, &ours)?;
         assert!(!path.exists());
         Ok(())
     }
@@ -1005,10 +925,10 @@ mod tests {
 
         std::fs::write(&canonical_path, b"old")?;
         let old = open_marker_for_retirement(&canonical_path)?;
-        rename_marker_handle(temp.path(), &registry, &old, retired)?;
+        rename_marker_handle(&registry, &old, retired)?;
         std::fs::write(&canonical_path, b"replacement")?;
 
-        remove_completed_marker(&registry, temp.path(), canonical, &old)?;
+        remove_completed_marker(&registry, canonical, &old)?;
         assert_eq!(std::fs::read(&canonical_path)?, b"replacement");
         drop(old);
         assert!(!retired_path.exists());
@@ -1027,13 +947,8 @@ mod tests {
         std::fs::write(&occupied_path, b"occupied")?;
         let source = open_marker_for_retirement(&source_path)?;
 
-        let error = rename_marker_handle(
-            temp.path(),
-            &registry,
-            &source,
-            std::ffi::OsStr::new("occupied"),
-        )
-        .expect_err("retirement must not replace an occupied destination");
+        let error = rename_marker_handle(&registry, &source, std::ffi::OsStr::new("occupied"))
+            .expect_err("retirement must not replace an occupied destination");
         let io_error = error
             .chain()
             .find_map(|cause| cause.downcast_ref::<std::io::Error>())
@@ -1041,36 +956,6 @@ mod tests {
         assert_eq!(io_error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&source_path)?, b"source");
         assert_eq!(std::fs::read(&occupied_path)?, b"occupied");
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn retirement_rejects_a_registry_path_with_different_identity() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let registry_path = temp.path().join("registry");
-        let replacement_path = temp.path().join("replacement");
-        std::fs::create_dir(&registry_path)?;
-        std::fs::create_dir(&replacement_path)?;
-        let registry =
-            cap_std::fs::Dir::open_ambient_dir(&registry_path, cap_std::ambient_authority())?;
-        let source_path = registry_path.join("source");
-        let destination_path = replacement_path.join("retired");
-        std::fs::write(&source_path, b"source")?;
-        let source = open_marker_for_retirement(&source_path)?;
-
-        let error = rename_marker_handle(
-            &replacement_path,
-            &registry,
-            &source,
-            std::ffi::OsStr::new("retired"),
-        )
-        .expect_err("a replacement registry path must be rejected");
-        assert!(error
-            .to_string()
-            .contains("directory publication registry path identity changed"));
-        assert_eq!(std::fs::read(&source_path)?, b"source");
-        assert!(!destination_path.exists());
         Ok(())
     }
 

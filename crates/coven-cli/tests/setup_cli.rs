@@ -32,6 +32,33 @@ fn test_tempdir() -> Result<tempfile::TempDir> {
     Ok(tempfile::Builder::new().prefix("setup-").tempdir_in(root)?)
 }
 
+/// Writes a fixture script that the test later executes.
+///
+/// Other tests in this binary spawn processes concurrently. A child forked
+/// while `fs::write` still held the script open for writing keeps a copy of
+/// that descriptor until its own exec, and executing the script in that window
+/// fails with ETXTBSY (coven#1730). Writing through a short-lived shell leaves
+/// this process with no writable descriptor for the script, so no concurrent
+/// fork can copy one. Callers still set the mode the case needs.
+#[cfg(unix)]
+fn write_script(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let status = Command::new("/bin/sh")
+        .args(["-c", "printf '%s' \"$2\" > \"$1\"", "write-script"])
+        .arg(path)
+        .arg(std::ffi::OsStr::from_bytes(contents.as_ref()))
+        .stdin(Stdio::null())
+        .status()
+        .with_context(|| format!("spawning the writer for {}", path.display()))?;
+    anyhow::ensure!(
+        status.success(),
+        "writing fixture script {} failed: {status}",
+        path.display()
+    );
+    Ok(())
+}
+
 fn descriptor(id: ProviderId) -> ProviderDescriptor {
     ProviderDescriptor::new(
         id,
@@ -1239,7 +1266,7 @@ fn copilot_fixture_inherits_terminal_streams_and_records_exact_login() -> Result
     let args_path = temp.path().join("args.txt");
     let stdout_path = temp.path().join("terminal.stdout");
     let stderr_path = temp.path().join("terminal.stderr");
-    fs::write(
+    write_script(
         &fake_copilot,
         concat!(
             "#!/bin/sh\n",
@@ -1559,7 +1586,7 @@ fn verify_ephemeral_state_reaches_provider_then_is_removed() -> Result<()> {
     let report_path = temp.path().join("verification-report.json");
     let stdout_path = temp.path().join("verification.stdout");
     let stderr_path = temp.path().join("verification.stderr");
-    fs::write(
+    write_script(
         &fake_codex,
         concat!(
             "#!/bin/sh\n",
@@ -1672,7 +1699,7 @@ fn version_probe_reaps_detached_provider_descendants() -> Result<()> {
     let fake_codex = temp.path().join("codex");
     let pid_path = temp.path().join("version-descendant.pid");
     let report_path = temp.path().join("report.json");
-    fs::write(
+    write_script(
         &fake_codex,
         concat!(
             "#!/usr/bin/env python3\n",
@@ -1753,7 +1780,7 @@ fn canonical_provider_launchers_produce_reports_with_trusted_provider_versions()
         fs::create_dir_all(&bin)?;
         fs::create_dir_all(&package)?;
         let executable = package.join(canonical_name);
-        fs::write(
+        write_script(
             &executable,
             format!(
                 "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  cat <<'BANNER'\n{banner}\nBANNER\n  exit 0\nfi\nprintf '%s\\n' \"$@\" > \"${{0%/*}}/verification-args\"\n"
@@ -1816,7 +1843,7 @@ fn version_probe_rejects_contextual_account_identifier() -> Result<()> {
     let fake_codex = temp.path().join("codex");
     let report_path = temp.path().join("report.json");
     let version_marker = temp.path().join("version-ran");
-    fs::write(
+    write_script(
         &fake_codex,
         concat!(
             "#!/bin/sh\n",
@@ -1952,7 +1979,7 @@ fn declining_setup_does_not_execute_provider_version_command() -> Result<()> {
     fs::create_dir_all(&bin)?;
     let marker = temp.path().join("version-ran");
     let executable = bin.join("fake-codex");
-    fs::write(
+    write_script(
         &executable,
         format!(
             "#!/bin/sh\nprintf ran > '{}'\nprintf 'fake-codex 1.2.3\\n'\n",
@@ -2200,7 +2227,7 @@ fn executable_discovery_is_injectable_and_rejects_non_executables() -> Result<()
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::write(&executable, b"#!/bin/sh\nprintf 'fake-cli 1.2.3\\n'\n")?;
+        write_script(&executable, b"#!/bin/sh\nprintf 'fake-cli 1.2.3\\n'\n")?;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
     }
     #[cfg(not(unix))]
@@ -2242,7 +2269,7 @@ fn executable_discovery_normalizes_explicit_relative_paths() -> Result<()> {
 
     let temp = test_tempdir()?;
     let executable = temp.path().join("relative-cli");
-    fs::write(&executable, b"#!/bin/sh\nprintf 'relative-cli 1.2.3\\n'\n")?;
+    write_script(&executable, b"#!/bin/sh\nprintf 'relative-cli 1.2.3\\n'\n")?;
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
     let relative = executable.strip_prefix(std::env::current_dir()?)?;
     let provider = ProviderDescriptor::new(
@@ -2747,7 +2774,7 @@ fn login_owns_the_terminal_so_an_interactive_provider_can_change_modes_and_read(
         let bin = temp.path().join("bin");
         fs::create_dir_all(&bin)?;
         let fake = bin.join(executable);
-        fs::write(
+        write_script(
             &fake,
             "#!/bin/sh\n\
              case \"$1\" in --version|-v|version) echo \"9.9.9\"; exit 0;; esac\n\
