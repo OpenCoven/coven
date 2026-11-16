@@ -393,11 +393,41 @@ fn rename_marker_handle(
     publication: &File,
     destination: &std::ffi::OsStr,
 ) -> Result<()> {
-    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+    use std::os::windows::{
+        ffi::{OsStrExt, OsStringExt},
+        io::AsRawHandle,
     };
-    let encoded: Vec<u16> = destination.encode_wide().collect();
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfo, GetFinalPathNameByHandleW, SetFileInformationByHandle, FILE_RENAME_INFO,
+    };
+    // Windows versions can reject RootDirectory-relative renames, so resolve
+    // the retained registry handle and use the more widely supported absolute form.
+    let mut registry_path = vec![0_u16; 512];
+    let registry_path_length = loop {
+        let capacity =
+            u32::try_from(registry_path.len()).context("Windows registry path is too long")?;
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                registry.as_raw_handle(),
+                registry_path.as_mut_ptr(),
+                capacity,
+                0,
+            )
+        };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("resolving retained publication registry path");
+        }
+        if length as usize >= registry_path.len() {
+            registry_path.resize(length as usize + 1, 0);
+            continue;
+        }
+        break length as usize;
+    };
+    registry_path.truncate(registry_path_length);
+    let registry_path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&registry_path));
+    let destination = registry_path.join(destination);
+    let encoded: Vec<u16> = destination.as_os_str().encode_wide().collect();
     anyhow::ensure!(!encoded.is_empty(), "completed marker name is empty");
     let name_bytes = encoded
         .len()
@@ -425,7 +455,7 @@ fn rename_marker_handle(
     // handles remain live through the call. Refuse any existing destination.
     let renamed = unsafe {
         (*header).Anonymous.ReplaceIfExists = false;
-        (*header).RootDirectory = registry.as_raw_handle();
+        (*header).RootDirectory = std::ptr::null_mut();
         (*header).FileNameLength = name_length;
         std::ptr::copy_nonoverlapping(
             encoded.as_ptr(),
