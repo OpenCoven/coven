@@ -257,6 +257,17 @@ pub(crate) fn create_dir_all(path: &Path) -> Result<()> {
         use cap_std::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NONBLOCK);
     }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, GENERIC_WRITE},
+            Storage::FileSystem::DELETE,
+        };
+        // Retirement and deletion must operate on this retained identity,
+        // even if a later creator acquires the canonical marker name.
+        options.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE);
+    }
     // On macOS, concurrent creation or unlink of this basename can make even
     // O_CREAT return ENOENT. Retry through the retained registry with the same
     // no-follow options; disappearance never proves publication succeeded.
@@ -311,30 +322,130 @@ fn remove_completed_marker(
     name: &std::ffi::OsStr,
     publication: &File,
 ) -> Result<()> {
-    // A creator that shared our marker and finished first has already removed
-    // it. The name may by now belong to a later creator's marker, which that
-    // creator removes itself. On Windows a second removal of that name is not
-    // harmless: while the other removal is between marking the file and
-    // closing it, ours fails with access denied (#1653). Remove only our own.
     #[cfg(windows)]
-    if marker_already_removed(publication) {
-        return Ok(());
+    {
+        let _ = name;
+        remove_completed_windows_marker(registry, publication)
     }
     #[cfg(not(windows))]
-    let _ = publication;
-    #[cfg(all(windows, test))]
-    if let Some(result) = tests::unlink_marker_at_hook(name) {
-        return result;
-    }
-    match registry.remove_file(name) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("removing completed directory publication marker"),
+    {
+        let _ = publication;
+        match registry.remove_file(name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("removing completed directory publication marker"),
+        }
     }
 }
 
+#[cfg(windows)]
+fn remove_completed_windows_marker(registry: &cap_std::fs::Dir, publication: &File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+    if marker_already_removed(publication) {
+        return Ok(());
+    }
+    // Both durability barriers have succeeded. Free the canonical name before
+    // deletion becomes pending: Windows otherwise refuses a concurrent open
+    // while any creator retains the old file. A crash after this rename leaves
+    // only a harmless completed-file name; a crash before it repeats barriers.
+    let retired = std::ffi::OsString::from(format!(".completed-{}", uuid::Uuid::new_v4()));
+    if let Err(error) = rename_marker_handle(registry, publication, &retired) {
+        if marker_already_removed(publication) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    #[cfg(test)]
+    if let Some(result) = tests::unlink_marker_at_hook(&retired) {
+        return result;
+    }
+    let info = FILE_DISPOSITION_INFO {
+        DeleteFile: true.into(),
+    };
+    // SAFETY: the live retained handle requested DELETE access, and info is a
+    // correctly sized native structure. No canonical pathname is reopened.
+    let removed = unsafe {
+        SetFileInformationByHandle(
+            publication.as_raw_handle(),
+            FileDispositionInfo,
+            (&info as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of_val(&info) as u32,
+        )
+    };
+    if removed != 0 {
+        return Ok(());
+    }
+    // Preserve the failing operation's error before querying handle identity.
+    let error = std::io::Error::last_os_error();
+    if marker_already_removed(publication) {
+        return Ok(());
+    }
+    Err(error).context("removing completed directory publication marker")
+}
+
+/// Rename this retained file, never whichever file now has its original name.
+#[cfg(windows)]
+fn rename_marker_handle(
+    registry: &cap_std::fs::Dir,
+    publication: &File,
+    destination: &std::ffi::OsStr,
+) -> Result<()> {
+    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+    };
+    let encoded: Vec<u16> = destination.encode_wide().collect();
+    anyhow::ensure!(!encoded.is_empty(), "completed marker name is empty");
+    let name_bytes = encoded
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .context("completed marker name is too long")?;
+    let name_length = u32::try_from(name_bytes).context("completed marker name is too long")?;
+    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let bytes = offset
+        .checked_add(name_bytes)
+        .and_then(|length| length.checked_add(std::mem::size_of::<u16>()))
+        .context("completed marker rename buffer is too large")?;
+    let buffer_length =
+        u32::try_from(bytes).context("completed marker rename buffer is too large")?;
+    // The flexible UTF-16 tail needs aligned storage, including a zero
+    // terminator beyond FileNameLength for native implementations that read it.
+    const {
+        assert!(std::mem::align_of::<usize>() >= std::mem::align_of::<FILE_RENAME_INFO>());
+    }
+    let mut buffer = vec![0_usize; bytes.div_ceil(std::mem::size_of::<usize>())];
+    let header = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: buffer has native-header alignment and enough initialized bytes
+    // for the header, every UTF-16 unit and its terminator. Both borrowed
+    // handles remain live through the call. Refuse any existing destination.
+    let renamed = unsafe {
+        (*header).Anonymous.ReplaceIfExists = false;
+        (*header).RootDirectory = registry.as_raw_handle();
+        (*header).FileNameLength = name_length;
+        std::ptr::copy_nonoverlapping(
+            encoded.as_ptr(),
+            buffer.as_mut_ptr().cast::<u8>().add(offset).cast::<u16>(),
+            encoded.len(),
+        );
+        SetFileInformationByHandle(
+            publication.as_raw_handle(),
+            FileRenameInfo,
+            buffer.as_ptr().cast(),
+            buffer_length,
+        )
+    };
+    if renamed == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("retiring completed directory publication marker");
+    }
+    Ok(())
+}
+
 /// Whether the file behind this retained handle is unlinked or marked for
-/// deletion. A failed query reports false, which keeps the removal by name.
+/// deletion. A failed query reports false, so native retirement errors fail closed.
 #[cfg(windows)]
 fn marker_already_removed(marker: &File) -> bool {
     use std::os::windows::io::AsRawHandle;
@@ -506,6 +617,211 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn open_marker_for_retirement(path: &Path) -> Result<File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        Ok(std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(
+                windows_sys::Win32::Foundation::GENERIC_READ
+                    | windows_sys::Win32::Foundation::GENERIC_WRITE
+                    | DELETE,
+            )
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)?)
+    }
+
+    #[cfg(windows)]
+    fn publication_registry_entries(path: &Path) -> Result<Vec<std::ffi::OsString>> {
+        let mut entries = std::fs::read_dir(path)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort();
+        Ok(entries)
+    }
+
+    #[cfg(windows)]
+    struct LocalSecurityDescriptor(*mut std::ffi::c_void);
+
+    #[cfg(windows)]
+    impl Drop for LocalSecurityDescriptor {
+        fn drop(&mut self) {
+            // SAFETY: the security APIs returned one LocalAlloc allocation.
+            unsafe {
+                windows_sys::Win32::Foundation::LocalFree(self.0);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    struct SavedMarkerDacl {
+        file: File,
+        _descriptor: LocalSecurityDescriptor,
+        dacl: *mut windows_sys::Win32::Security::ACL,
+        protected: bool,
+        restored: bool,
+    }
+
+    #[cfg(windows)]
+    impl SavedMarkerDacl {
+        fn restore(&mut self) -> Result<()> {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Security::{
+                Authorization::{SetSecurityInfo, SE_FILE_OBJECT},
+                DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+                UNPROTECTED_DACL_SECURITY_INFORMATION,
+            };
+            let protection = if self.protected {
+                PROTECTED_DACL_SECURITY_INFORMATION
+            } else {
+                UNPROTECTED_DACL_SECURITY_INFORMATION
+            };
+            // SAFETY: descriptor owns dacl, and the retained file handle has
+            // WRITE_DAC access. Null owner, group and SACL leave them unchanged.
+            let status = unsafe {
+                SetSecurityInfo(
+                    self.file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | protection,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    self.dacl,
+                    std::ptr::null_mut(),
+                )
+            };
+            if status != 0 {
+                anyhow::bail!("restoring marker DACL: Windows error {status}");
+            }
+            self.restored = true;
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for SavedMarkerDacl {
+        fn drop(&mut self) {
+            if !self.restored {
+                let _ = self.restore();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn deny_marker_write_data(path: &Path) -> Result<SavedMarkerDacl> {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::{
+            Security::{
+                Authorization::{
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+                    SetSecurityInfo, SE_FILE_OBJECT,
+                },
+                GetSecurityDescriptorControl, GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION,
+                PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+            },
+            Storage::FileSystem::{
+                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
+            },
+        };
+        let file = std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)?;
+        let mut saved_dacl = std::ptr::null_mut();
+        let mut saved_descriptor = std::ptr::null_mut();
+        // SAFETY: output pointers are writable and the retained handle has
+        // READ_CONTROL access. The descriptor owns the returned DACL pointer.
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut saved_dacl,
+                std::ptr::null_mut(),
+                &mut saved_descriptor,
+            )
+        };
+        if status != 0 {
+            anyhow::bail!("saving marker DACL: Windows error {status}");
+        }
+        let saved_descriptor = LocalSecurityDescriptor(saved_descriptor);
+        anyhow::ensure!(!saved_dacl.is_null(), "saved marker DACL was null");
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: saved_descriptor is live and points to a native descriptor.
+        if unsafe { GetSecurityDescriptorControl(saved_descriptor.0, &mut control, &mut revision) }
+            == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("reading marker DACL control");
+        }
+
+        // Deny FILE_WRITE_DATA to everyone on this private fixture, while
+        // retaining full control for its owner so the original DACL is restorable.
+        let sddl: Vec<u16> = "D:P(D;;0x00000002;;;WD)(A;;FA;;;OW)\0"
+            .encode_utf16()
+            .collect();
+        let mut restricted_descriptor = std::ptr::null_mut();
+        // SAFETY: sddl is NUL-terminated; the output receives one LocalAlloc allocation.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut restricted_descriptor,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("building restrictive marker DACL");
+        }
+        let restricted_descriptor = LocalSecurityDescriptor(restricted_descriptor);
+        let mut present = 0;
+        let mut restricted_dacl = std::ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: restricted_descriptor is live and all outputs are writable.
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                restricted_descriptor.0,
+                &mut present,
+                &mut restricted_dacl,
+                &mut defaulted,
+            )
+        } == 0
+            || present == 0
+            || restricted_dacl.is_null()
+        {
+            anyhow::bail!("restrictive marker security descriptor had no DACL");
+        }
+        // SAFETY: the retained handle has WRITE_DAC, and the restricted DACL
+        // remains live through this call. Other security components are unchanged.
+        let status = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                restricted_dacl,
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            anyhow::bail!("applying restrictive marker DACL: Windows error {status}");
+        }
+        Ok(SavedMarkerDacl {
+            file,
+            _descriptor: saved_descriptor,
+            dacl: saved_dacl,
+            protected: control & SE_DACL_PROTECTED != 0,
+            restored: false,
+        })
+    }
+
+    #[cfg(windows)]
     #[test]
     fn a_creator_succeeds_while_a_completed_marker_is_pending_deletion() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -548,6 +864,7 @@ mod tests {
         concurrent.context("opening a marker while its completed peer is deleting it")?;
         assert!(directory.is_dir());
         assert!(!marker.exists());
+        assert!(publication_registry_entries(marker.parent().unwrap())?.is_empty());
         Ok(())
     }
 
@@ -581,15 +898,88 @@ mod tests {
         drop(removing);
         assert!(!path.exists());
 
-        // A marker that is still ours is removed by name as before.
+        // A marker that is still ours is retired and removed by its handle.
         std::fs::write(&path, b"")?;
-        let ours = File::open(&path)?;
+        let ours = open_marker_for_retirement(&path)?;
         remove_completed_marker(&registry, name, &ours)?;
         assert!(!path.exists());
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    #[test]
+    fn retirement_never_removes_a_later_marker_at_the_canonical_name() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry =
+            cap_std::fs::Dir::open_ambient_dir(temp.path(), cap_std::ambient_authority())?;
+        let canonical = std::ffi::OsStr::new("shared");
+        let canonical_path = temp.path().join(canonical);
+        let retired = std::ffi::OsStr::new("retired-by-peer");
+        let retired_path = temp.path().join(retired);
+
+        std::fs::write(&canonical_path, b"old")?;
+        let old = open_marker_for_retirement(&canonical_path)?;
+        rename_marker_handle(&registry, &old, retired)?;
+        std::fs::write(&canonical_path, b"replacement")?;
+
+        remove_completed_marker(&registry, canonical, &old)?;
+        assert_eq!(std::fs::read(&canonical_path)?, b"replacement");
+        drop(old);
+        assert!(!retired_path.exists());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retirement_refuses_to_replace_an_existing_destination() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry =
+            cap_std::fs::Dir::open_ambient_dir(temp.path(), cap_std::ambient_authority())?;
+        let source_path = temp.path().join("source");
+        let occupied_path = temp.path().join("occupied");
+        std::fs::write(&source_path, b"source")?;
+        std::fs::write(&occupied_path, b"occupied")?;
+        let source = open_marker_for_retirement(&source_path)?;
+
+        let error = rename_marker_handle(&registry, &source, std::ffi::OsStr::new("occupied"))
+            .expect_err("retirement must not replace an occupied destination");
+        let io_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .expect("native rename error");
+        assert_eq!(io_error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&source_path)?, b"source");
+        assert_eq!(std::fs::read(&occupied_path)?, b"occupied");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_fails_closed_when_marker_write_data_is_denied() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join("new");
+        let marker = publication_marker(&directory).unwrap();
+        std::fs::create_dir(marker.parent().unwrap())?;
+        std::fs::write(&marker, b"guard")?;
+        let mut saved_dacl = deny_marker_write_data(&marker)?;
+
+        let result = create_dir_all(&directory);
+        saved_dacl.restore()?;
+        let error = result.expect_err("write-denied marker must stop publication");
+        let io_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .expect("marker open must retain its native I/O error");
+        assert_eq!(io_error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error
+            .to_string()
+            .contains("opening directory publication marker"));
+        assert_eq!(std::fs::read(&marker)?, b"guard");
+        assert!(!directory.exists());
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn publication_marker_symlink_is_refused_without_touching_target() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -598,11 +988,95 @@ mod tests {
         std::fs::create_dir(marker.parent().unwrap())?;
         let target = temp.path().join("unrelated");
         std::fs::write(&target, b"unchanged")?;
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &marker)?;
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &marker)?;
         assert!(create_dir_all(&directory).is_err());
         assert!(!directory.exists());
         assert_eq!(std::fs::read(&target)?, b"unchanged");
         assert!(marker.symlink_metadata()?.file_type().is_symlink());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "subprocess fixture invoked by completed_marker_retirement_survives_process_death"]
+    fn completed_marker_retirement_process_fixture() -> Result<()> {
+        let Some(root) = std::env::var_os("COVEN_RETIRED_MARKER_PROCESS_FIXTURE") else {
+            return Ok(());
+        };
+        let root = std::path::PathBuf::from(root);
+        let directory = root.join("published");
+        let ready = root.join("ready");
+        BEFORE_MARKER_UNLINK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |name| {
+                let pending = ready.with_extension("pending");
+                std::fs::write(&pending, name.as_encoded_bytes())?;
+                std::fs::rename(&pending, &ready)?;
+                loop {
+                    std::thread::park();
+                }
+            }));
+        });
+        create_dir_all(&directory)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn completed_marker_retirement_survives_process_death() -> Result<()> {
+        struct ChildGuard(Option<std::process::Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(child) = &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let mut child = ChildGuard(Some(
+            std::process::Command::new(std::env::current_exe()?)
+                .arg("--exact")
+                .arg("durable_fs::tests::completed_marker_retirement_process_fixture")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("COVEN_RETIRED_MARKER_PROCESS_FIXTURE", temp.path())
+                .spawn()?,
+        ));
+        let ready = temp.path().join("ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let retired = loop {
+            match std::fs::read(&ready) {
+                Ok(bytes) => break std::ffi::OsString::from(String::from_utf8(bytes)?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("reading process fixture readiness"),
+            }
+            if let Some(status) = child.0.as_mut().unwrap().try_wait()? {
+                anyhow::bail!("retirement process fixture exited early with {status}");
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "retirement process fixture did not become ready within 120 seconds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        child.0.as_mut().unwrap().kill()?;
+        let status = child.0.as_mut().unwrap().wait()?;
+        child.0 = None;
+        assert!(
+            !status.success(),
+            "killed process fixture unexpectedly succeeded"
+        );
+
+        let directory = temp.path().join("published");
+        let marker = publication_marker(&directory).unwrap();
+        assert!(!marker.exists());
+        assert!(marker.parent().unwrap().join(retired).is_file());
+        create_dir_all(&directory)?;
+        std::fs::write(directory.join("usable"), b"ok")?;
+        assert_eq!(std::fs::read(directory.join("usable"))?, b"ok");
         Ok(())
     }
 
