@@ -205,9 +205,23 @@ fn actual_parent_death_keeps_child_profile_lease_until_worker_exit() {
         std::thread::sleep(POLL);
     }
     eof_release.observed_exit = true;
-    let reset_after_exit = crate::state_lock::try_acquire_exclusive(home.path())
-        .unwrap()
-        .is_some();
+    // The probe reports an exiting process as gone (ESRCH) as soon as its
+    // exit has begun. The lease is a flock that the kernel releases when it
+    // closes the worker's descriptors, a moment later. Wait for that release
+    // under a hang guard: a lease that outlives the worker still fails.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let reset_after_exit = loop {
+        if crate::state_lock::try_acquire_exclusive(home.path())
+            .unwrap()
+            .is_some()
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(POLL);
+    };
     assert!(
         child_still_alive,
         "EOF gate did not select a live worker after actual parent death"
