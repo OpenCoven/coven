@@ -988,7 +988,7 @@ fn relay_only_runtime_reconnects_without_identity_change_and_stops_idle_workers(
                     Instant::now() + Duration::from_secs(8),
                 )
                 .unwrap_err();
-            assert_eq!(error.to_string(), "unexpected relay record");
+            assert_eq!(error.to_string(), "unexpected relay record: close 1001");
         }
         if round == 2 {
             fixture
