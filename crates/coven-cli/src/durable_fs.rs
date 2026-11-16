@@ -394,9 +394,12 @@ fn rename_marker_handle(
     destination: &std::ffi::OsStr,
 ) -> Result<()> {
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileRenameInformation, NtSetInformationFile, FILE_RENAME_INFORMATION,
+        FILE_RENAME_INFORMATION_0,
     };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     let encoded: Vec<u16> = destination.encode_wide().collect();
     anyhow::ensure!(!encoded.is_empty(), "completed marker name is empty");
     let name_bytes = encoded
@@ -404,29 +407,26 @@ fn rename_marker_handle(
         .checked_mul(std::mem::size_of::<u16>())
         .context("completed marker name is too long")?;
     let name_length = u32::try_from(name_bytes).context("completed marker name is too long")?;
-    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    // Windows requires at least sizeof(FILE_RENAME_INFO) plus the name bytes.
-    // On 64-bit targets the structure has trailing alignment padding after its
-    // one-element FileName field, so offset + name + one WCHAR is two bytes
-    // short and SetFileInformationByHandle rejects it with ERROR_INVALID_PARAMETER.
-    let bytes = std::mem::size_of::<FILE_RENAME_INFO>()
+    let offset = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+    let bytes = offset
         .checked_add(name_bytes)
         .context("completed marker rename buffer is too large")?;
     let buffer_length =
         u32::try_from(bytes).context("completed marker rename buffer is too large")?;
-    // The flexible UTF-16 tail needs aligned storage. The native structure's
-    // existing FileName element and trailing padding leave room beyond the
-    // counted string; FileNameLength deliberately excludes that storage.
+    // NtSetInformationFile requires an aligned FILE_RENAME_INFORMATION buffer.
     const {
-        assert!(std::mem::align_of::<usize>() >= std::mem::align_of::<FILE_RENAME_INFO>());
+        assert!(std::mem::align_of::<usize>() >= std::mem::align_of::<FILE_RENAME_INFORMATION>());
     }
     let mut buffer = vec![0_usize; bytes.div_ceil(std::mem::size_of::<usize>())];
-    let header = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let header = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let mut io_status = IO_STATUS_BLOCK::default();
     // SAFETY: buffer has native-header alignment and enough initialized bytes
-    // for the header, every UTF-16 unit and its terminator. Both borrowed
-    // handles remain live through the call. Refuse any existing destination.
-    let renamed = unsafe {
-        (*header).Anonymous.ReplaceIfExists = false;
+    // for the header and every UTF-16 unit. Both borrowed handles remain live
+    // through the call. Refuse any existing destination.
+    let status = unsafe {
+        (*header).Anonymous = FILE_RENAME_INFORMATION_0 {
+            ReplaceIfExists: false,
+        };
         (*header).RootDirectory = registry.as_raw_handle();
         (*header).FileNameLength = name_length;
         std::ptr::copy_nonoverlapping(
@@ -434,15 +434,17 @@ fn rename_marker_handle(
             buffer.as_mut_ptr().cast::<u8>().add(offset).cast::<u16>(),
             encoded.len(),
         );
-        SetFileInformationByHandle(
+        NtSetInformationFile(
             publication.as_raw_handle(),
-            FileRenameInfo,
+            &mut io_status,
             buffer.as_ptr().cast(),
             buffer_length,
+            FileRenameInformation,
         )
     };
-    if renamed == 0 {
-        return Err(std::io::Error::last_os_error())
+    if status < 0 {
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        return Err(std::io::Error::from_raw_os_error(error as i32))
             .context("retiring completed directory publication marker");
     }
     Ok(())
