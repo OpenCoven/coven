@@ -267,8 +267,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # Native audit and the complete workspace retain independent 20-minute
-  # acceptance budgets; both are required before the stable PR gate can pass.
+  # Native audit and each workspace shard retain independent 20-minute
+  # acceptance budgets; all are required before the stable PR gate can pass.
 
   native-audit-linux:
     name: Native Automations audit (Linux)
@@ -314,11 +314,22 @@ jobs:
           if-no-files-found: error
 
   rust-test-linux:
-    name: Rust tests (Linux)
+    name: Rust tests (Linux, ${{ matrix.shard }})
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The native v2 storage matrices grew beyond one job's cold-cache budget
+    # (#1763). One name predicate and its exact complement retain every default
+    # test, including new tests, without serializing the matrices with the rest.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: storage
+            test-args: 'mobile_memory::transport::storage::v2'
+          - shard: rest
+            test-args: '--skip mobile_memory::transport::storage::v2'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Keep build outputs outside the audited source
@@ -341,12 +352,14 @@ jobs:
             ${{ runner.os }}-rust-test-
       - name: Install native link dependencies
         run: bash scripts/install-native-link-dependencies.sh
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked -- ${{ matrix.test-args }}
       - name: Exercise passkey recovery through the real daemon
+        if: ${{ matrix.shard == 'rest' }}
         env:
           COVEN_PASSKEY_RECEIPT: ${{ runner.temp }}/passkey-recovery-receipt.json
         run: node crates/coven-cli/tests/fixtures/passkey-recovery/daemon-e2e.mjs "$CARGO_TARGET_DIR/debug/coven"
       - name: Upload passkey recovery receipt
+        if: ${{ matrix.shard == 'rest' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: passkey-recovery-linux-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
