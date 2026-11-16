@@ -1,5 +1,5 @@
 {
-  "policy_sha256": "5f289faa8a844765b3a6fab98708846d992c9912d5e41004cc2ca0b0ccb6c109",
+  "policy_sha256": "8f16c3bdda856e62295c8bb2bc095cb276b53768c7fac0df9e6f3cf7408ef067",
   "commands": [
     [
       "python3",
@@ -114,6 +114,10 @@
     [
       "python3",
       "scripts/branch-triage-test.py"
+    ],
+    [
+      "python3",
+      "scripts/propose-engine-bump-test.py"
     ],
     [
       "npm",
