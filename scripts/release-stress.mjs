@@ -91,6 +91,21 @@ const UNIX_COMMANDS = [
       'finishing_a_request_after_the_daemon'
     ]
   }
+,
+  // Relay hosts register before their clients connect and outlive their last
+  // queued response (coven#1726).
+  {
+    label: 'relay migration fixture ordering',
+    args: [
+      'test',
+      '-p',
+      'coven-cli',
+      '--bin',
+      'coven',
+      'mobile_memory::gateway::transport_tests::migration_',
+      '--locked'
+    ]
+  }
 ];
 
 const WINDOWS_COMMANDS = [
@@ -113,6 +128,21 @@ const WINDOWS_COMMANDS = [
   {
     label: 'directory publication markers',
     args: ['test', '-p', 'coven-cli', '--bin', 'coven', 'durable_fs::tests::', '--locked']
+  }
+,
+  // Relay hosts register before their clients connect and outlive their last
+  // queued response (coven#1726).
+  {
+    label: 'relay migration fixture ordering',
+    args: [
+      'test',
+      '-p',
+      'coven-cli',
+      '--bin',
+      'coven',
+      'mobile_memory::gateway::transport_tests::migration_',
+      '--locked'
+    ]
   }
 ];
 

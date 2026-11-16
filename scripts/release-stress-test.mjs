@@ -11,7 +11,7 @@ import {
 test('unix stress plan covers every release reliability surface ten times', () => {
   const plan = buildStressPlan({ suite: 'unix', iterations: 10 });
 
-  assert.equal(plan.length, 70);
+  assert.equal(plan.length, 80);
   assert.deepEqual(
     [...new Set(plan.map((entry) => entry.label))],
     [
@@ -21,7 +21,8 @@ test('unix stress plan covers every release reliability surface ten times', () =
       'PTY timeout',
       'short socket homes',
       'process-crash fixture exit ordering',
-      'daemon request half-close'
+      'daemon request half-close',
+      'relay migration fixture ordering'
     ]
   );
   assert.ok(plan.every((entry) => entry.timeoutMs === 180_000));
@@ -82,6 +83,15 @@ test('unix stress plan covers every release reliability surface ten times', () =
         '--',
         'unix_serve_loop_isolates_per_connection_errors',
         'finishing_a_request_after_the_daemon'
+      ],
+      [
+        'test',
+        '-p',
+        'coven-cli',
+        '--bin',
+        'coven',
+        'mobile_memory::gateway::transport_tests::migration_',
+        '--locked'
       ]
     ]
   );
@@ -90,10 +100,14 @@ test('unix stress plan covers every release reliability surface ten times', () =
 test('windows stress plan repeats PTY timeout and directory publication ten times', () => {
   const plan = buildStressPlan({ suite: 'windows', iterations: 10 });
 
-  assert.equal(plan.length, 20);
+  assert.equal(plan.length, 30);
   assert.deepEqual(
     [...new Set(plan.map((entry) => entry.label))],
-    ['Windows PTY timeout and process cleanup', 'directory publication markers']
+    [
+      'Windows PTY timeout and process cleanup',
+      'directory publication markers',
+      'relay migration fixture ordering'
+    ]
   );
   assert.deepEqual(plan[1].args, [
     'test',
@@ -138,6 +152,21 @@ test('warm plan compiles each distinct selection once without running it', () =>
     {
       label: 'directory publication markers',
       args: ['test', '-p', 'coven-cli', '--bin', 'coven', 'durable_fs::tests::', '--locked', '--no-run'],
+      iteration: 0,
+      timeoutMs: 1_800_000
+    },
+    {
+      label: 'relay migration fixture ordering',
+      args: [
+        'test',
+        '-p',
+        'coven-cli',
+        '--bin',
+        'coven',
+        'mobile_memory::gateway::transport_tests::migration_',
+        '--locked',
+        '--no-run'
+      ],
       iteration: 0,
       timeoutMs: 1_800_000
     }
@@ -200,8 +229,8 @@ test('stress runner stops at the first failed command and records its iteration'
       }),
     /iteration 2.*exit 17/
   );
-  // Both Windows surfaces of iteration 1 run; iteration 2 stops at its first.
-  assert.deepEqual(calls, [1, 1, 2]);
+  // All Windows surfaces of iteration 1 run; iteration 2 stops at its first.
+  assert.deepEqual(calls, [1, 1, 1, 2]);
   assert.match(writes.join(''), /<repo> failed/);
   assert.doesNotMatch(writes.join(''), /\/private\/work\/coven/);
 });
