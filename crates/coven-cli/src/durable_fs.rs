@@ -322,6 +322,10 @@ fn remove_completed_marker(
     }
     #[cfg(not(windows))]
     let _ = publication;
+    #[cfg(all(windows, test))]
+    if let Some(result) = tests::unlink_marker_at_hook(name) {
+        return result;
+    }
     match registry.remove_file(name) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -426,6 +430,21 @@ pub(crate) fn fail_directory_sync_after(successful_barriers: usize) {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    type MarkerUnlinkHook = Box<dyn FnOnce(&std::ffi::OsStr) -> Result<()>>;
+
+    #[cfg(windows)]
+    std::thread_local! {
+        static BEFORE_MARKER_UNLINK: std::cell::RefCell<Option<MarkerUnlinkHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(windows)]
+    pub(super) fn unlink_marker_at_hook(name: &std::ffi::OsStr) -> Option<Result<()>> {
+        let hook = BEFORE_MARKER_UNLINK.with(|slot| slot.borrow_mut().take());
+        hook.map(|hook| hook(name))
+    }
+
     #[test]
     fn concurrent_directory_publication_succeeds_for_every_creator() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -484,6 +503,52 @@ mod tests {
         };
         assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
         file
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_creator_succeeds_while_a_completed_marker_is_pending_deletion() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join("shared");
+        let marker = publication_marker(&directory).unwrap();
+        let registry_path = marker.parent().unwrap().to_path_buf();
+        let worker_directory = directory.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let creator = std::thread::spawn(move || {
+            BEFORE_MARKER_UNLINK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |name| {
+                    let removing = mark_delete_pending(&registry_path.join(name));
+                    ready_tx.send(()).expect("report delete-pending marker");
+                    release_rx.recv().expect("release marker deletion");
+                    drop(removing);
+                    Ok(())
+                }));
+            });
+            create_dir_all(&worker_directory)
+        });
+        // A hang guard, far above fixture work. Early creator failure drops
+        // the sole sender; parent unwind drops release so the worker cannot wedge.
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("first creator must reach marker deletion");
+        let other_directory = directory.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let concurrent_creator = std::thread::spawn(move || {
+            let _ = done_tx.send(create_dir_all(&other_directory));
+        });
+        let concurrent = done_rx.recv_timeout(std::time::Duration::from_secs(120));
+        let _ = release_tx.send(());
+        let first = creator.join();
+        let other = concurrent_creator.join();
+        first.expect("first creator panicked")?;
+        other.expect("concurrent creator panicked");
+        let concurrent =
+            concurrent.expect("concurrent publication must finish while deletion is held");
+        concurrent.context("opening a marker while its completed peer is deleting it")?;
+        assert!(directory.is_dir());
+        assert!(!marker.exists());
+        Ok(())
     }
 
     /// #1653 in a fixed order. Our marker was removed by a creator that shared
