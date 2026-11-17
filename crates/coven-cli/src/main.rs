@@ -91,6 +91,7 @@ mod pty_runner;
 mod repos_config;
 mod request_authority;
 mod reset;
+mod run_budget;
 mod session_launch;
 mod session_policy;
 mod settings;
@@ -539,6 +540,8 @@ enum Command {
             help = "Latency/reasoning hint: fast, balanced, or thorough. Unsupported harnesses warn and continue."
         )]
         speed: Option<String>,
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..), help = "Positive finite model-round budget; requires a declared adapter and negotiated engine run-budget v1")]
+        max_turns: Option<u32>,
         #[arg(
             long,
             value_name = "MODE",
@@ -2353,6 +2356,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             model,
             think,
             speed,
+            max_turns,
             permission,
             add_dir,
             write_scope,
@@ -2373,6 +2377,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             model.as_deref(),
             think,
             speed.as_deref(),
+            max_turns,
             permission.as_deref(),
             add_dir,
             stream_json,
@@ -5837,6 +5842,7 @@ fn run_session(
     model: Option<&str>,
     think: bool,
     speed: Option<&str>,
+    max_turns: Option<u32>,
     permission: Option<&str>,
     add_dirs: Vec<String>,
     stream_json: bool,
@@ -5886,6 +5892,9 @@ fn run_session(
     } else {
         None
     };
+    if let Some(limit) = max_turns {
+        run_budget::negotiate(harness_id, limit)?;
+    }
     let selected_harness =
         session_launch::validate_harness(harness_id, session_launch::HarnessCheck::Available)?;
     if chat_policy.is_some() {
@@ -6033,6 +6042,7 @@ fn run_session(
         model: requested_model,
         think,
         speed: requested_speed,
+        max_turns,
         permission: requested_permission,
         add_dirs: &requested_add_dirs,
         launch_policy: scoped_policy.as_ref(),
@@ -6151,7 +6161,8 @@ fn run_session(
     // *not* emit it itself: detach (no harness runs) and codex / generic
     // non-stream harnesses. Native pass-through skips this so we don't
     // duplicate the user message the harness echoes through its protocol.
-    let stream_harness_passthrough = stream_json && selected_harness.capabilities.stream;
+    let stream_harness_passthrough =
+        (stream_json || max_turns.is_some()) && selected_harness.capabilities.stream;
     let synthesize_user_event = should_synthesize_stream_user_event(
         stream_json,
         &expanded_prompt,
@@ -6203,7 +6214,11 @@ fn run_session(
     if stream_harness_passthrough {
         let privacy_config = privacy::load_config(&coven_home).unwrap_or_default();
         let stdout = io::stdout();
-        let mut handle = stdout.lock();
+        let mut handle: Box<dyn Write + '_> = if stream_json {
+            Box::new(stdout.lock())
+        } else {
+            Box::new(run_budget::HumanOutput::new(stdout.lock()))
+        };
         let stream_conversation_hint = if is_resume {
             harness::ConversationHint::Resume {
                 id: resume_group_id
@@ -6272,24 +6287,47 @@ fn run_session(
                     persist_terminal(FAILED_SESSION_STATUS, None, Some(failure.clone()));
                 // The original protocol/runner error remains primary even if
                 // the consumer also closed stdout before the terminal frame.
-                let _ = emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
-                    subtype: "error_during_execution".into(),
-                    duration_ms: stream_started.elapsed().as_millis() as u64,
-                    is_error: true,
-                    num_turns: 1,
-                    session_id: record.id.clone(),
-                    harness_session_id: None,
-                    error: Some(failure),
-                    usage: None,
-                }));
+                if stream_json {
+                    let _ =
+                        emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+                            subtype: "error_during_execution".into(),
+                            duration_ms: stream_started.elapsed().as_millis() as u64,
+                            is_error: true,
+                            num_turns: 1,
+                            session_id: record.id.clone(),
+                            harness_session_id: None,
+                            error: Some(failure),
+                            usage: None,
+                        }));
+                }
                 if let Err(persistence_error) = persistence {
                     return Err(error.context(format!("{persistence_error:#}")));
                 }
                 return Err(error);
             }
         };
-        let exit_code = stream_exit.exit_code;
-        let is_error = exit_code != 0;
+        let budget_result = stream_exit.budget_result.as_ref();
+        let confirmation_error = max_turns.filter(|requested| {
+            !budget_result.is_some_and(|receipt| receipt.turn_budget.max_turns == *requested
+                && receipt.turn_budget.source == run_budget::Source::Explicit)
+                && stream_exit.harness_error.is_none() && stream_exit.exit_code == 0
+        }).map(|_| "The engine did not confirm the requested model-round budget; unfinished work is retained.".to_owned());
+        let exit_code = if confirmation_error.is_some() {
+            1
+        } else {
+            stream_exit.exit_code
+        };
+        let is_error = exit_code != 0
+            || stream_exit.harness_error.is_some()
+            || budget_result.is_some_and(|receipt| receipt.is_error);
+        if let Some(receipt) = budget_result {
+            store::update_session_conversation_id(
+                &conn,
+                &record.id,
+                &receipt.native_session_id,
+                &current_timestamp(),
+            )?;
+        }
         let status = if is_error { "failed" } else { "completed" };
         // A non-zero exit without a harness `result` frame used to reach
         // clients as `error: null` and leave the ledger empty (#1268). Carry
@@ -6297,7 +6335,9 @@ fn run_session(
         // stderr tail, on both the result frame and the terminal event.
         let failure = is_error.then(|| {
             pty_runner::native_failure_text(
-                &stream_exit.failure_summary(&selected_harness.id),
+                &confirmation_error
+                    .clone()
+                    .unwrap_or_else(|| stream_exit.failure_summary(&selected_harness.id)),
                 &privacy_config,
             )
         });
@@ -6311,7 +6351,7 @@ fn run_session(
         // Persist independently of stdout delivery. A disconnected client
         // must not erase terminal evidence from the session ledger.
         let persistence = persist_terminal(status, Some(exit_code), failure.clone());
-        let emission = emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
+        let terminal = stream_json::RunResult {
             subtype: if is_error {
                 "error_during_execution".into()
             } else {
@@ -6324,14 +6364,33 @@ fn run_session(
             harness_session_id: None,
             error: failure.clone(),
             usage: None,
-        }));
+        };
+        let emission = if !stream_json {
+            println!();
+            if let Some(receipt) = budget_result {
+                println!(
+                    "Model rounds: {}/{} ({:?}).",
+                    receipt.turn_budget.consumed,
+                    receipt.turn_budget.max_turns,
+                    receipt.turn_budget.source
+                );
+            }
+            if let Some(error) = &failure {
+                eprintln!("Run unfinished: {error}");
+            }
+            Ok(())
+        } else if let Some(receipt) = budget_result {
+            receipt.emit(terminal)
+        } else {
+            emit_stream_event(&stream_json::Event::Result(terminal))
+        };
         persistence?;
         emission?;
         if archive {
             let archived_at = current_timestamp();
             store::archive_session(&conn, &record.id, &archived_at)?;
         }
-        if is_error {
+        if is_error && exit_code != 0 {
             exit_with_session_code(exit_code, true);
         }
         return Ok(());
@@ -9884,6 +9943,7 @@ mod tests {
             available,
             install_hint: String::new(),
             capabilities: coven_runtime_spec::Capabilities::BASELINE,
+            run_budget: None,
             source: "built-in".to_string(),
             manifest_path: None,
         }
@@ -10040,6 +10100,7 @@ mod tests {
             available,
             install_hint: install_hint.to_string(),
             capabilities: coven_runtime_spec::Capabilities::BASELINE,
+            run_budget: None,
             source: "built-in".to_string(),
             manifest_path: None,
         }

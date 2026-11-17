@@ -4304,6 +4304,7 @@ fn spawn_captured_drain(
 /// relaying `error: null` (#1268).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeStreamExit {
+    pub budget_result: Option<crate::run_budget::Receipt>,
     pub exit_code: i32,
     pub harness_error: Option<String>,
     pub stderr_tail: String,
@@ -4618,6 +4619,7 @@ fn normalize_native_stream_line<W: Write>(
     ledger_session_id: &str,
     out: &mut W,
     harness_error: &mut Option<String>,
+    budget_result: &mut Option<crate::run_budget::Receipt>,
     privacy: &crate::privacy::PrivacyConfig,
     policy: Option<&crate::chat_workspace_policy::ChatWorkspacePolicy>,
     workspace_admitted: &mut bool,
@@ -4640,6 +4642,14 @@ fn normalize_native_stream_line<W: Write>(
         } else if init {
             // The scoped startup already supplied the one canonical init.
             return Ok(());
+        }
+    }
+    if harness_id == crate::engine::ENGINE_HARNESS_ID
+        && object.get("type").and_then(serde_json::Value::as_str) == Some("result")
+    {
+        *budget_result = crate::run_budget::Receipt::from_native(object)?;
+        if budget_result.is_some() {
+            *harness_error = native_result_error(object, privacy);
         }
     }
     if let Some(error) = native_result_error(object, privacy) {
@@ -4846,6 +4856,7 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
     let mut stderr_forwarded = false;
     let mut workspace_admitted = false;
     let mut harness_error: Option<String> = None;
+    let mut budget_result = None;
     let mut post_exit_deadline = None;
     let mut post_exit_queued_messages = 0_usize;
     let post_exit_drain_timeout = native_post_exit_drain_timeout();
@@ -4926,6 +4937,7 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
                         ledger_session_id,
                         out,
                         &mut harness_error,
+                        &mut budget_result,
                         privacy,
                         policy,
                         &mut workspace_admitted,
@@ -4982,6 +4994,7 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
         stderr_tail = NATIVE_STDERR_OMITTED.to_string();
     }
     Ok(NativeStreamExit {
+        budget_result,
         exit_code: status.code().unwrap_or(1),
         harness_error,
         stderr_tail,
@@ -9558,6 +9571,7 @@ exit 1
     #[test]
     fn native_stream_failure_summary_without_stderr_names_only_the_exit_code() {
         let exit = NativeStreamExit {
+            budget_result: None,
             exit_code: 3,
             harness_error: None,
             stderr_tail: "   \n".to_string(),
