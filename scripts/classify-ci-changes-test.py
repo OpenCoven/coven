@@ -132,6 +132,14 @@ class ClassifyTest(unittest.TestCase):
                 self.assertTrue(result['engine'])
                 self.assertFalse(result['workflow'])
 
+    def test_keyless_turn_test_runs_the_engine_job_and_the_rust_jobs(self):
+        # It skips without a real engine, so only the engine job exercises it.
+        result = self.classify('crates/coven-cli/tests/engine_keyless_turn.rs')
+        self.assertTrue(result['engine'])
+        self.assertTrue(result['rust'])
+        self.assertFalse(result['workflow'])
+        self.assertFalse(self.classify('crates/coven-cli/tests/smoke.rs')['engine'])
+
     def test_workflow_supporting_scripts_fan_out(self):
         for path in (
             'scripts/check-workflows.sh',
