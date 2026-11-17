@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::time::Instant;
 
+pub mod state;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Adapter {
     pub version: u8,
@@ -25,10 +27,16 @@ struct Capabilities {
     stream_eof_exit_code: i32,
 }
 
+pub struct Negotiated {
+    pub(crate) program: String,
+}
+
 /// Probe the executable actually selected by the managed engine resolver.
 /// No package-version inference, model request or prompt-text fallback.
-pub fn negotiate(harness: &str, limit: u32) -> Result<()> {
-    ensure!(limit > 0, "Model-round budget must be positive and finite");
+pub fn negotiate(harness: &str, limit: Option<u32>) -> Result<Negotiated> {
+    if let Some(limit) = limit {
+        ensure!(limit > 0, "Model-round budget must be positive and finite");
+    }
     let declared = crate::harness::configured_harness_specs()?
         .into_iter()
         .find(|spec| spec.id == harness)
@@ -38,8 +46,12 @@ pub fn negotiate(harness: &str, limit: u32) -> Result<()> {
         "Harness `{harness}` does not support explicit model-round budgets"
     );
     let resolved = crate::engine::resolve().context("Run-budget engine is unavailable")?;
+    let program = resolved
+        .path
+        .canonicalize()
+        .context("Resolved run-budget engine is unavailable")?;
     let (status, bytes) = crate::engine::probe_stdout(
-        &resolved.path,
+        &program,
         &["--run-budget-capabilities"],
         Instant::now() + crate::engine::PROBE_TIMEOUT,
         16 * 1024,
@@ -63,7 +75,12 @@ pub fn negotiate(harness: &str, limit: u32) -> Result<()> {
             && caps.stream_eof_exit_code == 0,
         "Engine does not provide the required run-budget v1 contract; update the engine"
     );
-    Ok(())
+    Ok(Negotiated {
+        program: program
+            .to_str()
+            .context("Run-budget engine path is not UTF-8")?
+            .to_owned(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +119,22 @@ pub struct Receipt {
     pub continuation: Continuation,
     #[serde(skip)]
     pub native_session_id: String,
+}
+
+pub fn validate_applied(
+    receipt: &Receipt,
+    requested: Option<u32>,
+    claim: Option<&state::Claim>,
+) -> Result<()> {
+    if let Some(limit) = requested {
+        ensure!(receipt.turn_budget.max_turns == limit && receipt.turn_budget.source == Source::Explicit,
+            "The engine did not confirm the requested model-round budget; unfinished work is retained.");
+    }
+    if let Some(claim) = claim {
+        ensure!(receipt.native_session_id == claim.engine_session_id,
+            "The engine returned a different continuation identity; unfinished work cannot be replayed as a new conversation.");
+    }
+    Ok(())
 }
 
 impl Receipt {

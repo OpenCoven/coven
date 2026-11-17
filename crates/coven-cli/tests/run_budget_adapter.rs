@@ -5,7 +5,7 @@
 use serde_json::{json, Value};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 const CAPS: &str = r#"{"engine_contract_version":1,"run_budget_version":1,"flag":"--max-turns","minimum":1,"maximum":4294967295,"default":10,"exhausted_outcome":"turn_budget_exhausted","one_shot_exhausted_exit_code":1,"stream_eof_exit_code":0}"#;
 
@@ -16,7 +16,7 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let engine = root.path().join("engine");
         fs::write(&engine, r#"#!/usr/bin/python3
-import sys,os,json,pathlib
+import sys,os,json,pathlib,time
 if sys.argv[1:] == ['--version']:
  print('0.9.1'); sys.exit(0)
 if sys.argv[1:] == ['--run-budget-capabilities']:
@@ -24,8 +24,14 @@ if sys.argv[1:] == ['--run-budget-capabilities']:
  print(os.environ.get('TEST_BUDGET_CAPS','{}')); sys.exit(0)
 pathlib.Path('argv.json').write_text(json.dumps(sys.argv[1:]))
 limit = int(sys.argv[sys.argv.index('--max-turns')+1]) if '--max-turns' in sys.argv else 10
-print(json.dumps({'type':'system','subtype':'init','session_id':'engine-session','run_budget_version':1,'turn_budget':{'max_turns':limit,'source':'explicit'}}))
-print(json.dumps({'type':'text_delta','text':'fixture output'}))
+print(json.dumps({'type':'system','subtype':'init','session_id':'engine-session','run_budget_version':1,'turn_budget':{'max_turns':limit,'source':'explicit'}}),flush=True)
+print(json.dumps({'type':'text_delta','text':'fixture output'}),flush=True)
+if os.environ.get('TEST_RESULT_GATE'):
+ pathlib.Path('ready').touch()
+ deadline=time.monotonic()+30
+ while not pathlib.Path('release').exists():
+  if time.monotonic()>deadline:sys.exit(64)
+  time.sleep(.01)
 normal = {'type':'result','subtype':'success','is_error':False,'session_id':'engine-session','run_budget_version':1,'num_turns':1,'turn_budget':{'max_turns':limit,'source':'explicit','consumed':1},'continuation':{'session_id':'engine-session','resumable':True}}
 print(os.environ.get('TEST_BUDGET_RESULT',json.dumps(normal)))
 sys.exit(int(os.environ.get('TEST_ENGINE_EXIT','0')))
@@ -302,4 +308,183 @@ fn ordinary_budget_run_renders_text_and_retains_engine_continuity() {
     let args = f.args();
     let at = args.iter().position(|x| x == "--resume").unwrap();
     assert_eq!(args[at + 1], "engine-session");
+}
+
+#[test]
+fn a_newer_unconfirmed_save_blocks_every_older_engine_alias() {
+    for ordinary in [false, true] {
+        let f = Fixture::new();
+        let first = f
+            .command()
+            .args([
+                "run",
+                "coven-code",
+                "--max-turns",
+                "12",
+                "--stream-json",
+                "--",
+                "first",
+            ])
+            .output()
+            .unwrap();
+        assert!(first.status.success(), "{first:?}");
+        let values = frames(&first);
+        let older = values.last().unwrap()["session_id"].as_str().unwrap();
+        let receipt = if ordinary {
+            json!({"type":"result","subtype":"success","is_error":false,"run_budget_version":1,"session_id":"engine-session","num_turns":1,"turn_budget":{"max_turns":10,"source":"default","consumed":1},"continuation":{"session_id":"engine-session","resumable":false}})
+        } else {
+            json!({"type":"result","subtype":"success","is_error":false,"run_budget_version":1,"session_id":"engine-session","num_turns":1,"turn_budget":{"max_turns":12,"source":"explicit","consumed":1},"continuation":{"session_id":"engine-session","resumable":false}})
+        };
+        let mut second = f.command();
+        second.env("TEST_BUDGET_RESULT", receipt.to_string()).args([
+            "run",
+            "coven-code",
+            "--continue",
+            older,
+        ]);
+        if !ordinary {
+            second.args(["--max-turns", "12", "--stream-json"]);
+        }
+        let output = second.args(["--", "second"]).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        fs::remove_file(f.0.path().join("argv.json")).unwrap();
+        let third = f
+            .command()
+            .args([
+                "run",
+                "coven-code",
+                "--continue",
+                older,
+                "--max-turns",
+                "12",
+                "--stream-json",
+                "--",
+                "third",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !third.status.success(),
+            "A failed newer save must invalidate the whole engine conversation: {third:?}"
+        );
+        assert!(
+            !f.0.path().join("argv.json").exists(),
+            "Unconfirmed history must fail before work starts"
+        );
+    }
+}
+
+#[test]
+fn a_parsed_one_shot_receipt_survives_stdout_disconnect() {
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+    let f = Fixture::new();
+    let mut child = f
+        .command()
+        .env("TEST_RESULT_GATE", "1")
+        .args([
+            "run",
+            "coven-code",
+            "--max-turns",
+            "12",
+            "--stream-json",
+            "--",
+            "hello",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pipe = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = BufReader::new(pipe).lines();
+        let forwarded = lines.any(|line| {
+            line.ok()
+                .and_then(|line| serde_json::from_str::<Value>(&line).ok())
+                .is_some_and(|value| value["type"] == "text_delta")
+        });
+        drop(lines); // Close the consumer only after initial output was forwarded.
+        let _ = tx.send(forwarded);
+    });
+    let ready = rx.recv_timeout(Duration::from_secs(30));
+    fs::write(f.0.path().join("release"), "").unwrap();
+    // Hang guard, not a promptness assertion. The fixture gate also has its
+    // own deadline, so an error cannot leave a permanently waiting engine.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!(
+                "consumer did not settle after disconnect: {:?}",
+                child.wait_with_output()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(ready.unwrap(), "{out:?}");
+    assert!(!out.status.success());
+    let listing = f.command().args(["sessions", "--json"]).output().unwrap();
+    let sessions: Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert_eq!(
+        sessions["sessions"][0]["conversation_id"], "engine-session",
+        "{out:?}"
+    );
+}
+
+#[test]
+fn budget_probe_is_bound_to_the_executable_that_launches_work() {
+    let f = Fixture::new();
+    let root = f.0.path().join("home/.coven/engine");
+    let source = fs::read_to_string(f.0.path().join("engine")).unwrap();
+    for (version, label) in [("verified", "verified"), ("unverified", "unverified")] {
+        let dir = root.join(version);
+        fs::create_dir_all(&dir).unwrap();
+        let mut script = source.replace(
+            "pathlib.Path('argv.json')",
+            &format!(
+                "pathlib.Path('selected-engine').write_text('{label}')\npathlib.Path('argv.json')"
+            ),
+        );
+        if version == "verified" {
+            script = script.replace("pathlib.Path('capability-checked').touch()", "pathlib.Path('capability-checked').touch()\n (pathlib.Path(os.environ['HOME'])/'.coven/engine/current').write_text('unverified')");
+        } else {
+            script = script.replace(
+                "print(os.environ.get('TEST_BUDGET_CAPS','{}'))",
+                "print('{}')",
+            );
+        }
+        let file = dir.join("coven-code");
+        fs::write(&file, script).unwrap();
+        fs::set_permissions(file, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(root.join("current"), "verified").unwrap();
+    let out = f
+        .command()
+        .env_remove("COVEN_ENGINE_BIN")
+        .args([
+            "run",
+            "coven-code",
+            "--max-turns",
+            "12",
+            "--stream-json",
+            "--",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    let selected = fs::read_to_string(f.0.path().join("selected-engine")).ok();
+    if out.status.success() {
+        assert_eq!(
+            selected.as_deref(),
+            Some("verified"),
+            "A changed managed selector must not launch an unprobed engine: {out:?}"
+        );
+    } else {
+        assert!(
+            selected.is_none(),
+            "An unsupported replacement must fail before work: {out:?}"
+        );
+    }
 }

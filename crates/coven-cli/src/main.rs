@@ -540,8 +540,12 @@ enum Command {
             help = "Latency/reasoning hint: fast, balanced, or thorough. Unsupported harnesses warn and continue."
         )]
         speed: Option<String>,
-        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..), help = "Positive finite model-round budget; requires a declared adapter and negotiated engine run-budget v1")]
-        max_turns: Option<u32>,
+        #[arg(
+            long,
+            value_name = "N",
+            help = "Positive finite model-round budget; requires a declared adapter and negotiated engine run-budget v1"
+        )]
+        max_turns: Option<std::num::NonZeroU32>,
         #[arg(
             long,
             value_name = "MODE",
@@ -2377,7 +2381,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             model.as_deref(),
             think,
             speed.as_deref(),
-            max_turns,
+            max_turns.map(std::num::NonZeroU32::get),
             permission.as_deref(),
             add_dir,
             stream_json,
@@ -5892,9 +5896,11 @@ fn run_session(
     } else {
         None
     };
-    if let Some(limit) = max_turns {
-        run_budget::negotiate(harness_id, limit)?;
-    }
+    let mut budget_engine = if max_turns.is_some() {
+        Some(run_budget::negotiate(harness_id, max_turns)?)
+    } else {
+        None
+    };
     let selected_harness =
         session_launch::validate_harness(harness_id, session_launch::HarnessCheck::Available)?;
     if chat_policy.is_some() {
@@ -6127,7 +6133,23 @@ fn run_session(
             .unwrap_or_else(|| source.id.clone())
     });
 
-    store::insert_session(&conn, &record)?;
+    let engine_claim = if selected_harness.id == engine::ENGINE_HARNESS_ID {
+        if let Some(engine_session_id) = resume_group_id.as_deref() {
+            run_budget::state::start(
+                &conn,
+                &record,
+                engine_session_id,
+                max_turns.is_some(),
+                &mut budget_engine,
+            )?
+        } else {
+            store::insert_session(&conn, &record)?;
+            None
+        }
+    } else {
+        store::insert_session(&conn, &record)?;
+        None
+    };
 
     if !stream_json {
         println!(
@@ -6161,8 +6183,8 @@ fn run_session(
     // *not* emit it itself: detach (no harness runs) and codex / generic
     // non-stream harnesses. Native pass-through skips this so we don't
     // duplicate the user message the harness echoes through its protocol.
-    let stream_harness_passthrough =
-        (stream_json || max_turns.is_some()) && selected_harness.capabilities.stream;
+    let stream_harness_passthrough = (stream_json || max_turns.is_some() || engine_claim.is_some())
+        && selected_harness.capabilities.stream;
     let synthesize_user_event = should_synthesize_stream_user_event(
         stream_json,
         &expanded_prompt,
@@ -6245,6 +6267,9 @@ fn run_session(
             launch_options,
         );
         let stream_exit = command.and_then(|mut command| {
+            if let Some(negotiated) = &budget_engine {
+                command.bind_run_budget_engine(negotiated);
+            }
             apply_maintenance_participant(&mut command, maintenance_writer.as_ref())?;
             if let Some((file, policy)) = &chat_policy {
                 command.bind_chat_workspace_policy(file, policy)?;
@@ -6274,6 +6299,28 @@ fn run_session(
         let stream_exit = match stream_exit {
             Ok(exit) => exit,
             Err(error) => {
+                let retained = if let Some(evidence) =
+                    error.downcast_ref::<pty_runner::NativeReceiptEvidence>()
+                {
+                    let confirmed = run_budget::validate_applied(
+                        &evidence.receipt,
+                        max_turns,
+                        engine_claim.as_ref(),
+                    )
+                    .is_ok();
+                    // A one-shot result is its last query. For a stream-input
+                    // disconnect, unread later input/output may exist: retain
+                    // identity and evidence without promising safe resumption.
+                    run_budget::state::retain(
+                        &conn,
+                        &record.id,
+                        &evidence.receipt,
+                        engine_claim.as_ref(),
+                        confirmed && !stream_json_input,
+                    )
+                } else {
+                    Ok(())
+                };
                 store::update_session_status(
                     &conn,
                     &record.id,
@@ -6300,18 +6347,41 @@ fn run_session(
                             usage: None,
                         }));
                 }
+                if let Err(retention_error) = retained {
+                    return Err(error.context(format!(
+                        "failed to retain engine receipt: {retention_error:#}"
+                    )));
+                }
                 if let Err(persistence_error) = persistence {
                     return Err(error.context(format!("{persistence_error:#}")));
                 }
                 return Err(error);
             }
         };
-        let budget_result = stream_exit.budget_result.as_ref();
-        let confirmation_error = max_turns.filter(|requested| {
-            !budget_result.is_some_and(|receipt| receipt.turn_budget.max_turns == *requested
-                && receipt.turn_budget.source == run_budget::Source::Explicit)
-                && stream_exit.harness_error.is_none() && stream_exit.exit_code == 0
-        }).map(|_| "The engine did not confirm the requested model-round budget; unfinished work is retained.".to_owned());
+        let mut budget_result = stream_exit.budget_result.clone();
+        let mut confirmation_error = match budget_result.as_ref() {
+            Some(receipt) => run_budget::validate_applied(receipt, max_turns, engine_claim.as_ref()).err().map(|error| error.to_string()),
+            None if (max_turns.is_some() || engine_claim.is_some()) && stream_exit.harness_error.is_none() && stream_exit.exit_code == 0 =>
+                Some("The engine did not confirm its applied budget and saved continuation; unfinished work is retained.".to_owned()),
+            None => None,
+        };
+        if let Some(receipt) = budget_result.as_mut() {
+            let confirmed = confirmation_error.is_none();
+            if let Err(error) = run_budget::state::retain(
+                &conn,
+                &record.id,
+                receipt,
+                engine_claim.as_ref(),
+                confirmed,
+            ) {
+                confirmation_error = Some(format!(
+                    "Failed to retain verified engine continuation: {error:#}"
+                ));
+            }
+            if confirmation_error.is_some() {
+                receipt.continuation.resumable = false;
+            }
+        }
         let exit_code = if confirmation_error.is_some() {
             1
         } else {
@@ -6319,15 +6389,9 @@ fn run_session(
         };
         let is_error = exit_code != 0
             || stream_exit.harness_error.is_some()
-            || budget_result.is_some_and(|receipt| receipt.is_error);
-        if let Some(receipt) = budget_result {
-            store::update_session_conversation_id(
-                &conn,
-                &record.id,
-                &receipt.native_session_id,
-                &current_timestamp(),
-            )?;
-        }
+            || budget_result
+                .as_ref()
+                .is_some_and(|receipt| receipt.is_error);
         let status = if is_error { "failed" } else { "completed" };
         // A non-zero exit without a harness `result` frame used to reach
         // clients as `error: null` and leave the ledger empty (#1268). Carry
@@ -6367,7 +6431,7 @@ fn run_session(
         };
         let emission = if !stream_json {
             println!();
-            if let Some(receipt) = budget_result {
+            if let Some(receipt) = budget_result.as_ref() {
                 println!(
                     "Model rounds: {}/{} ({:?}).",
                     receipt.turn_budget.consumed,
@@ -6379,7 +6443,7 @@ fn run_session(
                 eprintln!("Run unfinished: {error}");
             }
             Ok(())
-        } else if let Some(receipt) = budget_result {
+        } else if let Some(receipt) = budget_result.as_ref() {
             receipt.emit(terminal)
         } else {
             emit_stream_event(&stream_json::Event::Result(terminal))

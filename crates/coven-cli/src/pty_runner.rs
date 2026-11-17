@@ -247,6 +247,10 @@ impl ChildKiller for SharedPtyKiller {
 }
 
 impl HarnessCommand {
+    pub(crate) fn bind_run_budget_engine(&mut self, negotiated: &crate::run_budget::Negotiated) {
+        self.program.clone_from(&negotiated.program);
+    }
+
     pub(crate) fn bind_chat_workspace_policy(
         &mut self,
         file: &Path,
@@ -4310,6 +4314,19 @@ pub struct NativeStreamExit {
     pub stderr_tail: String,
 }
 
+#[derive(Debug)]
+pub struct NativeReceiptEvidence {
+    pub receipt: crate::run_budget::Receipt,
+}
+
+impl std::fmt::Display for NativeReceiptEvidence {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("engine result was observed before output delivery failed")
+    }
+}
+
+impl std::error::Error for NativeReceiptEvidence {}
+
 /// Redact before bounding: truncating raw text can remove the prefix that
 /// identifies a credential. Bound bytes at a UTF-8 boundary after redaction.
 pub fn native_failure_text(text: &str, config: &crate::privacy::PrivacyConfig) -> String {
@@ -4645,6 +4662,14 @@ fn normalize_native_stream_line<W: Write>(
         }
     }
     if harness_id == crate::engine::ENGINE_HARNESS_ID
+        && object.get("type").and_then(serde_json::Value::as_str) == Some("user")
+    {
+        // A later streamed query must not inherit an earlier query's saved
+        // receipt if the later query crashes or fails before its own result.
+        *budget_result = None;
+        *harness_error = None;
+    }
+    if harness_id == crate::engine::ENGINE_HARNESS_ID
         && object.get("type").and_then(serde_json::Value::as_str) == Some("result")
     {
         *budget_result = crate::run_budget::Receipt::from_native(object)?;
@@ -4977,7 +5002,12 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
             &cancellation_context
         ));
     }
-    result?;
+    if let Err(error) = result {
+        return Err(match budget_result {
+            Some(receipt) => error.context(NativeReceiptEvidence { receipt }),
+            None => error,
+        });
+    }
     let status = match status {
         Some(status) => status,
         None => waited_status?,
