@@ -11,6 +11,9 @@ carry one policy that ships inside the `coven` binary, so a chat behaves the
 same on every machine. Issue [#1738](https://github.com/OpenCoven/coven/issues/1738)
 has the measurements behind this design.
 
+The engine applies the policy only in Coven Code releases after 0.9.2. See
+[Engine version](#engine-version).
+
 ## What a headless launch gets
 
 | Argument | Effect |
@@ -43,7 +46,7 @@ confined.
 | Launch | Covered |
 |---|---|
 | `coven run claude` with `--stream-json` or a one-shot prompt | Yes, in its arguments. |
-| `coven run coven-code` with `--stream-json` or a one-shot prompt | Yes. Coven sets `COVEN_CLAUDE_POLICY` and the engine adds the arguments to its Claude Code backend. |
+| `coven run coven-code` with `--stream-json` or a one-shot prompt | Yes, with a Coven Code release after 0.9.2. Coven sets `COVEN_CLAUDE_POLICY` and the engine adds the arguments to its Claude Code backend. See [Engine version](#engine-version). |
 | `coven run claude --write-scope <file>` | No change. That launch already loads no settings files and carries its own rules. |
 | Interactive terminal launches, including the bare `coven` engine | No change. A person can answer a prompt there, and an interactive engine can change its permission while it runs. |
 
@@ -64,9 +67,24 @@ The paths are absolute, and `mcpConfigFile` may be `null`. The object names no
 permission mode: the engine already passes each turn's own mode to Claude Code,
 so exactly one `--permission-mode` reaches it. The engine gives a read-only
 turn `readOnlySettingsFile` and every other turn `settingsFile`. An engine that
-cannot apply the object in full, including a field it does not know, refuses
-the turn and says to update Coven and the engine together. It does not start
-Claude Code without the policy.
+reads the variable and cannot apply the object in full, including a field it
+does not know, refuses the turn and says to update Coven and the engine
+together. It does not start Claude Code without the policy.
+
+## Engine version
+
+The engine reads `COVEN_CLAUDE_POLICY` in Coven Code releases after 0.9.2
+([OpenCoven/coven-code#468](https://github.com/OpenCoven/coven-code/pull/468)).
+
+Coven Code 0.9.2 and earlier ignore the variable. Such an engine starts Claude
+Code with the turn's permission mode and without `--settings` or
+`--setting-sources`, so the operator's and the workspace's Claude settings
+apply as they did before the policy existed, and the allow list and the
+refusals above do not. Coven sets the variable for every covered launch, and
+the turn is not refused.
+
+`coven engine status` prints the installed engine's version. The `claude`
+harness does not depend on the engine: Coven passes it the arguments itself.
 
 ## Provisioning and migration
 
