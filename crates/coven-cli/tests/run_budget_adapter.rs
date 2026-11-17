@@ -28,7 +28,7 @@ print(json.dumps({'type':'system','subtype':'init','session_id':'engine-session'
 print(json.dumps({'type':'text_delta','text':'fixture output'}),flush=True)
 if os.environ.get('TEST_RESULT_GATE'):
  pathlib.Path('ready').touch()
- deadline=time.monotonic()+30
+ deadline=time.monotonic() + 30
  while not pathlib.Path('release').exists():
   if time.monotonic()>deadline:sys.exit(64)
   time.sleep(.01)
