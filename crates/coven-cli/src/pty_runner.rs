@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -4547,24 +4547,10 @@ fn spawn_native_stdout_reader(
     });
 }
 
-fn count_native_inputs(bytes: &[u8], count: &AtomicUsize, in_line: &mut bool) {
-    // Count every nonempty JSONL input as potential work, before delivery.
-    // Partial writes and unknown/control frames can only deny continuation;
-    // they cannot make an older result authorize unconfirmed later work.
-    for byte in bytes {
-        if *byte == b'\n' {
-            *in_line = false;
-        } else if !byte.is_ascii_whitespace() && !*in_line {
-            count.fetch_add(1, Ordering::SeqCst);
-            *in_line = true;
-        }
-    }
-}
-
 fn spawn_native_stdin_forwarder(
     child_stdin: std::process::ChildStdin,
     stopped: Arc<AtomicBool>,
-    inputs: Arc<AtomicUsize>,
+    inputs: Arc<Mutex<crate::run_budget::input::Progress>>,
 ) {
     #[cfg(unix)]
     thread::spawn(move || {
@@ -4574,7 +4560,6 @@ fn spawn_native_stdin_forwarder(
         let fd = stdin.as_raw_fd();
         let mut child_stdin = child_stdin;
         let mut buffer = [0_u8; 4096];
-        let mut in_line = false;
         while !stopped.load(Ordering::Relaxed) {
             let mut poll_fd = libc::pollfd {
                 fd,
@@ -4593,9 +4578,16 @@ fn spawn_native_stdin_forwarder(
             }
             let count = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
             if count <= 0 {
+                if count == 0 {
+                    if let Ok(mut progress) = inputs.lock() {
+                        progress.eof();
+                    }
+                }
                 break;
             }
-            count_native_inputs(&buffer[..count as usize], &inputs, &mut in_line);
+            if let Ok(mut progress) = inputs.lock() {
+                progress.observe(&buffer[..count as usize]);
+            }
             if stopped.load(Ordering::Relaxed)
                 || child_stdin.write_all(&buffer[..count as usize]).is_err()
                 || child_stdin.flush().is_err()
@@ -4611,13 +4603,20 @@ fn spawn_native_stdin_forwarder(
         let mut handle = stdin.lock();
         let mut child_stdin = child_stdin;
         let mut buffer = String::new();
-        let mut in_line = false;
         while !stopped.load(Ordering::Relaxed) {
             buffer.clear();
             match handle.read_line(&mut buffer) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => {
+                    if let Ok(mut progress) = inputs.lock() {
+                        progress.eof();
+                    }
+                    break;
+                }
+                Err(_) => break,
                 Ok(_) => {
-                    count_native_inputs(buffer.as_bytes(), &inputs, &mut in_line);
+                    if let Ok(mut progress) = inputs.lock() {
+                        progress.observe(buffer.as_bytes());
+                    }
                     if stopped.load(Ordering::Relaxed)
                         || child_stdin.write_all(buffer.as_bytes()).is_err()
                         || child_stdin.flush().is_err()
@@ -4858,7 +4857,7 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
         }
     };
     let stdin_stopped = Arc::new(AtomicBool::new(false));
-    let inputs = Arc::new(AtomicUsize::new(0));
+    let inputs = Arc::new(Mutex::new(crate::run_budget::input::Progress::default()));
     let child_stdin = if forward_stdin {
         match child.stdin.take() {
             Some(stdin) => Some(stdin),
@@ -5054,8 +5053,10 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
     if !stderr_closed {
         stderr_tail = NATIVE_STDERR_OMITTED.to_string();
     }
-    let budget_queries_complete =
-        !forward_stdin || inputs.load(Ordering::SeqCst) == completed_budget_queries;
+    let budget_queries_complete = !forward_stdin
+        || inputs
+            .lock()
+            .is_ok_and(|progress| progress.saved_queries_cover_input(completed_budget_queries));
     if forward_stdin && (!budget_queries_complete || !status.success()) {
         if let Some(receipt) = budget_result.as_mut() {
             receipt.continuation.resumable = false;

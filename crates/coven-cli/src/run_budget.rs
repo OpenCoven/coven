@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::time::Instant;
 
+pub mod input;
 pub mod state;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

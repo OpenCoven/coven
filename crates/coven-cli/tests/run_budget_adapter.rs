@@ -65,6 +65,46 @@ fn frames(o: &Output) -> Vec<Value> {
 }
 
 #[test]
+fn transcript_prefill_and_ignored_frames_do_not_require_query_receipts() {
+    use std::io::Write;
+    let prefill = json!({"role":"assistant","content":"prefill ".repeat(1024)});
+    for (prefix, suffix, resumable) in [
+        (format!("{prefill}\n"), String::new(), true),
+        (
+            "{\"type\":\"control_request\",\"request\":{}}\n{\"type\":\"user\",\"message\":{\"content\":\"  \"}}\n".into(),
+            "{\"type\":\"control_response\"}\n".into(),
+            true,
+        ),
+        (String::new(), format!("{prefill}\n"), false),
+        (String::new(), "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"\"},{\"type\":\"text\",\"text\":\"\"}]}}\n".into(), false),
+        (String::new(), "{\"type\":\"user\",\"message\":".into(), false),
+    ] {
+        let f = Fixture::new();
+        let engine = f.0.path().join("engine");
+        let source = fs::read_to_string(&engine).unwrap().replace(
+            "print(os.environ.get('TEST_BUDGET_RESULT',json.dumps(normal)))",
+            "sys.stdin.read()\nprint(json.dumps(normal),flush=True)",
+        );
+        fs::write(engine, source).unwrap();
+        let mut child = f.command()
+            .args(["run", "coven-code", "--max-turns", "12", "--stream-json", "--stream-json-input", "--", "work"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let input = format!("{prefix}{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"work\"}}}}\n{suffix}");
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        let all = frames(&output);
+        let last = all.last().unwrap();
+        if resumable {
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(last["continuation"]["resumable"], true, "{output:?}");
+        } else {
+            assert!(!output.status.success(), "{output:?}");
+            assert!(last.get("continuation").is_none(), "{output:?}");
+        }
+    }
+}
+
+#[test]
 fn later_streamed_input_needs_its_own_saved_result_before_continuation() {
     use std::io::Write;
     for (complete, exit) in [(false, 0), (false, 7), (true, 0)] {
