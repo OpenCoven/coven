@@ -327,6 +327,38 @@ class CheckCiWorkflowTests(unittest.TestCase):
                 self.assertIn("timeout-minutes: 30", windows)
             self.assertNotIn("continue-on-error:", windows)
 
+    def test_engine_contract_runs_on_each_hosted_linux_and_windows_engine_platform(self) -> None:
+        job = ci_job_block('engine-contract')
+        for platform, runner in (
+            ('linux-x86_64', 'ubuntu-latest'),
+            ('linux-aarch64', 'ubuntu-24.04-arm'),
+            ('windows-x86_64', 'windows-latest'),
+        ):
+            with self.subTest(platform=platform):
+                self.assertIn(f"- platform: {platform}\n            os: {runner}\n", job)
+        self.assertIn('name: engine contract (${{ matrix.platform }})', job)
+        self.assertIn('runs-on: ${{ matrix.os }}', job)
+        self.assertIn('timeout-minutes: ${{ matrix.job-timeout }}', job)
+        self.assertIn('fail-fast: false', job)
+        self.assertIn(
+            "if: ${{ github.event_name == 'push' || needs.changes.outputs.engine == 'true' }}",
+            job,
+        )
+        # Linux and Windows runners must not share a build cache across
+        # architectures: both Linux legs report runner.os as Linux.
+        self.assertIn(
+            "key: ${{ runner.os }}-${{ runner.arch }}-rust-engine-${{ hashFiles('Cargo.lock') }}",
+            job,
+        )
+        self.assertIn('cargo run -p coven-cli --locked -- engine install', job)
+        self.assertIn('engine which', job)
+        self.assertIn(
+            'COVEN_ENGINE_BIN="$ENGINE" cargo test -p coven-cli --locked contract -- --nocapture',
+            job,
+        )
+        self.assertNotIn('continue-on-error:', job)
+        self.assertIn('      - engine-contract\n', ci_job_block('pr-gate'))
+
     def test_manual_windows_release_stress_owns_shared_test_cache_writes(self) -> None:
         stress = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')
         triggers = stress.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
