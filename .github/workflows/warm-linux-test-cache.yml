@@ -1,0 +1,42 @@
+name: Warm Linux test cache
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: warm-linux-test-cache
+  cancel-in-progress: false
+
+jobs:
+  warm:
+    # Shared cache maintenance uses accepted main, separate from PR acceptance.
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Keep build outputs outside the audited source
+        run: echo "CARGO_TARGET_DIR=${{ runner.temp }}/coven-target" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - name: Install native link dependencies
+        run: bash scripts/install-native-link-dependencies.sh
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/coven-target
+          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-test-
+      # Compilation populates a cache; only required CI provides acceptance.
+      - name: Warm the locked workspace test build
+        run: cargo test --workspace --locked --no-run

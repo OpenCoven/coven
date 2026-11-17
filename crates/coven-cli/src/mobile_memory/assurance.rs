@@ -39,13 +39,28 @@ struct AssuranceStoreFileLock {
 
 impl AssuranceStoreFileLock {
     fn acquire(path: &Path, lock_name: &str) -> Result<Self> {
+        Self::acquire_inner(path, lock_name, false)
+    }
+
+    fn acquire_inner(path: &Path, lock_name: &str, enrollment_recovery: bool) -> Result<Self> {
         let parent = path
             .parent()
             .context("mobile assurance store has no parent")?;
         let lock_path = parent.join(lock_name);
         let file = crate::state_lock::open_lock_file(&lock_path)?;
-        file.lock_exclusive()
-            .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+        super::store_lock::lock_exclusive(&file, &lock_path)?;
+        if lock_name == AUTHORIZATION_KEY_LOCK_FILE && !enrollment_recovery {
+            // Never acquire registry after keys. An independent key caller
+            // fails closed; the next registry admission performs recovery in
+            // the documented registry -> keys order.
+            match fs::symlink_metadata(parent.join(".initial-enrollment.json")) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    bail!("initial-enrollment recovery is required before authorization-key access")
+                }
+                Err(error) => return Err(error).context("inspect pending initial enrollment"),
+            }
+        }
         Ok(Self { file })
     }
 }
@@ -407,9 +422,8 @@ pub struct AssuranceChallengeStore {
 impl AssuranceChallengeStore {
     pub fn load(coven_home: &Path) -> Result<Self> {
         let path = ensure_private_mobile_dir(coven_home)?.join(ASSURANCE_CHALLENGES_FILE);
-        let _guard = CHALLENGE_STORE_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("mobile assurance challenge lock poisoned"))?;
+        let _guard = super::store_lock::process(&CHALLENGE_STORE_LOCK)
+            .context("mobile assurance challenge lock unavailable")?;
         let _file_lock = AssuranceStoreFileLock::acquire(&path, ASSURANCE_CHALLENGE_LOCK_FILE)?;
         read_challenges(&path)?;
         Ok(Self { path })
@@ -421,8 +435,7 @@ impl AssuranceChallengeStore {
         now: DateTime<Utc>,
     ) -> Result<IssuedAssuranceChallenge, AssuranceError> {
         validate_challenge_binding(&binding)?;
-        let _guard = CHALLENGE_STORE_LOCK
-            .lock()
+        let _guard = super::store_lock::process(&CHALLENGE_STORE_LOCK)
             .map_err(|_| AssuranceError::StoreUnavailable)?;
         let _file_lock = AssuranceStoreFileLock::acquire(&self.path, ASSURANCE_CHALLENGE_LOCK_FILE)
             .map_err(|_| AssuranceError::StoreUnavailable)?;
@@ -471,8 +484,7 @@ impl AssuranceChallengeStore {
         now: DateTime<Utc>,
     ) -> Result<(), AssuranceError> {
         validate_challenge_binding(binding)?;
-        let _guard = CHALLENGE_STORE_LOCK
-            .lock()
+        let _guard = super::store_lock::process(&CHALLENGE_STORE_LOCK)
             .map_err(|_| AssuranceError::StoreUnavailable)?;
         let _file_lock = AssuranceStoreFileLock::acquire(&self.path, ASSURANCE_CHALLENGE_LOCK_FILE)
             .map_err(|_| AssuranceError::StoreUnavailable)?;
@@ -503,8 +515,7 @@ impl AssuranceChallengeStore {
         now: DateTime<Utc>,
     ) -> Result<AssuranceChallengeState, AssuranceError> {
         validate_challenge_binding(binding)?;
-        let _guard = CHALLENGE_STORE_LOCK
-            .lock()
+        let _guard = super::store_lock::process(&CHALLENGE_STORE_LOCK)
             .map_err(|_| AssuranceError::StoreUnavailable)?;
         let _file_lock = AssuranceStoreFileLock::acquire(&self.path, ASSURANCE_CHALLENGE_LOCK_FILE)
             .map_err(|_| AssuranceError::StoreUnavailable)?;
@@ -536,8 +547,7 @@ impl AssuranceChallengeStore {
         binding: &ChallengeBinding,
     ) -> Result<(), AssuranceError> {
         validate_challenge_binding(binding)?;
-        let _guard = CHALLENGE_STORE_LOCK
-            .lock()
+        let _guard = super::store_lock::process(&CHALLENGE_STORE_LOCK)
             .map_err(|_| AssuranceError::StoreUnavailable)?;
         let _file_lock = AssuranceStoreFileLock::acquire(&self.path, ASSURANCE_CHALLENGE_LOCK_FILE)
             .map_err(|_| AssuranceError::StoreUnavailable)?;
@@ -767,12 +777,156 @@ pub(crate) struct AuthorizationKeyRegistry {
     keys: RwLock<Vec<DeviceAuthorizationKeyRecord>>,
 }
 
+/// Accessible only while the registry's key-store transaction retains both
+/// locks. Recovery writes exact validated images; it never re-enters admission
+/// after an initial authority write has been admitted.
+pub(super) struct EnrollmentImages<'a> {
+    registry: &'a AuthorizationKeyRegistry,
+}
+
+pub(super) fn decode_enrollment_keys(
+    bytes: Option<&[u8]>,
+) -> Result<Vec<DeviceAuthorizationKeyRecord>> {
+    let Some(bytes) = bytes else {
+        return Ok(Vec::new());
+    };
+    anyhow::ensure!(
+        bytes.len() <= 4 * 1024 * 1024,
+        "initial-enrollment key image exceeds bound"
+    );
+    let stored: StoredAuthorizationKeys = serde_json::from_slice(bytes)?;
+    anyhow::ensure!(
+        stored.version == AUTHORIZATION_KEY_REGISTRY_VERSION,
+        "unsupported initial-enrollment key image version"
+    );
+    validate_authorization_keys(&stored.keys)?;
+    Ok(stored.keys)
+}
+
+impl EnrollmentImages<'_> {
+    pub(super) fn read(&self) -> Result<Option<Vec<u8>>> {
+        use std::io::Read;
+        let path = &self.registry.path;
+        match fs::symlink_metadata(path) {
+            Ok(_) => validate_private_file(path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("inspect initial-enrollment keys"),
+        }
+        let mut bytes = Vec::new();
+        fs::File::open(path)?
+            .take(4 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        decode_enrollment_keys(Some(&bytes))?;
+        Ok(Some(bytes))
+    }
+
+    pub(super) fn prepare_initial(
+        &self,
+        device_id: Uuid,
+        possession_public_key: &str,
+        key: NewAuthorizationKey,
+    ) -> Result<Vec<u8>> {
+        validate_public_key(&key.public_key_x963)?;
+        anyhow::ensure!(
+            key.public_key_x963 != possession_public_key,
+            "mobile authorization key must differ from the possession key"
+        );
+        let mut keys = decode_enrollment_keys(self.read()?.as_deref())?;
+        anyhow::ensure!(
+            keys.len() < MAX_AUTHORIZATION_KEY_RECORDS,
+            "mobile authorization-key registry is full"
+        );
+        anyhow::ensure!(
+            keys.iter().all(|existing| existing.device_id != device_id),
+            "mobile device already has authorization-key history"
+        );
+        keys.push(DeviceAuthorizationKeyRecord {
+            device_id,
+            subject_key_id: authorization_key_id(&key.public_key_x963)?,
+            public_key_x963: key.public_key_x963,
+            assurance_class: key.assurance_class,
+            enrolled_at: key.enrolled_at,
+            revoked_at: None,
+            key_epoch: 1,
+        });
+        validate_authorization_keys(&keys)?;
+        let mut encoded = serde_json::to_vec_pretty(&StoredAuthorizationKeys {
+            version: AUTHORIZATION_KEY_REGISTRY_VERSION,
+            keys,
+        })?;
+        encoded.push(b'\n');
+        Ok(encoded)
+    }
+
+    pub(super) fn replace(&self, image: Option<&[u8]>) -> Result<()> {
+        let decoded = decode_enrollment_keys(image)?;
+        let path = &self.registry.path;
+        match image {
+            Some(bytes) => atomic_replace_private(path, bytes)?,
+            None => match fs::symlink_metadata(path) {
+                Ok(_) => {
+                    validate_private_file(path)?;
+                    fs::remove_file(path)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).context("inspect rolled-back initial-enrollment keys")
+                }
+            },
+        }
+        self.sync()?;
+        *self
+            .registry
+            .keys
+            .write()
+            .map_err(|_| anyhow::anyhow!("mobile authorization-key registry lock poisoned"))? =
+            decoded;
+        Ok(())
+    }
+
+    pub(super) fn sync(&self) -> Result<()> {
+        let path = &self.registry.path;
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                validate_private_file(path)?;
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)?
+                    .sync_all()?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspect initial-enrollment keys for sync"),
+        }
+        super::config::sync_directory(
+            path.parent()
+                .context("initial-enrollment keys have no parent")?,
+        )
+    }
+}
+
 impl AuthorizationKeyRegistry {
+    pub(super) fn for_enrollment_recovery(home: &Path) -> Result<Self> {
+        Ok(Self {
+            path: ensure_private_mobile_dir(home)?.join(AUTHORIZATION_KEYS_FILE),
+            keys: RwLock::new(Vec::new()),
+        })
+    }
+
+    pub(super) fn with_enrollment_images<T>(
+        &self,
+        operation: impl FnOnce(&EnrollmentImages<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let _guard = super::store_lock::process(&AUTHORIZATION_KEY_STORE_LOCK)
+            .context("mobile authorization-key store lock unavailable")?;
+        let _file_lock =
+            AssuranceStoreFileLock::acquire_inner(&self.path, AUTHORIZATION_KEY_LOCK_FILE, true)?;
+        operation(&EnrollmentImages { registry: self })
+    }
     pub fn load(coven_home: &Path) -> Result<Self> {
         let path = ensure_private_mobile_dir(coven_home)?.join(AUTHORIZATION_KEYS_FILE);
-        let _guard = AUTHORIZATION_KEY_STORE_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
+        let _guard = super::store_lock::process(&AUTHORIZATION_KEY_STORE_LOCK)
+            .context("mobile authorization-key store lock unavailable")?;
         let _file_lock = AssuranceStoreFileLock::acquire(&path, AUTHORIZATION_KEY_LOCK_FILE)?;
         let keys = read_authorization_keys(&path)?;
         Ok(Self {
@@ -782,9 +936,8 @@ impl AuthorizationKeyRegistry {
     }
 
     pub fn active(&self, device_id: Uuid) -> Result<Option<DeviceAuthorizationKeyRecord>> {
-        let _guard = AUTHORIZATION_KEY_STORE_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
+        let _guard = super::store_lock::process(&AUTHORIZATION_KEY_STORE_LOCK)
+            .context("mobile authorization-key store lock unavailable")?;
         let _file_lock = AssuranceStoreFileLock::acquire(&self.path, AUTHORIZATION_KEY_LOCK_FILE)?;
         let loaded = read_authorization_keys(&self.path)?;
         let active = loaded
@@ -816,9 +969,8 @@ impl AuthorizationKeyRegistry {
         device_ids: &[Uuid],
         operation: impl FnOnce(&[DeviceAuthorizationKeyRecord]) -> Result<T>,
     ) -> Result<T> {
-        let _guard = AUTHORIZATION_KEY_STORE_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
+        let _guard = super::store_lock::process(&AUTHORIZATION_KEY_STORE_LOCK)
+            .context("mobile authorization-key store lock unavailable")?;
         let _file_lock = AssuranceStoreFileLock::acquire(&self.path, AUTHORIZATION_KEY_LOCK_FILE)?;
         let keys = read_authorization_keys(&self.path)?;
         let active = device_ids
@@ -833,19 +985,35 @@ impl AuthorizationKeyRegistry {
         operation(&active)
     }
 
+    #[cfg(test)]
     pub fn enroll_initial(
         &self,
         device_id: Uuid,
         possession_public_key_x963: &str,
         key: NewAuthorizationKey,
     ) -> Result<DeviceAuthorizationKeyRecord> {
+        self.with_initial_enrollment(device_id, possession_public_key_x963, key, |record| {
+            Ok(record.clone())
+        })
+    }
+
+    /// Retain key-store ownership across the dependent registry commit and its
+    /// compensation. Shutdown may refuse admission, but cannot turn rollback
+    /// of this already admitted transaction into a new cancelled acquisition.
+    #[cfg(test)]
+    pub(super) fn with_initial_enrollment<T>(
+        &self,
+        device_id: Uuid,
+        possession_public_key_x963: &str,
+        key: NewAuthorizationKey,
+        commit: impl FnOnce(&DeviceAuthorizationKeyRecord) -> Result<T>,
+    ) -> Result<T> {
         validate_public_key(&key.public_key_x963)?;
         if key.public_key_x963 == possession_public_key_x963 {
             bail!("mobile authorization key must differ from the possession key");
         }
-        let _guard = AUTHORIZATION_KEY_STORE_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
+        let _guard = super::store_lock::process(&AUTHORIZATION_KEY_STORE_LOCK)
+            .context("mobile authorization-key store lock unavailable")?;
         let _file_lock = AssuranceStoreFileLock::acquire(&self.path, AUTHORIZATION_KEY_LOCK_FILE)?;
         let keys = read_authorization_keys(&self.path)?;
         if keys.len() >= MAX_AUTHORIZATION_KEY_RECORDS {
@@ -872,7 +1040,22 @@ impl AuthorizationKeyRegistry {
             .write()
             .map_err(|_| anyhow::anyhow!("mobile authorization-key registry lock poisoned"))? =
             updated;
-        Ok(record)
+        match commit(&record) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                // Both store locks remain held. No cancelled lock admission is
+                // needed to restore the pre-enrollment image and cache.
+                write_authorization_keys(&self.path, &keys).with_context(|| {
+                    format!(
+                    "failed to roll back authorization key after device commit failed: {error:#}"
+                )
+                })?;
+                *self.keys.write().map_err(|_| {
+                    anyhow::anyhow!("mobile authorization-key registry lock poisoned")
+                })? = keys;
+                Err(error)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -886,9 +1069,8 @@ impl AuthorizationKeyRegistry {
         if key.public_key_x963 == possession_public_key_x963 {
             bail!("mobile authorization key must differ from the possession key");
         }
-        let _guard = AUTHORIZATION_KEY_STORE_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
+        let _guard = super::store_lock::process(&AUTHORIZATION_KEY_STORE_LOCK)
+            .context("mobile authorization-key store lock unavailable")?;
         let _file_lock = AssuranceStoreFileLock::acquire(&self.path, AUTHORIZATION_KEY_LOCK_FILE)?;
         let keys = read_authorization_keys(&self.path)?;
         if keys.len() >= MAX_AUTHORIZATION_KEY_RECORDS {
@@ -935,9 +1117,8 @@ impl AuthorizationKeyRegistry {
     }
 
     pub fn revoke(&self, device_id: Uuid, revoked_at: DateTime<Utc>) -> Result<()> {
-        let _guard = AUTHORIZATION_KEY_STORE_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
+        let _guard = super::store_lock::process(&AUTHORIZATION_KEY_STORE_LOCK)
+            .context("mobile authorization-key store lock unavailable")?;
         let _file_lock = AssuranceStoreFileLock::acquire(&self.path, AUTHORIZATION_KEY_LOCK_FILE)?;
         let keys = read_authorization_keys(&self.path)?;
         let Some(active_index) = keys
@@ -962,9 +1143,8 @@ impl AuthorizationKeyRegistry {
     }
 
     pub fn history(&self, device_id: Uuid) -> Result<Vec<DeviceAuthorizationKeyRecord>> {
-        let _guard = AUTHORIZATION_KEY_STORE_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
+        let _guard = super::store_lock::process(&AUTHORIZATION_KEY_STORE_LOCK)
+            .context("mobile authorization-key store lock unavailable")?;
         let _file_lock = AssuranceStoreFileLock::acquire(&self.path, AUTHORIZATION_KEY_LOCK_FILE)?;
         let loaded = read_authorization_keys(&self.path)?;
         let history = loaded
@@ -981,34 +1161,14 @@ impl AuthorizationKeyRegistry {
     }
 
     pub fn forget_all(&self) -> Result<()> {
-        let _guard = AUTHORIZATION_KEY_STORE_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
+        let _guard = super::store_lock::process(&AUTHORIZATION_KEY_STORE_LOCK)
+            .context("mobile authorization-key store lock unavailable")?;
         let _file_lock = AssuranceStoreFileLock::acquire(&self.path, AUTHORIZATION_KEY_LOCK_FILE)?;
         write_authorization_keys(&self.path, &[])?;
         self.keys
             .write()
             .map_err(|_| anyhow::anyhow!("mobile authorization-key registry lock poisoned"))?
             .clear();
-        Ok(())
-    }
-
-    pub fn remove_device(&self, device_id: Uuid) -> Result<()> {
-        let _guard = AUTHORIZATION_KEY_STORE_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
-        let _file_lock = AssuranceStoreFileLock::acquire(&self.path, AUTHORIZATION_KEY_LOCK_FILE)?;
-        let keys = read_authorization_keys(&self.path)?;
-        let updated: Vec<_> = keys
-            .into_iter()
-            .filter(|key| key.device_id != device_id)
-            .collect();
-        write_authorization_keys(&self.path, &updated)?;
-        *self
-            .keys
-            .write()
-            .map_err(|_| anyhow::anyhow!("mobile authorization-key registry lock poisoned"))? =
-            updated;
         Ok(())
     }
 }
@@ -1020,9 +1180,8 @@ pub(crate) fn with_restore_snapshot<T>(
     operation: impl FnOnce(zeroize::Zeroizing<Vec<u8>>) -> Result<T>,
 ) -> Result<T> {
     let path = ensure_private_mobile_dir(home)?.join(AUTHORIZATION_KEYS_FILE);
-    let _guard = AUTHORIZATION_KEY_STORE_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
+    let _guard = super::store_lock::process(&AUTHORIZATION_KEY_STORE_LOCK)
+        .context("mobile authorization-key store lock unavailable")?;
     let _file = AssuranceStoreFileLock::acquire(&path, AUTHORIZATION_KEY_LOCK_FILE)?;
     super::config::validate_restore_export_component(&path)?;
     let stored = StoredAuthorizationKeys {
@@ -1075,9 +1234,8 @@ pub(crate) fn restore_authorization_keys(home: &Path, encoded: &[u8], install: b
     );
     validate_authorization_keys(&incoming.keys)?;
     let path = ensure_private_mobile_dir(home)?.join(AUTHORIZATION_KEYS_FILE);
-    let _guard = AUTHORIZATION_KEY_STORE_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("mobile authorization-key store lock poisoned"))?;
+    let _guard = super::store_lock::process(&AUTHORIZATION_KEY_STORE_LOCK)
+        .context("mobile authorization-key store lock unavailable")?;
     let _file = AssuranceStoreFileLock::acquire(&path, AUTHORIZATION_KEY_LOCK_FILE)?;
     super::config::validate_restore_export_component(&path)?;
     for current in read_authorization_keys(&path)? {
@@ -1201,6 +1359,48 @@ fn validate_authorization_keys(keys: &[DeviceAuthorizationKeyRecord]) -> Result<
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn startup_process_contention_reports_deadline_without_false_poisoning() {
+        let home = tempfile::tempdir().unwrap();
+        ensure_private_mobile_dir(home.path()).unwrap();
+        let held = CHALLENGE_STORE_LOCK.lock().unwrap();
+        let worker_home = home.path().to_owned();
+        let (ready, waiting) = std::sync::mpsc::sync_channel(1);
+        let (finished, outcome) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            super::super::store_lock::observe_process_waits(ready);
+            let result = super::super::store_lock::during_startup(|| {
+                AssuranceChallengeStore::load(&worker_home)
+            })
+            .map(drop);
+            let _ = finished.send(result.map_err(|error| format!("{error:#}")));
+        });
+        let observed = waiting.recv_timeout(std::time::Duration::from_secs(30));
+        let started = std::time::Instant::now();
+        let result = outcome.recv_timeout(std::time::Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        drop(held);
+        worker.join().unwrap();
+        assert!(
+            observed.is_ok(),
+            "no failed process-lock attempt: {observed:?}"
+        );
+        let error = result
+            .unwrap_or_else(|error| {
+                panic!("startup process wait was unbounded after {elapsed:?}: {error:?}")
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("deadline"),
+            "deadline cause was lost: {error}"
+        );
+        assert!(
+            !error.contains("poisoned"),
+            "ordinary contention was mislabeled: {error}"
+        );
+        assert!(AssuranceChallengeStore::load(home.path()).is_ok());
+    }
     use super::super::grant::{DeviceActionIntent, DeviceScope, DEVICE_ACTION_VERSION};
     use super::*;
     use chrono::Duration;

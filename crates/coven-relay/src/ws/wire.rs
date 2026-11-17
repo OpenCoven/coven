@@ -265,6 +265,11 @@ impl Peer {
     }
 
     async fn raw_frame(&mut self, fin: bool, opcode: u8, payload: &[u8], masked: bool) {
+        let bytes = Self::encoded(fin, opcode, payload, masked);
+        guarded(self.stream.write_all(&bytes)).await.unwrap();
+    }
+
+    fn encoded(fin: bool, opcode: u8, payload: &[u8], masked: bool) -> Vec<u8> {
         let mask_bit = if masked { 0x80 } else { 0 };
         let mut bytes = vec![(if fin { 0x80 } else { 0 }) | opcode];
         match payload.len() {
@@ -288,7 +293,7 @@ impl Peer {
                 .enumerate()
                 .map(|(i, b)| if masked { b ^ mask[i % 4] } else { *b }),
         );
-        guarded(self.stream.write_all(&bytes)).await.unwrap();
+        bytes
     }
 
     async fn recv(&mut self) -> (u8, Vec<u8>) {
@@ -536,14 +541,43 @@ async fn full_queue_does_not_lose_peer_disconnect() {
         })
         .await;
     client.writes.set(WriteMode::Open);
-    // In-flight delivery may finish, but disconnect must survive a full inbox.
-    loop {
-        let (opcode, _) = client.recv().await;
-        if opcode == 8 {
-            break;
-        }
-        assert_eq!(opcode, 2);
+    // What the host queued is delivered in order, and the disconnect still
+    // follows a full inbox.
+    for payload in [&b"in flight"[..], b"queued one", b"queued two"] {
+        assert_eq!(client.recv().await, (2, payload.to_vec()));
     }
+    client.close(1001).await;
+    server.released().await;
+}
+
+/// A peer that answers and then leaves, as a host does after a request that
+/// ends its channel. The answer was queued before the departure was signalled,
+/// so it must reach the other peer ahead of the close.
+#[tokio::test]
+async fn messages_queued_before_a_disconnect_are_delivered_before_its_close() {
+    // One write carries the answers and a Close frame, so the relay has read
+    // all of it before the client's task next runs.
+    let mut server = Server::start(limits()).await;
+    let mut host = server.peer(PeerRole::Host).await;
+    let mut client = server.peer(PeerRole::Client).await;
+    let mut bytes = Peer::encoded(true, 2, b"first answer", true);
+    bytes.extend(Peer::encoded(true, 2, b"final answer", true));
+    bytes.extend(Peer::encoded(true, 8, &1000u16.to_be_bytes(), true));
+    guarded(host.stream.write_all(&bytes)).await.unwrap();
+    assert_eq!(client.recv().await, (2, b"first answer".to_vec()));
+    assert_eq!(client.recv().await, (2, b"final answer".to_vec()));
+    client.close(1000).await;
+    drop(host);
+    server.released().await;
+
+    // The same departure without a Close frame: the socket just ends.
+    let mut server = Server::start(limits()).await;
+    let mut host = server.peer(PeerRole::Host).await;
+    let mut client = server.peer(PeerRole::Client).await;
+    host.frame(true, 2, b"final answer").await;
+    drop(host);
+    assert_eq!(client.recv().await, (2, b"final answer".to_vec()));
+    client.close(1001).await;
     server.released().await;
 }
 
@@ -560,6 +594,22 @@ async fn blocked_send_expires_without_retaining_room_or_permits() {
         DEFAULT_MAX_QUEUED_BYTES - 24
     );
     host.close(1001).await;
+    server.released().await;
+}
+
+/// Delivering queued messages ahead of a close must not hold the room past the
+/// send budget when the socket has stopped accepting writes.
+#[tokio::test]
+async fn blocked_delivery_ahead_of_a_close_expires_without_retaining_room_or_permits() {
+    let mut server = Server::start(limits()).await;
+    let mut host = server.peer(PeerRole::Host).await;
+    let client = server.peer(PeerRole::Client).await;
+    client.writes.set(WriteMode::Blocked);
+    let mut bytes = Peer::encoded(true, 2, b"held until send deadline", true);
+    bytes.extend(Peer::encoded(true, 8, &1000u16.to_be_bytes(), true));
+    guarded(host.stream.write_all(&bytes)).await.unwrap();
+    guarded(client.writes.attempted.notified()).await;
+    drop(host);
     server.released().await;
 }
 
@@ -649,7 +699,11 @@ async fn queue_overflow_closes_sender_and_releases_buffered_permits() {
     host.frame(true, 2, b"overflow").await;
     host.close(1013).await;
     client.writes.set(WriteMode::Open);
-    assert_eq!(client.recv().await, (2, b"12345".to_vec()));
+    // The refused message is lost with its sender. The three accepted before
+    // it are still delivered ahead of the close.
+    for _ in 0..3 {
+        assert_eq!(client.recv().await, (2, b"12345".to_vec()));
+    }
     client.close(1001).await;
     server.released().await;
 }

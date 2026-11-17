@@ -18,33 +18,98 @@ pub fn write_owner_only_windows_daemon_status_with_staging(
     staging_directory: &Path,
     contents: &[u8],
 ) -> Result<(), ClientError> {
+    write_owner_only_windows_daemon_status_observed(
+        coven_home,
+        staging_directory,
+        contents,
+        &mut |_| {},
+    )
+}
+
+/// A writer phase, reported when it begins. The next report ends it. The
+/// production entry points pass a no-op observer; the status-replacement
+/// tests record the timeline so a bounded wait can name the phase that was
+/// still running when it expired (#1599).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StatusWritePhase {
+    /// Exclusive creation of the temporary file plus its owner-only DACL.
+    CreateTemporary,
+    /// Payload and trailing newline writes.
+    WriteContents,
+    /// `sync_all` of the temporary file.
+    SyncTemporary,
+    /// The `MoveFileExW` replacement of the destination.
+    ReplaceStatus,
+    /// One retry of the replacement after a sharing or access denial, inside
+    /// the writer's own retry deadline.
+    RetryReplace,
+    /// The writer is returning its result.
+    Complete,
+}
+
+pub(crate) type StatusWriteObserver<'a> = &'a mut dyn FnMut(StatusWritePhase);
+
+pub(crate) fn write_owner_only_windows_daemon_status_observed(
+    coven_home: &Path,
+    staging_directory: &Path,
+    contents: &[u8],
+    observe: StatusWriteObserver<'_>,
+) -> Result<(), ClientError> {
     let status_path = coven_home.join("daemon.json");
     let temporary_path = temporary_status_path(&staging_directory.join("daemon.json"));
-    write_owner_only_windows_daemon_status_at_paths(&status_path, &temporary_path, contents)
+    write_owner_only_windows_daemon_status_at_paths(
+        &status_path,
+        &temporary_path,
+        contents,
+        observe,
+    )
 }
 
 fn write_owner_only_windows_daemon_status_at_paths(
     status_path: &Path,
     temporary_path: &Path,
     contents: &[u8],
+    observe: StatusWriteObserver<'_>,
 ) -> Result<(), ClientError> {
-    let mut file = create_owner_only_status_file(temporary_path)?;
-    let write_result = (|| {
-        file.write_all(contents)
-            .map_err(|error| StatusWriteStage::WriteContents.io_error(error))?;
-        if !contents.ends_with(b"\n") {
-            file.write_all(b"\n")
-                .map_err(|error| StatusWriteStage::WriteNewline.io_error(error))?;
+    observe(StatusWritePhase::CreateTemporary);
+    // A creation failure (for example a colliding temporary) must not remove
+    // the path, so it returns before the cleanup below.
+    let file = match create_owner_only_status_file(temporary_path) {
+        Ok(file) => file,
+        Err(error) => {
+            observe(StatusWritePhase::Complete);
+            return Err(error);
         }
-        file.sync_all()
-            .map_err(|error| StatusWriteStage::SyncTemporary.io_error(error))?;
-        drop(file);
-        replace_status_file(temporary_path, status_path)
-    })();
+    };
+    let write_result =
+        fill_and_replace_status_file(file, contents, temporary_path, status_path, &mut *observe);
     if write_result.is_err() {
         let _ = std::fs::remove_file(temporary_path);
     }
+    observe(StatusWritePhase::Complete);
     write_result
+}
+
+fn fill_and_replace_status_file(
+    mut file: std::fs::File,
+    contents: &[u8],
+    temporary_path: &Path,
+    status_path: &Path,
+    observe: StatusWriteObserver<'_>,
+) -> Result<(), ClientError> {
+    observe(StatusWritePhase::WriteContents);
+    file.write_all(contents)
+        .map_err(|error| StatusWriteStage::WriteContents.io_error(error))?;
+    if !contents.ends_with(b"\n") {
+        file.write_all(b"\n")
+            .map_err(|error| StatusWriteStage::WriteNewline.io_error(error))?;
+    }
+    observe(StatusWritePhase::SyncTemporary);
+    file.sync_all()
+        .map_err(|error| StatusWriteStage::SyncTemporary.io_error(error))?;
+    drop(file);
+    observe(StatusWritePhase::ReplaceStatus);
+    replace_status_file(temporary_path, status_path, observe)
 }
 
 fn temporary_status_path(status_path: &Path) -> PathBuf {
@@ -175,7 +240,11 @@ fn create_owner_only_status_file(path: &Path) -> Result<std::fs::File, ClientErr
     Ok(file)
 }
 
-fn replace_status_file(temporary_path: &Path, status_path: &Path) -> Result<(), ClientError> {
+fn replace_status_file(
+    temporary_path: &Path,
+    status_path: &Path,
+    observe: StatusWriteObserver<'_>,
+) -> Result<(), ClientError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::{
         Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION},
@@ -214,6 +283,7 @@ fn replace_status_file(temporary_path: &Path, status_path: &Path) -> Result<(), 
         {
             return Err(StatusWriteStage::ReplaceStatus.io_error(error));
         }
+        observe(StatusWritePhase::RetryReplace);
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
@@ -453,15 +523,56 @@ pub(crate) mod tests {
         let temporary_path = staging.0.join("collision.tmp");
         std::fs::write(&temporary_path, b"not ours").expect("create colliding temporary");
 
-        let error =
-            write_owner_only_windows_daemon_status_at_paths(&status_path, &temporary_path, b"new")
-                .expect_err("exclusive temporary collision must fail");
+        let mut phases = Vec::new();
+        let error = write_owner_only_windows_daemon_status_at_paths(
+            &status_path,
+            &temporary_path,
+            b"new",
+            &mut |phase| phases.push(phase),
+        )
+        .expect_err("exclusive temporary collision must fail");
         let ClientError::Io { source, .. } = error else {
             panic!("expected I/O error")
         };
         assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&temporary_path).unwrap(), b"not ours");
         assert!(!status_path.exists());
+        assert_eq!(
+            phases,
+            [
+                StatusWritePhase::CreateTemporary,
+                StatusWritePhase::Complete
+            ],
+            "a creation failure reports no later phase"
+        );
+    }
+
+    #[test]
+    fn observed_writer_reports_each_phase_once_in_order() {
+        let home = TestHome::new();
+        let staging = TestHome::new();
+        let status_path = home.0.join("daemon.json");
+        let mut phases = Vec::new();
+        write_owner_only_windows_daemon_status_observed(
+            &home.0,
+            &staging.0,
+            b"observed",
+            &mut |phase| phases.push(phase),
+        )
+        .expect("write observed status");
+        assert_eq!(
+            phases,
+            [
+                StatusWritePhase::CreateTemporary,
+                StatusWritePhase::WriteContents,
+                StatusWritePhase::SyncTemporary,
+                StatusWritePhase::ReplaceStatus,
+                StatusWritePhase::Complete,
+            ],
+            "an uncontended replacement reports every phase once and no retry"
+        );
+        assert_eq!(std::fs::read(&status_path).unwrap(), b"observed\n");
+        assert_status_file_is_owner_only(&status_path);
     }
 
     #[test]

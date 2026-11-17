@@ -666,6 +666,10 @@ fn a_deadline_that_passes_during_the_write_lock_wait_withholds_the_result() {
         noted.note("gate asked for the write lock".to_owned());
         let _ = asked.send(());
     });
+    let acquired = timeline.clone();
+    gate.acquired = Some(Box::new(move || {
+        acquired.note("gate acquired the write lock".to_owned());
+    }));
     assert_eq!(gate.admit(), Ok(()));
     timeline.trace.lock().unwrap().clear();
 
@@ -679,7 +683,6 @@ fn a_deadline_that_passes_during_the_write_lock_wait_withholds_the_result() {
         timeout_at.to_rfc3339_opts(SecondsFormat::Millis, true)
     ));
     holder.execute_batch("COMMIT").unwrap();
-    timeline.note("the other writer let go".to_owned());
     let verdict = committing.join().unwrap();
 
     let trace = timeline.trace();
@@ -697,7 +700,7 @@ fn a_deadline_that_passes_during_the_write_lock_wait_withholds_the_result() {
             "another writer holds the write lock".to_owned(),
             "gate asked for the write lock".to_owned(),
             format!("the run's timeout_at passed: {expired}"),
-            "the other writer let go".to_owned(),
+            "gate acquired the write lock".to_owned(),
             format!("gate read the time: {expired}"),
         ],
         "the gate reads the time only once it holds the lock"

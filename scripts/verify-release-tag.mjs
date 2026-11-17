@@ -106,7 +106,6 @@ export function parseReleaseSigners(text, label = RELEASE_SIGNERS_PATH) {
   if (!Array.isArray(signers) || signers.length === 0) {
     throw new Error(`Refusing release: ${label} must pin at least one trusted signer.`);
   }
-  const principals = new Set();
   const keyIds = new Set();
   return signers.map((signer, index) => {
     const where = `${label} signers[${index}]`;
@@ -128,10 +127,9 @@ export function parseReleaseSigners(text, label = RELEASE_SIGNERS_PATH) {
       );
     }
     const principal = signerPrincipal(signer);
-    if (principals.has(principal) || keyIds.has(signer.sshSigningKeyId)) {
+    if (keyIds.has(signer.sshSigningKeyId)) {
       throw new Error(`Refusing release: ${where} repeats a signer or signing key already pinned.`);
     }
-    principals.add(principal);
     keyIds.add(signer.sshSigningKeyId);
     return { ...signer, principal };
   });
@@ -309,7 +307,17 @@ export async function verifyReleaseTag({
     const signers = parseReleaseSigners(shown.stdout, `${RELEASE_SIGNERS_PATH} at the ${label}`);
     const resolved = await resolveSignerKeys(signers, { ghApi });
     const signature = verifyTagSignature({ cwd, releaseTag, allowedSigners: allowedSignersText(resolved) });
-    pinSources.push({ label, commit, sha256: sha256(shown.stdout), signature, signer: resolved.find((entry) => entry.principal === signature.principal) });
+    // One account can retain several registered signing keys. Attribute the
+    // verified signature to its exact key, independently of pin ordering.
+    const matches = resolved.filter((entry) => {
+      const blob = Buffer.from(entry.publicKey.split(' ')[1], 'base64');
+      const fingerprint = `SHA256:${createHash('sha256').update(blob).digest('base64').replace(/=+$/, '')}`;
+      return entry.principal === signature.principal && fingerprint === signature.fingerprint;
+    });
+    if (matches.length !== 1) {
+      throw new Error(`Refusing release: ${releaseTag} signature does not uniquely match a pinned signing key at ${label}.`);
+    }
+    pinSources.push({ label, commit, sha256: sha256(shown.stdout), signature, signer: matches[0] });
   }
   const [atTag, atBranch] = pinSources;
   if (

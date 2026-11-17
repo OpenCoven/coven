@@ -24,6 +24,8 @@ mod api_response;
 mod api_routes;
 mod capabilities;
 mod chat_context_admission;
+mod chat_workspace_policy;
+mod claude_policy;
 mod claude_write_scope;
 mod cockpit_sources;
 mod config_paths;
@@ -78,7 +80,7 @@ mod parallel_protocol;
 mod patch;
 mod paths;
 mod pc;
-#[cfg(test)]
+#[cfg(any(test, feature = "threads-test-clock"))]
 mod power_loss_tests;
 mod privacy;
 mod project;
@@ -110,6 +112,8 @@ mod ward_probes;
 mod ward;
 mod ward_decision;
 mod ward_migrate;
+#[cfg(feature = "threads-test-clock")]
+mod ward_power_loss_fixture;
 // The coven-threads validator call site: typed authority-state gating of
 // protected-surface mutations (OpenCoven/coven-threads Phase 2). Runs before
 // Ward::apply on the same write path; see threads_gate.rs.
@@ -341,6 +345,23 @@ impl From<MemoryImportSourceArg> for memory_import::MemoryImportSourceKind {
     }
 }
 
+#[derive(clap::Args, Debug)]
+struct ChatWorkspaceArgs {
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Host-owned Chat workspace policy v1; fails closed unless native enforcement can be verified"
+    )]
+    chat_workspace_policy_v1: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires = "chat_workspace_policy_v1",
+        help = "Read-only staged Chat input folder, never a write grant"
+    )]
+    chat_input_directory: Option<PathBuf>,
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     #[command(about = "Open the interactive Coven UI (requires coven-code)")]
@@ -418,6 +439,13 @@ enum Command {
     ProcessSupervisor {
         #[arg(long, value_name = "PROTOCOL")]
         protocol: String,
+    },
+    #[command(hide = true, name = "mobile-gateway-worker")]
+    MobileGatewayWorker {
+        #[arg(long)]
+        protocol: String,
+        #[arg(long)]
+        home: PathBuf,
     },
     #[command(about = "Inspect and decide Ward proposals or migrate configuration")]
     Ward {
@@ -530,6 +558,8 @@ enum Command {
             help = "Explicit Claude scoped-write v1 authority document; requires a qualified Claude streamed profile, and cannot be combined with --permission or --add-dir"
         )]
         write_scope: Option<PathBuf>,
+        #[command(flatten)]
+        chat_workspace: Box<ChatWorkspaceArgs>,
         #[arg(
             long,
             help = "Emit JSONL events on stdout (system.init / user / assistant / tool_result / result)"
@@ -967,7 +997,11 @@ enum MobileRestoreCommand {
             help = "Separate selected snapshot home; copied only after the restore fence is durable"
         )]
         snapshot_home: PathBuf,
-        #[arg(long, help = "Previously pinned installation fingerprint (base64url)")]
+        #[arg(
+            long,
+            allow_hyphen_values = true,
+            help = "Previously pinned installation fingerprint (base64url)"
+        )]
         installation_fingerprint: String,
         #[arg(long, help = "Stable UUID for this restore and every retry")]
         operation_id: uuid::Uuid,
@@ -1009,6 +1043,16 @@ enum MobileRelayCommand {
     Enable,
     #[command(about = "Disable relay access while retaining paired devices and endpoint settings")]
     Disable,
+    #[command(
+        about = "Reset relay settings to disabled with no endpoints, retaining devices and identity"
+    )]
+    Reset {
+        #[arg(
+            long,
+            help = "Confirm discarding all relay endpoints and certificate trust"
+        )]
+        yes: bool,
+    },
     #[command(about = "Show relay configuration status (not connection status)")]
     Status {
         #[arg(long)]
@@ -2146,6 +2190,14 @@ fn main() -> Result<()> {
         unreachable!("process supervisor exits with its target status");
     }
 
+    if let Some(Command::MobileGatewayWorker { protocol, home }) = &cli.command {
+        if let Err(error) = mobile_memory::gateway::process::run_worker(protocol, home) {
+            eprintln!("coven mobile worker failed: {error:#}");
+            std::process::exit(70);
+        }
+        unreachable!("mobile worker exits after native authority cleanup");
+    }
+
     let loaded =
         settings::user_settings_path().as_deref().and_then(|path| {
             match settings::load_from(path) {
@@ -2280,6 +2332,9 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::ProcessSupervisor { .. }) => {
             unreachable!("process supervisor runs before state initialization")
         }
+        Some(Command::MobileGatewayWorker { .. }) => {
+            unreachable!("mobile gateway worker runs before state initialization")
+        }
         Some(Command::Ward { command }) => run_ward_command(command),
         Some(Command::FamiliarLedger { command }) => familiar_cli::run(command),
         Some(Command::Executor { command }) => run_executor_command(command),
@@ -2301,6 +2356,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             permission,
             add_dir,
             write_scope,
+            chat_workspace,
             stream_json,
             stream_json_input,
         }) => run_session(
@@ -2323,6 +2379,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             stream_json_input,
             context_admission.as_deref(),
             write_scope.as_deref(),
+            chat_workspace.chat_workspace_policy_v1.as_deref(),
+            chat_workspace.chat_input_directory.as_deref(),
         ),
         Some(Command::Sessions {
             command,
@@ -2494,6 +2552,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                     }
                     MobileRelayCommand::Enable => mobile_memory::relay::run_enable(),
                     MobileRelayCommand::Disable => mobile_memory::relay::run_disable(),
+                    MobileRelayCommand::Reset { yes } => mobile_memory::relay::run_reset(yes),
                     MobileRelayCommand::Status { json } => mobile_memory::relay::run_status(json),
                 },
                 MobileMemoryCommand::Enable { bind, endpoint } => {
@@ -5784,6 +5843,8 @@ fn run_session(
     stream_json_input: bool,
     context_admission: Option<&Path>,
     write_scope: Option<&Path>,
+    chat_workspace_policy_v1: Option<&Path>,
+    chat_input_directory: Option<&Path>,
 ) -> Result<()> {
     let context_admission = context_admission
         .map(chat_context_admission::Request::read)
@@ -5803,8 +5864,36 @@ fn run_session(
         anyhow::bail!("--detach and --continue are mutually exclusive");
     }
 
+    let chat_policy = if let Some(file) = chat_workspace_policy_v1 {
+        anyhow::ensure!(stream_json && !detach && permission.is_none() && add_dirs.is_empty() && write_scope.is_none() && context_admission.is_none(),
+            "Chat workspace access requires streamed execution without separate permission, add-dir, write-scope or context options");
+        anyhow::ensure!(
+            harness_id == engine::ENGINE_HARNESS_ID && cfg!(target_os = "macos"),
+            "This engine cannot verify workspace write access on this host. Use an updated Coven Code on macOS, or select an engine with verified workspace access."
+        );
+        let cwd = cwd.unwrap_or(Path::new("."));
+        let policy = chat_workspace_policy::ChatWorkspacePolicy::read(file, cwd)?;
+        policy.require_protected(file)?;
+        policy.require_protected(&std::env::current_exe()?)?;
+        if let Some(directory) = chat_input_directory {
+            anyhow::ensure!(
+                directory.is_absolute() && directory.is_dir(),
+                "Chat input folder is unavailable"
+            );
+            policy.require_protected(directory)?;
+        }
+        Some((file, policy))
+    } else {
+        None
+    };
     let selected_harness =
         session_launch::validate_harness(harness_id, session_launch::HarnessCheck::Available)?;
+    if chat_policy.is_some() {
+        anyhow::ensure!(
+            selected_harness.source == "bundled" && selected_harness.capabilities.stream,
+            "Workspace access requires the built-in Coven Code adapter."
+        );
+    }
     let current_dir = std::env::current_dir().context("failed to read current directory")?;
     let session_launch::LaunchPaths { project_root, cwd } =
         session_launch::resolve_launch_paths(&current_dir, cwd).map_err(|error| match error {
@@ -6042,7 +6131,7 @@ fn run_session(
     }
 
     let stream_started = std::time::Instant::now();
-    if stream_json {
+    if stream_json && chat_policy.is_none() {
         emit_stream_event(&stream_json::Event::System(stream_json::System {
             subtype: "init".into(),
             cwd: cwd.to_string_lossy().into_owned(),
@@ -6142,8 +6231,12 @@ fn run_session(
         );
         let stream_exit = command.and_then(|mut command| {
             apply_maintenance_participant(&mut command, maintenance_writer.as_ref())?;
-            pty_runner::stream_harness(
+            if let Some((file, policy)) = &chat_policy {
+                command.bind_chat_workspace_policy(file, policy)?;
+            }
+            pty_runner::stream_harness_with_chat_policy(
                 &command,
+                chat_policy.as_ref().map(|(_, policy)| policy),
                 stream_json_input,
                 &selected_harness.id,
                 &record.id,
@@ -6885,9 +6978,7 @@ fn post_daemon_request(coven_home: &Path, path: &str, body: &str) -> Result<u16>
     stream
         .write_all(request.as_bytes())
         .context("failed to write Coven daemon request")?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .context("failed to finish Coven daemon request")?;
+    daemon::finish_daemon_request(&stream).context("failed to finish Coven daemon request")?;
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
@@ -10668,6 +10759,87 @@ mod tests {
             "coven 0.7.0-3-gabc123 (engine not installed, pinned 0.6.1)"
         );
     }
+    #[test]
+    fn mobile_restore_install_accepts_every_base64url_prefix() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+        for prefix in 0_u8..64 {
+            let mut bytes = [0_u8; 32];
+            bytes[0] = prefix << 2;
+            let pin = URL_SAFE_NO_PAD.encode(bytes);
+            for equals in [false, true] {
+                let mut args: Vec<String> = [
+                    "coven",
+                    "memory",
+                    "mobile",
+                    "restore",
+                    "install",
+                    "--authority",
+                    "authority.json",
+                    "--snapshot-home",
+                    "snapshot",
+                    "--operation-id",
+                    "00000000-0000-0000-0000-000000000001",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+                if equals {
+                    args.push(format!("--installation-fingerprint={pin}"));
+                } else {
+                    args.extend(["--installation-fingerprint".to_owned(), pin.clone()]);
+                }
+                let parsed = Cli::try_parse_from(args).unwrap_or_else(|error| {
+                    panic!("valid base64url prefix {prefix}, equals={equals}: {error}")
+                });
+                match parsed.command {
+                    Some(Command::Memory {
+                        command:
+                            Some(MemoryCommand::Mobile {
+                                command:
+                                    MobileMemoryCommand::Restore {
+                                        command:
+                                            MobileRestoreCommand::Install {
+                                                installation_fingerprint,
+                                                ..
+                                            },
+                                    },
+                            }),
+                        ..
+                    }) => assert_eq!(installation_fingerprint, pin),
+                    other => panic!("expected mobile restore install, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mobile_restore_install_rejects_unknown_options_and_missing_values() {
+        let args = [
+            "coven",
+            "memory",
+            "mobile",
+            "restore",
+            "install",
+            "--authority",
+            "authority.json",
+            "--snapshot-home",
+            "snapshot",
+            "--operation-id",
+            "00000000-0000-0000-0000-000000000001",
+        ];
+        let mut unknown = args.to_vec();
+        unknown.extend([
+            "--installation-fingerprint",
+            "-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "--unrecognized-option",
+        ]);
+        assert!(Cli::try_parse_from(unknown).is_err());
+        let mut missing = args.to_vec();
+        missing.push("--installation-fingerprint");
+        assert!(Cli::try_parse_from(missing).is_err());
+    }
+
     #[test]
     fn mobile_restore_export_cli_requires_explicit_private_output() {
         for json in [false, true] {

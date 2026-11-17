@@ -190,6 +190,7 @@ jobs:
       - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
         env:
           COVEN_BUILD_VERSION: v${{ needs.verify-tag.outputs.npm_version }}
+          COVEN_BUILD_COMMIT: ${{ needs.verify-tag.outputs.head_sha }}
       # The per-mount NFS export process, which the daemon spawns and locates
       # beside its own executable. macOS only: `afs_mount::backend()` returns
       # None on other platforms, and the `mount` feature does not compile on
@@ -200,6 +201,7 @@ jobs:
         run: cargo build --release -p coven-afs --features mount --bins --target ${{ matrix.rust-target }}
         env:
           COVEN_BUILD_VERSION: v${{ needs.verify-tag.outputs.npm_version }}
+          COVEN_BUILD_COMMIT: ${{ needs.verify-tag.outputs.head_sha }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coven-${{ matrix.npm-target }}

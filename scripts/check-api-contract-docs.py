@@ -139,6 +139,11 @@ HEALTH_CAPABILITY_FIELDS = (
     "requestAdoptionContracts",
     "sessionPolicyContracts",
 )
+WINDOWS_LIFECYCLE_CAPABILITY_NOTE = 'Windows adds the optional 19th capability field, `lifecycleShutdown: "observed-workers-v1"`, alongside these 18 common fields. Older Windows daemons and non-Windows daemons omit it. Unknown values or types fail closed and do not permit legacy termination.'
+WINDOWS_LIFECYCLE_IDENTITY_CLAIM = 'The Windows stop client retains the authenticated daemon process HANDLE and opens a new owner-validated pipe bound to the same PID and process creation time. It sends `POST /api/v1/internal/lifecycle/shutdown` with `apiVersion: "coven.daemon.v1"` and the exact `daemon` object obtained from authenticated health. The daemon validates the serving identity before accepting shutdown; this internal owner-local route grants no TCP or mobile authority.'
+WINDOWS_LIFECYCLE_STOP_CLAIM = 'When health advertises `lifecycleShutdown: "observed-workers-v1"`, the client requires HTTP `202` with `ok: true`, the exact named `apiVersion`, `capabilities.structuredErrors: true`, the exact lifecycle contract, and the same `daemon` object. This acknowledgement accepts shutdown; it is not a stopped receipt. The client retains the pipe and process HANDLE and waits for daemon exit within its original two-second lifecycle deadline. The daemon observes owned mobile-worker exit and joins cleanup before releasing ownership. A timeout, malformed response, identity change, or required-contract refusal never permits root-termination fallback or status clearing. Legacy root termination is allowed only when the capability is absent and the authenticated same-instance pipe explicitly returns `404` or `405`; an absent capability alone is insufficient.'
+WINDOWS_LIFECYCLE_TABLE_DESCRIPTION = 'Windows only. Currently `"observed-workers-v1"`. Omitted on other platforms and older daemons; see [Windows lifecycle shutdown](#windows-lifecycle-shutdown).'
+
 O3_REQUIRED_LITERALS = (
     "/api/v1/adopted-sessions",
     "/api/v1/sessions/:id/adopted-input",
@@ -1991,7 +1996,12 @@ def validate_session_launch_policy_docs(documents: dict[str, str]) -> list[str]:
 
     expected_count = len(HEALTH_CAPABILITY_FIELDS)
     for path in HEALTH_CAPABILITY_COUNT_DOCS:
-        if not re.search(rf"\ball {expected_count}\b[^.\n]*\bfields\b", documents[path]):
+        heading, marker = HEALTH_CAPABILITY_LISTS[path]
+        section = markdown_section(documents[path], heading)
+        claims = markdown_paragraphs(section or "", marker)
+        if len(claims) != 1 or not re.search(
+            rf"\ball {expected_count}\b[^.]*\bfields\b", re.sub(r"\s+", " ", claims[0])
+        ):
             errors.append(f"{path}: health capability field count is stale")
 
     contract = documents["docs/API-CONTRACT.md"]
@@ -2390,6 +2400,41 @@ def validate_o3_negotiation_claims(
             )
 
 
+
+def validate_windows_lifecycle_docs(documents: dict[str, str], errors: list[str]) -> None:
+    # Keep the common JSON examples exactly 18 fields; validate the platform
+    # extension separately in its owning prose/table, never as arbitrary extras.
+    for path in HEALTH_CAPABILITY_LIST_DOCS:
+        heading = "Capability fields" if path == "docs/API-CONTRACT.md" else HEALTH_CAPABILITY_LISTS[path][0]
+        section = markdown_section(documents[path], heading, level=3 if path == "docs/API-CONTRACT.md" else 2)
+        notes = markdown_paragraphs(section or "", "Windows adds the optional")
+        expected = WINDOWS_LIFECYCLE_CAPABILITY_NOTE
+        if path != "docs/API-CONTRACT.md":
+            expected += ' See [Windows lifecycle shutdown](../API-CONTRACT.md#windows-lifecycle-shutdown) for owner validation, the required `202` acknowledgement, and the explicit `404`/`405` legacy-only fallback.'
+        if len(notes) != 1 or normalized_markdown_text(notes[0]) != normalized_markdown_text(expected):
+            errors.append(f"{path}: optional Windows lifecycle capability note is missing or invalid")
+
+    path = "docs/API-CONTRACT.md"
+    section = markdown_section(documents[path], "Capability fields", level=3)
+    table = markdown_table(section or "", ("Field", "Type", "Description"))
+    rows = markdown_table_rows(table, {"Field": "lifecycleShutdown"}) if table is not None else []
+    if len(rows) != 1 or (
+        markdown_cell_value(markdown_table_cell(table, rows[0], "Type")) != "optional string"
+        or normalized_markdown_text(markdown_table_cell(table, rows[0], "Description"))
+        != normalized_markdown_text(WINDOWS_LIFECYCLE_TABLE_DESCRIPTION)
+    ):
+        errors.append(f"{path}: optional Windows lifecycle capability row is missing or invalid")
+
+    section = markdown_section(documents[path], "Windows lifecycle shutdown", level=2)
+    for marker, expected in (
+        ("The Windows stop client", WINDOWS_LIFECYCLE_IDENTITY_CLAIM),
+        ("When health advertises", WINDOWS_LIFECYCLE_STOP_CLAIM),
+    ):
+        claims = markdown_paragraphs(section or "", marker)
+        if len(claims) != 1 or normalized_markdown_text(claims[0]) != normalized_markdown_text(expected):
+            errors.append(f"{path}: owner-validated Windows shutdown claim is missing or invalid ({marker})")
+
+
 def validate_o3_document_structures(documents: dict[str, str]) -> list[str]:
     """Validate O3 claims only inside the Markdown structures that own them."""
     errors: list[str] = []
@@ -2435,6 +2480,7 @@ def validate_o3_document_structures(documents: dict[str, str]) -> list[str]:
         )
 
     validate_capability_value_table(documents, errors)
+    validate_windows_lifecycle_docs(documents, errors)
     validate_session_policy_route_table(documents, errors)
 
     expected_count = len(HEALTH_CAPABILITY_FIELDS)
@@ -2513,8 +2559,7 @@ def validate_o3_document_structures(documents: dict[str, str]) -> list[str]:
     dto_claims = (
         markdown_paragraphs(
             compatibility,
-            "The complete current "
-            f"{len(HEALTH_CAPABILITY_FIELDS)}-field Rust health-capability DTO",
+            "The complete current Rust health-capability DTO",
         )
         if compatibility
         else []
@@ -2529,7 +2574,9 @@ def validate_o3_document_structures(documents: dict[str, str]) -> list[str]:
     elif not all(
         literal in dto_claims[0]
         for literal in (
-            f"{len(HEALTH_CAPABILITY_FIELDS)}-field",
+            f"{len(HEALTH_CAPABILITY_FIELDS)} common fields",
+            f"optional Windows-only {len(HEALTH_CAPABILITY_FIELDS) + 1}th field",
+            '`lifecycleShutdown: "observed-workers-v1"`',
             "../../docs/API-CONTRACT.md#get-apiv1health",
             "`requestAdoptionContracts`",
             "`sessionPolicyContracts`",

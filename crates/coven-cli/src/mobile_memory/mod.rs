@@ -17,6 +17,7 @@ pub mod policy_cli;
 pub mod recovery;
 pub mod registry;
 pub mod relay;
+mod store_lock;
 pub mod transport;
 
 use std::net::SocketAddr;
@@ -606,8 +607,7 @@ fn post_mobile_control_inner(
     stream
         .write_all(request.as_bytes())
         .context("failed to write mobile pairing control request")?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
+    crate::daemon::finish_daemon_request(&stream)
         .context("failed to finish mobile pairing control request")?;
     let deadline = Instant::now() + io_deadline;
     let mut response = Vec::new();

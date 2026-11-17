@@ -79,6 +79,8 @@ def classify(paths: list[str]) -> dict[str, bool]:
             'crates/coven-cli/src/engine_install.rs',
             'crates/coven-cli/engine.lock',
             'scripts/pin-engine.sh',
+            # Runs only against a real engine, which only that job installs.
+            'crates/coven-cli/tests/engine_keyless_turn.rs',
         }
         # A pinned toolchain or action lock changes what every job runs.
         is_workflow = path.startswith('.github/workflows/') or path in {

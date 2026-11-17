@@ -18,6 +18,7 @@ mod daemon_startup_diagnostics;
 
 struct DaemonGuard {
     coven_home: PathBuf,
+    armed: bool,
 }
 
 struct ExactProcessHandle(windows_sys::Win32::Foundation::HANDLE);
@@ -85,7 +86,9 @@ impl Drop for ExactProcessHandle {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
-        terminate_recorded_daemon(&self.coven_home);
+        if self.armed {
+            terminate_recorded_daemon(&self.coven_home);
+        }
     }
 }
 
@@ -483,6 +486,7 @@ fn inherited_legacy_status_with_dead_pid_does_not_wedge_lifecycle_commands() -> 
     assert!(exited.wait()?.success());
     let _guard = DaemonGuard {
         coven_home: coven_home.clone(),
+        armed: true,
     };
 
     write_inherited_legacy_status(&coven_home, exited_pid, &pipe_name)?;
@@ -621,7 +625,7 @@ fn inherited_legacy_status_rejects_cross_profile_and_arbitrary_records() -> Resu
 }
 
 #[test]
-fn abrupt_daemon_stop_kills_child_stalled_before_per_session_job_attachment() -> Result<()> {
+fn abrupt_daemon_termination_kills_child_stalled_before_per_session_job_attachment() -> Result<()> {
     let _real_daemon = real_daemon_test_lock();
     eprintln!("[windows-daemon-lifecycle] preparing fixture");
     let temp = tempfile::tempdir()?;
@@ -631,14 +635,19 @@ fn abrupt_daemon_stop_kills_child_stalled_before_per_session_job_attachment() ->
     let barrier = temp.path().join("strict-preattach");
     std::fs::create_dir_all(&project)?;
     std::fs::create_dir_all(&fake_bin)?;
+    std::fs::create_dir_all(&barrier)?;
+    // Startup also launches a strict mobile worker. Let startup children pass
+    // before arming this fixture for its one explicit per-session launch.
+    std::fs::write(barrier.join("release"), b"allow startup children\n")?;
 
     let fake_codex = fake_bin.join("codex.exe");
     compile_windows_probe(&fake_codex)?;
     eprintln!("[windows-daemon-lifecycle] fixture compiled");
 
     let path = prepend_path(&fake_bin);
-    let _guard = DaemonGuard {
+    let mut guard = DaemonGuard {
         coven_home: coven_home.clone(),
+        armed: true,
     };
     let mut start = Command::new(env!("CARGO_BIN_EXE_coven"));
     start
@@ -656,6 +665,35 @@ fn abrupt_daemon_stop_kills_child_stalled_before_per_session_job_attachment() ->
 
     let status = wait_for_daemon_status(&coven_home, &path)?;
     eprintln!("[windows-daemon-lifecycle] daemon health confirmed");
+    let daemon_pid = status["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .context("daemon status omitted a valid Windows PID")?;
+    let pipe_name = status["socket"]
+        .as_str()
+        .context("daemon status omitted its pipe")?;
+    let creation_time = status["processCreationTime"]
+        .as_str()
+        .context("daemon status omitted its creation time")?
+        .parse::<u64>()?;
+    // Retain the exact authenticated root before a session is deliberately
+    // stalled. This fixture tests abrupt lifetime-Job closure, independently
+    // of the normal CLI's now-cooperative shutdown path.
+    let daemon_process = coven_client::open_windows_daemon_process_for_stop_with_creation_time(
+        pipe_name,
+        daemon_pid,
+        Some(creation_time),
+        Duration::from_secs(2),
+    )?
+    .context("could not retain the authenticated Windows daemon for abrupt termination")?;
+    for name in ["pid", "ready"] {
+        match std::fs::remove_file(barrier.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("clear startup-only pre-attachment marker"),
+        }
+    }
+    std::fs::remove_file(barrier.join("release"))?;
     let launch_stream =
         send_launch_request(&status, &project, "stall before per-session Job attachment")?;
     eprintln!("[windows-daemon-lifecycle] launch request sent");
@@ -673,26 +711,43 @@ fn abrupt_daemon_stop_kills_child_stalled_before_per_session_job_attachment() ->
     );
 
     let started = Instant::now();
-    let stop = Command::new(env!("CARGO_BIN_EXE_coven"))
-        .args(["daemon", "stop"])
-        .env("COVEN_HOME", &coven_home)
-        .env("PATH", &path)
-        .output()?;
-    assert_success("abrupt Windows daemon stop", &stop);
-    eprintln!("[windows-daemon-lifecycle] daemon stop returned");
+    let stopped = daemon_process.terminate_and_wait_until(started + Duration::from_secs(2))?;
+    let elapsed = started.elapsed();
+    if stopped {
+        // The exact root is already dead. Never reopen its stale numeric PID
+        // during assertion/audit failure cleanup after its HANDLE was consumed.
+        guard.armed = false;
+    }
+    eprintln!(
+        "[windows-daemon-lifecycle] verified abrupt daemon termination returned after {elapsed:?}"
+    );
     assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "Windows daemon stop exceeded its documented two-second contract"
+        stopped && elapsed < Duration::from_secs(2),
+        "verified abrupt Windows daemon termination exceeded the strict two-second contract: exited={stopped} elapsed={elapsed:?}"
     );
     wait_until("inherited daemon Job child termination", || {
         Ok(!process_is_alive(child_pid))
     })?;
+    // Close the dead owner's unanswered request before probing its absent pipe.
     drop(launch_stream);
+    // Raw termination intentionally bypassed CLI status cleanup. After both
+    // the exact root and selected child are observed dead, use the ordinary
+    // fingerprint-aware dead-owner audit rather than unlinking status here.
+    let audit = Command::new(env!("CARGO_BIN_EXE_coven"))
+        .args(["daemon", "stop"])
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .output()?;
+    assert_success("audit observed-dead abrupt Windows daemon", &audit);
+    assert!(
+        !coven_home.join("daemon.json").exists(),
+        "dead-owner audit left stale status for DaemonGuard teardown"
+    );
     Ok(())
 }
 
 #[test]
-fn abrupt_daemon_stop_kills_live_piped_descendants() -> Result<()> {
+fn daemon_stop_kills_live_piped_descendants() -> Result<()> {
     let _real_daemon = real_daemon_test_lock();
     let temp = tempfile::tempdir()?;
     let coven_home = temp.path().join("coven-home");
@@ -707,6 +762,7 @@ fn abrupt_daemon_stop_kills_live_piped_descendants() -> Result<()> {
     let path = prepend_path(&fake_bin);
     let _guard = DaemonGuard {
         coven_home: coven_home.clone(),
+        armed: true,
     };
     let mut start = Command::new("node.exe");
     start
@@ -746,7 +802,9 @@ fn abrupt_daemon_stop_kills_live_piped_descendants() -> Result<()> {
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &path)
         .output()?;
-    assert_success("abrupt Windows daemon stop with descendant", &stop);
+    // Public CLI stop remains covered here; abrupt lifetime-Job closure is
+    // selected separately by the pre-attachment fixture above.
+    assert_success("Windows daemon stop with descendant", &stop);
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "Windows daemon stop exceeded its documented two-second contract"

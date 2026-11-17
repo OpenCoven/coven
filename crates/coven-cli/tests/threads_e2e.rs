@@ -54,6 +54,11 @@ mod corpus_closure_cases {
     include!("support/threads_corpus_closure_cases.rs");
 }
 
+#[cfg(feature = "threads-test-clock")]
+mod ward_power_loss_cases {
+    include!("support/threads_ward_power_loss_cases.rs");
+}
+
 #[test]
 fn smoke_bounded_ward_apply_over_real_daemon() -> Result<()> {
     run_journey("smoke-bounded-ward-apply", |fixture| {

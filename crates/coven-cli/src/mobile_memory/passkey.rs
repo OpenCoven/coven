@@ -142,13 +142,11 @@ struct PasskeyStoreLock {
 
 impl PasskeyStoreLock {
     fn acquire(directory: &Path) -> Result<Self> {
-        let process = PASSKEY_WRITE_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("passkey store lock was poisoned"))?;
+        let process = super::store_lock::process(&PASSKEY_WRITE_LOCK)
+            .context("passkey store lock unavailable")?;
         let path = directory.join(PASSKEY_LOCK_FILE);
         let file = crate::state_lock::open_lock_file(&path)?;
-        file.lock_exclusive()
-            .with_context(|| format!("failed to lock {}", path.display()))?;
+        super::store_lock::lock_exclusive(&file, &path)?;
         Ok(Self {
             _process: process,
             file,

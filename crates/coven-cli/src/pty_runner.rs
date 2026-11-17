@@ -247,6 +247,33 @@ impl ChildKiller for SharedPtyKiller {
 }
 
 impl HarnessCommand {
+    pub(crate) fn bind_chat_workspace_policy(
+        &mut self,
+        file: &Path,
+        policy: &crate::chat_workspace_policy::ChatWorkspacePolicy,
+    ) -> Result<()> {
+        let program = Path::new(&self.program);
+        anyhow::ensure!(program.is_absolute(),
+            "Workspace access requires a resolved Coven Code installation. Update Coven Code and retry.");
+        policy.require_protected(program)?;
+        let end = self
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .context("Missing Coven Code prompt boundary")?;
+        self.args.splice(
+            end..end,
+            [
+                "--chat-workspace-policy-v1".into(),
+                file.canonicalize()?
+                    .to_str()
+                    .context("Invalid workspace policy path")?
+                    .into(),
+            ],
+        );
+        Ok(())
+    }
+
     pub fn program(&self) -> &str {
         &self.program
     }
@@ -554,7 +581,10 @@ fn build_harness_command_with_conversation_inner(
         cfg!(windows) || force_codex_stdin,
     );
     let (program, args) = qualify_scoped_write_command(cwd, options, program, args)?;
-    let (program, env_overrides) = prepare_harness_program(harness_id, mode, program)?;
+    let policy = crate::claude_policy::for_launch(harness_id, mode, options)?;
+    let args = policy.prepend_args(harness_id, mode, &program, args);
+    let (program, mut env_overrides) = prepare_harness_program(harness_id, mode, program)?;
+    env_overrides.extend(policy.env);
 
     Ok(HarnessCommand {
         program,
@@ -1895,7 +1925,7 @@ fn terminate_unix_process_group(pid: u32) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn poll_child_exit_without_reaping(child: &std::process::Child) -> io::Result<bool> {
+pub(crate) fn poll_child_exit_without_reaping(child: &std::process::Child) -> io::Result<bool> {
     loop {
         // POSIX leaves siginfo contents unspecified when WNOHANG finds no
         // waitable child, so initialize it for every call and trust si_pid
@@ -3847,11 +3877,11 @@ pub fn build_stream_harness_command_with_conversation(
         args,
     );
     let (program, args) = qualify_scoped_write_command(cwd, options, program, args)?;
-    let (program, env_overrides) = prepare_harness_program(
-        harness_id,
-        crate::harness::HarnessLaunchMode::Stream,
-        program,
-    )?;
+    let mode = crate::harness::HarnessLaunchMode::Stream;
+    let policy = crate::claude_policy::for_launch(harness_id, mode, options)?;
+    let args = policy.prepend_args(harness_id, mode, &program, args);
+    let (program, mut env_overrides) = prepare_harness_program(harness_id, mode, program)?;
+    env_overrides.extend(policy.env);
     Ok(HarnessCommand {
         program,
         args,
@@ -4322,8 +4352,9 @@ impl NativeStreamExit {
     }
 }
 
-pub fn stream_harness<W: Write>(
+pub(crate) fn stream_harness_with_chat_policy<W: Write>(
     command: &HarnessCommand,
+    policy: Option<&crate::chat_workspace_policy::ChatWorkspacePolicy>,
     forward_stdin: bool,
     harness_id: &str,
     ledger_session_id: &str,
@@ -4340,6 +4371,7 @@ pub fn stream_harness<W: Write>(
         ledger_session_id,
         privacy,
         out,
+        policy,
     )
 }
 
@@ -4579,6 +4611,7 @@ fn native_result_error(
         .map(|text| native_failure_text(text, privacy))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_native_stream_line<W: Write>(
     line: &str,
     harness_id: &str,
@@ -4586,6 +4619,8 @@ fn normalize_native_stream_line<W: Write>(
     out: &mut W,
     harness_error: &mut Option<String>,
     privacy: &crate::privacy::PrivacyConfig,
+    policy: Option<&crate::chat_workspace_policy::ChatWorkspacePolicy>,
+    workspace_admitted: &mut bool,
 ) -> Result<()> {
     if line.trim().is_empty() {
         return Ok(());
@@ -4595,6 +4630,18 @@ fn normalize_native_stream_line<W: Write>(
     let object = frame
         .as_object_mut()
         .with_context(|| format!("invalid JSON object from {harness_id} native stream"))?;
+    if let Some(policy) = policy {
+        let init = object.get("type").and_then(serde_json::Value::as_str) == Some("system")
+            && object.get("subtype").and_then(serde_json::Value::as_str) == Some("init");
+        if !*workspace_admitted {
+            anyhow::ensure!(init, "Coven Code returned output before confirming workspace write access. Update Coven Code and retry.");
+            policy.verify_receipt(object.get("effectiveAccess"))?;
+            *workspace_admitted = true;
+        } else if init {
+            // The scoped startup already supplied the one canonical init.
+            return Ok(());
+        }
+    }
     if let Some(error) = native_result_error(object, privacy) {
         *harness_error = Some(error);
     }
@@ -4666,6 +4713,7 @@ fn stream_harness_with_program_and_env<W: Write>(
         ledger_session_id,
         &crate::privacy::PrivacyConfig::default(),
         out,
+        None,
     )
 }
 
@@ -4680,6 +4728,7 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
     ledger_session_id: &str,
     privacy: &crate::privacy::PrivacyConfig,
     out: &mut W,
+    policy: Option<&crate::chat_workspace_policy::ChatWorkspacePolicy>,
 ) -> Result<NativeStreamExit> {
     let mut command = std::process::Command::new(program);
     command
@@ -4795,6 +4844,7 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
     let mut stderr_closed = false;
     let mut stderr_tail = String::new();
     let mut stderr_forwarded = false;
+    let mut workspace_admitted = false;
     let mut harness_error: Option<String> = None;
     let mut post_exit_deadline = None;
     let mut post_exit_queued_messages = 0_usize;
@@ -4877,6 +4927,8 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
                         out,
                         &mut harness_error,
                         privacy,
+                        policy,
+                        &mut workspace_admitted,
                     )?;
                 }
                 Ok(NativeStreamMessage::ReadError(error)) => {
@@ -4918,6 +4970,11 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
         Some(status) => status,
         None => waited_status?,
     };
+    if policy.is_some() && !workspace_admitted {
+        anyhow::bail!(
+            "Coven Code did not establish workspace write access. Update Coven Code and retry."
+        );
+    }
     // The reader publishes only at end of stream, so an unfinished capture holds
     // an unredacted prefix that must stay private. Say it is missing instead of
     // reporting an empty tail, which would read as a harness that wrote nothing.
@@ -6607,6 +6664,11 @@ fn env_u16(name: &str) -> Option<u16> {
         .parse()
         .ok()
         .filter(|value| *value > 0)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_macos_process_has_exited(pid: u32) -> std::io::Result<bool> {
+    process_exit_test::macos_process_has_exited(pid)
 }
 
 #[cfg(all(test, unix))]

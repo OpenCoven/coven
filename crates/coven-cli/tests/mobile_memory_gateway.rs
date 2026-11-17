@@ -46,6 +46,44 @@ fn mobile_enable_rejects_public_and_wildcard_bindings_without_state() {
 }
 
 #[test]
+fn mobile_restore_install_short_hyphen_pin_reaches_strict_validation_without_state() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    let home = tempfile::tempdir().unwrap();
+    let snapshot = tempfile::tempdir().unwrap();
+    let authority = snapshot.path().join("missing-authority.json");
+    let pin = URL_SAFE_NO_PAD.encode([0xf8]);
+    assert!(pin.starts_with('-'));
+    let output = coven(
+        home.path(),
+        &[
+            "memory",
+            "mobile",
+            "restore",
+            "install",
+            "--authority",
+            authority.to_str().unwrap(),
+            "--snapshot-home",
+            snapshot.path().to_str().unwrap(),
+            "--installation-fingerprint",
+            &pin,
+            "--operation-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--json",
+        ],
+    );
+    assert!(!output.status.success(), "{output:?}");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("installation fingerprint must be 32 bytes"),
+        "{output:?}"
+    );
+    assert!(!error.contains("unexpected argument"), "{output:?}");
+    assert!(!home.path().join("mobile").exists());
+    assert!(!authority.exists());
+}
+
+#[test]
 fn restore_authority_export_cli_preserves_revocation_and_reports_exact_artifact_digest() {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use p256::ecdsa::SigningKey;

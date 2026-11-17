@@ -97,7 +97,11 @@ impl ProcessLauncher for SystemProcessLauncher {
     }
 }
 
-pub fn probe_version(request: &LaunchRequest, timeout: Duration) -> io::Result<Option<String>> {
+pub fn probe_version(
+    request: &LaunchRequest,
+    provider: super::ProviderId,
+    timeout: Duration,
+) -> io::Result<Option<String>> {
     let mut command = Command::new(&request.executable);
     command
         .args(&request.args)
@@ -151,17 +155,8 @@ pub fn probe_version(request: &LaunchRequest, timeout: Duration) -> io::Result<O
     }
     Ok(extract_version(
         &String::from_utf8_lossy(&output),
-        version_program_marker(&request.executable),
+        Some(provider.as_str()),
     ))
-}
-
-fn version_program_marker(executable: &std::path::Path) -> Option<&str> {
-    let file_name = executable.file_name()?.to_str()?;
-    if valid_version(file_name) {
-        Some(file_name)
-    } else {
-        executable.file_stem()?.to_str()
-    }
 }
 
 fn apply_launch_context(command: &mut Command, request: &LaunchRequest) {
@@ -672,15 +667,9 @@ mod version_extraction_tests {
     use super::*;
 
     #[test]
-    fn numeric_canonical_executable_name_is_kept_as_version_marker() {
-        let executable = std::path::Path::new("managed/claude/versions/2.1.258");
+    fn numeric_managed_installation_banner_uses_provider_identity() {
         assert_eq!(
-            version_program_marker(executable),
-            Some("2.1.258"),
-            "file_stem would incorrectly truncate this marker to 2.1"
-        );
-        assert_eq!(
-            extract_version("2.1.258 (Claude Code)", version_program_marker(executable)),
+            extract_version("2.1.258 (Claude Code)", Some("claude")),
             Some("2.1.258".to_owned())
         );
     }

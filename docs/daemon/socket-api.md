@@ -62,7 +62,9 @@ GET /api/v1/health
 }
 ```
 
-This example contains all 18 health capability fields: `sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `eventCursor`, `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`, `sessionClaudeWriteScope`, `afs`, `afsMount`, `afsCommit`, `afsCommitDryRun`, `executionBindingContracts`, and `requestAdoptionContracts`, and `sessionPolicyContracts`.
+This example contains all 18 common health capability fields: `sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `eventCursor`, `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`, `sessionClaudeWriteScope`, `afs`, `afsMount`, `afsCommit`, `afsCommitDryRun`, `executionBindingContracts`, `requestAdoptionContracts`, and `sessionPolicyContracts`.
+
+Windows adds the optional 19th capability field, `lifecycleShutdown: "observed-workers-v1"`, alongside these 18 common fields. Older Windows daemons and non-Windows daemons omit it. Unknown values or types fail closed and do not permit legacy termination. See [Windows lifecycle shutdown](../API-CONTRACT.md#windows-lifecycle-shutdown) for owner validation, the required `202` acknowledgement, and the explicit `404`/`405` legacy-only fallback.
 
 `sessionPolicyContracts` is `["coven.session-policy.v1"]` over owner-local IPC
 and `[]` over TCP. It advertises only the refusal-only restricted admission

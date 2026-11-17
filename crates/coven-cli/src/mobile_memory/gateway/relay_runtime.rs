@@ -82,6 +82,7 @@ struct Retry {
 pub(super) struct RelayHandle {
     stop: Arc<Stop>,
     registry: Arc<DeviceRegistry>,
+    storage_runtime: super::super::store_lock::Runtime,
     thread: Option<JoinHandle<()>>,
 }
 impl RelayHandle {
@@ -90,18 +91,21 @@ impl RelayHandle {
         let stop = Arc::new(Stop::default());
         let manager_stop = Arc::clone(&stop);
         let registry = Arc::clone(&state.registry);
+        let storage_runtime = state.storage_runtime.clone();
         let thread = std::thread::Builder::new()
             .name("coven-relay-manager".into())
             .spawn(move || manage(state, signer, manager_stop))?;
         Ok(Self {
             stop,
             registry,
+            storage_runtime,
             thread: Some(thread),
         })
     }
 }
 impl Drop for RelayHandle {
     fn drop(&mut self) {
+        self.storage_runtime.cancel();
         self.stop.request();
         self.registry.cancel_pending_operations();
         if let Some(thread) = self.thread.take() {
@@ -111,6 +115,7 @@ impl Drop for RelayHandle {
 }
 
 fn manage(state: Arc<MobileGatewayState>, signer: Arc<SigningKey>, stop: Arc<Stop>) {
+    let _storage_scope = state.storage_runtime.enter();
     let mut workers: BTreeMap<Uuid, Worker> = BTreeMap::new();
     let mut retries: BTreeMap<Uuid, Retry> = BTreeMap::new();
     let mut configuration: Option<storage::RelayConfig> = None;
@@ -319,6 +324,7 @@ fn serve(
     control: Arc<WorkerControl>,
     authenticated: Arc<AtomicBool>,
 ) -> Result<()> {
+    let _storage_scope = state.storage_runtime.enter();
     let mut connection = state
         .connections
         .begin(transport::connection::Transport::Relay)?;
