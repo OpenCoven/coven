@@ -471,7 +471,9 @@ impl<S: Read + Write> WebSocketRecords<S> {
 impl<S: Read + Write> WebSocketRecords<S> {
     /// Consume one inbound frame. Control frames keep the wait going (a read
     /// ping queues Tungstenite's pong, which the flush writes); anything other
-    /// than a binary record or a control frame fails the channel.
+    /// than a binary record or a control frame fails the channel. The error
+    /// names the frame, and a close's status code, so a report says what the
+    /// relay did. A close's reason text is the relay's and is not repeated.
     fn admit(&mut self, message: Message) -> Result<Option<Vec<u8>>> {
         self.attempt.ensure_active()?;
         match message {
@@ -482,7 +484,12 @@ impl<S: Read + Write> WebSocketRecords<S> {
                     .map_err(|_| anyhow::anyhow!("relay control write failed"))?;
                 Ok(None)
             }
-            _ => bail!("unexpected relay record"),
+            Message::Close(Some(frame)) => {
+                bail!("unexpected relay record: close {}", u16::from(frame.code))
+            }
+            Message::Close(None) => bail!("unexpected relay record: close without a status code"),
+            Message::Text(_) => bail!("unexpected relay record: text"),
+            Message::Frame(_) => bail!("unexpected relay record: raw frame"),
         }
     }
 }

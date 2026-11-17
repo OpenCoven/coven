@@ -412,8 +412,23 @@ async fn relay_loop(
         match event {
             Event::Disconnected => {
                 let close = disconnected.borrow_and_update().clone();
+                // The peer queued these before it left, so they precede its
+                // close: a peer that answers and then ends its channel must
+                // not lose the answer. Delivery shares the one send budget the
+                // close already had, so a stalled socket releases the room no
+                // later than before.
+                let deadline = Instant::now() + SEND_TIMEOUT;
+                while let Ok(outgoing) = inbox.try_recv() {
+                    let (sent, _) = deliver_queued_message(outgoing, |message| {
+                        send_until(socket, message, deadline)
+                    })
+                    .await;
+                    if sent.is_err() {
+                        break;
+                    }
+                }
                 if let Some(close) = close {
-                    let _ = send_with_timeout(socket, close).await;
+                    let _ = send_until(socket, close, deadline).await;
                 }
                 break;
             }
@@ -488,7 +503,11 @@ where
 }
 
 async fn send_with_timeout(socket: &mut WebSocket, message: Message) -> Result<(), ()> {
-    match tokio::time::timeout(SEND_TIMEOUT, socket.send(message)).await {
+    send_until(socket, message, Instant::now() + SEND_TIMEOUT).await
+}
+
+async fn send_until(socket: &mut WebSocket, message: Message, deadline: Instant) -> Result<(), ()> {
+    match tokio::time::timeout_at(deadline, socket.send(message)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) | Err(_) => Err(()),
     }
