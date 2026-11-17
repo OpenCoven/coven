@@ -975,11 +975,31 @@ jobs:
           COVEN_NPM_DRY_RUN_VERSION: 999.0.0
 
   engine-contract:
-    name: engine contract
+    name: engine contract (${{ matrix.platform }})
     needs: changes
     if: ${{ github.event_name == 'push' || needs.changes.outputs.engine == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.job-timeout }}
+    # One leg per engine archive that a hosted Linux or Windows runner can
+    # run (#1788). The pin names a different archive for each, and Windows
+    # unpacks a .zip and runs coven-code.exe. `fail-fast: false` keeps one
+    # platform's failure from cancelling the others' evidence.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            job-timeout: 20
+          - platform: linux-aarch64
+            os: ubuntu-24.04-arm
+            job-timeout: 20
+          - platform: windows-x86_64
+            os: windows-latest
+            job-timeout: 30
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -991,19 +1011,27 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-rust-engine-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-engine-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-rust-engine-
-      - name: Install native link dependencies
-        run: bash scripts/install-native-link-dependencies.sh
+            ${{ runner.os }}-${{ runner.arch }}-rust-engine-
+      # libopenblas-dev links coven; the Linux engine binary loads
+      # libasound.so.2 at start (OpenCoven/coven-code#505).
+      - name: Install native link dependencies and the engine's ALSA library (Linux only)
+        if: runner.os == 'Linux'
+        run: bash scripts/install-native-link-dependencies.sh libopenblas-dev libasound2t64
       - name: Build coven
         run: cargo build -p coven-cli --locked
       - name: Install the pinned engine
         run: cargo run -p coven-cli --locked -- engine install
       - name: Run contract tests against the pinned engine
         run: |
-          ENGINE="$HOME/.coven/engine/$(cat "$HOME/.coven/engine/current")/coven-code"
+          cargo run --quiet -p coven-cli --locked -- engine status
+          ENGINE="$(cargo run --quiet -p coven-cli --locked -- engine which)"
           echo "engine: $ENGINE"
+          case "$ENGINE" in
+            *.coven*engine*) ;;
+            *) echo "::error::coven resolved an engine outside its managed directory: $ENGINE"; exit 1 ;;
+          esac
           "$ENGINE" --version
           COVEN_ENGINE_BIN="$ENGINE" cargo test -p coven-cli --locked contract -- --nocapture
 
