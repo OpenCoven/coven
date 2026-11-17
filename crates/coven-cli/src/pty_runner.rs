@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -4309,6 +4309,7 @@ fn spawn_captured_drain(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeStreamExit {
     pub budget_result: Option<crate::run_budget::Receipt>,
+    pub budget_queries_complete: bool,
     pub exit_code: i32,
     pub harness_error: Option<String>,
     pub stderr_tail: String,
@@ -4546,7 +4547,25 @@ fn spawn_native_stdout_reader(
     });
 }
 
-fn spawn_native_stdin_forwarder(child_stdin: std::process::ChildStdin, stopped: Arc<AtomicBool>) {
+fn count_native_inputs(bytes: &[u8], count: &AtomicUsize, in_line: &mut bool) {
+    // Count every nonempty JSONL input as potential work, before delivery.
+    // Partial writes and unknown/control frames can only deny continuation;
+    // they cannot make an older result authorize unconfirmed later work.
+    for byte in bytes {
+        if *byte == b'\n' {
+            *in_line = false;
+        } else if !byte.is_ascii_whitespace() && !*in_line {
+            count.fetch_add(1, Ordering::SeqCst);
+            *in_line = true;
+        }
+    }
+}
+
+fn spawn_native_stdin_forwarder(
+    child_stdin: std::process::ChildStdin,
+    stopped: Arc<AtomicBool>,
+    inputs: Arc<AtomicUsize>,
+) {
     #[cfg(unix)]
     thread::spawn(move || {
         use std::os::fd::AsRawFd;
@@ -4555,6 +4574,7 @@ fn spawn_native_stdin_forwarder(child_stdin: std::process::ChildStdin, stopped: 
         let fd = stdin.as_raw_fd();
         let mut child_stdin = child_stdin;
         let mut buffer = [0_u8; 4096];
+        let mut in_line = false;
         while !stopped.load(Ordering::Relaxed) {
             let mut poll_fd = libc::pollfd {
                 fd,
@@ -4575,6 +4595,7 @@ fn spawn_native_stdin_forwarder(child_stdin: std::process::ChildStdin, stopped: 
             if count <= 0 {
                 break;
             }
+            count_native_inputs(&buffer[..count as usize], &inputs, &mut in_line);
             if stopped.load(Ordering::Relaxed)
                 || child_stdin.write_all(&buffer[..count as usize]).is_err()
                 || child_stdin.flush().is_err()
@@ -4590,11 +4611,13 @@ fn spawn_native_stdin_forwarder(child_stdin: std::process::ChildStdin, stopped: 
         let mut handle = stdin.lock();
         let mut child_stdin = child_stdin;
         let mut buffer = String::new();
+        let mut in_line = false;
         while !stopped.load(Ordering::Relaxed) {
             buffer.clear();
             match handle.read_line(&mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
+                    count_native_inputs(buffer.as_bytes(), &inputs, &mut in_line);
                     if stopped.load(Ordering::Relaxed)
                         || child_stdin.write_all(buffer.as_bytes()).is_err()
                         || child_stdin.flush().is_err()
@@ -4640,9 +4663,9 @@ fn normalize_native_stream_line<W: Write>(
     privacy: &crate::privacy::PrivacyConfig,
     policy: Option<&crate::chat_workspace_policy::ChatWorkspacePolicy>,
     workspace_admitted: &mut bool,
-) -> Result<()> {
+) -> Result<bool> {
     if line.trim().is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let mut frame: serde_json::Value = serde_json::from_str(line)
         .with_context(|| format!("invalid JSON from {harness_id} native stream"))?;
@@ -4658,7 +4681,7 @@ fn normalize_native_stream_line<W: Write>(
             *workspace_admitted = true;
         } else if init {
             // The scoped startup already supplied the one canonical init.
-            return Ok(());
+            return Ok(false);
         }
     }
     if harness_id == crate::engine::ENGINE_HARNESS_ID
@@ -4680,6 +4703,9 @@ fn normalize_native_stream_line<W: Write>(
     if let Some(error) = native_result_error(object, privacy) {
         *harness_error = Some(error);
     }
+    let budget_completed = harness_id == crate::engine::ENGINE_HARNESS_ID
+        && object.get("type").and_then(serde_json::Value::as_str) == Some("result")
+        && budget_result.is_some();
     if !object.contains_key("harness_session_id") {
         if let Some(native_session_id) = object
             .get("session_id")
@@ -4700,7 +4726,8 @@ fn normalize_native_stream_line<W: Write>(
         .with_context(|| format!("forwarding {harness_id} stdout"))?;
     writeln!(out).with_context(|| format!("forwarding {harness_id} stdout"))?;
     out.flush()
-        .with_context(|| format!("flushing {harness_id} stdout"))
+        .with_context(|| format!("flushing {harness_id} stdout"))?;
+    Ok(budget_completed)
 }
 
 #[cfg(test)]
@@ -4831,6 +4858,7 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
         }
     };
     let stdin_stopped = Arc::new(AtomicBool::new(false));
+    let inputs = Arc::new(AtomicUsize::new(0));
     let child_stdin = if forward_stdin {
         match child.stdin.take() {
             Some(stdin) => Some(stdin),
@@ -4857,7 +4885,7 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
     spawn_native_stdout_reader(child_stdout, sender.clone());
     spawn_native_stderr_reader(child_stderr, sender, privacy.clone());
     if let Some(child_stdin) = child_stdin {
-        spawn_native_stdin_forwarder(child_stdin, Arc::clone(&stdin_stopped));
+        spawn_native_stdin_forwarder(child_stdin, Arc::clone(&stdin_stopped), Arc::clone(&inputs));
     }
 
     let activation_signal = match cancellation.activate() {
@@ -4882,6 +4910,7 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
     let mut workspace_admitted = false;
     let mut harness_error: Option<String> = None;
     let mut budget_result = None;
+    let mut completed_budget_queries = 0;
     let mut post_exit_deadline = None;
     let mut post_exit_queued_messages = 0_usize;
     let post_exit_drain_timeout = native_post_exit_drain_timeout();
@@ -4956,7 +4985,7 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
 
             match message {
                 Ok(NativeStreamMessage::Line(line)) => {
-                    normalize_native_stream_line(
+                    if normalize_native_stream_line(
                         &line,
                         harness_id,
                         ledger_session_id,
@@ -4966,7 +4995,9 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
                         privacy,
                         policy,
                         &mut workspace_admitted,
-                    )?;
+                    )? {
+                        completed_budget_queries += 1;
+                    }
                 }
                 Ok(NativeStreamMessage::ReadError(error)) => {
                     anyhow::bail!("reading {harness_id} stdout: {error}");
@@ -5023,8 +5054,16 @@ fn stream_harness_with_program_and_env_and_privacy<W: Write>(
     if !stderr_closed {
         stderr_tail = NATIVE_STDERR_OMITTED.to_string();
     }
+    let budget_queries_complete =
+        !forward_stdin || inputs.load(Ordering::SeqCst) == completed_budget_queries;
+    if forward_stdin && (!budget_queries_complete || !status.success()) {
+        if let Some(receipt) = budget_result.as_mut() {
+            receipt.continuation.resumable = false;
+        }
+    }
     Ok(NativeStreamExit {
         budget_result,
+        budget_queries_complete,
         exit_code: status.code().unwrap_or(1),
         harness_error,
         stderr_tail,
@@ -9602,6 +9641,7 @@ exit 1
     fn native_stream_failure_summary_without_stderr_names_only_the_exit_code() {
         let exit = NativeStreamExit {
             budget_result: None,
+            budget_queries_complete: true,
             exit_code: 3,
             harness_error: None,
             stderr_tail: "   \n".to_string(),

@@ -6143,7 +6143,11 @@ fn run_session(
                 &mut budget_engine,
             )?
         } else {
-            store::insert_session(&conn, &record)?;
+            if budget_engine.is_some() {
+                run_budget::state::start_fresh(&conn, &record)?;
+            } else {
+                store::insert_session(&conn, &record)?;
+            }
             None
         }
     } else {
@@ -6360,6 +6364,9 @@ fn run_session(
         };
         let mut budget_result = stream_exit.budget_result.clone();
         let mut confirmation_error = match budget_result.as_ref() {
+            Some(_) if !stream_exit.budget_queries_complete => Some(
+                "The streamed engine did not confirm a saved result for all forwarded input; unfinished work cannot safely continue.".to_owned()
+            ),
             Some(receipt) => run_budget::validate_applied(receipt, max_turns, engine_claim.as_ref()).err().map(|error| error.to_string()),
             None if (max_turns.is_some() || engine_claim.is_some()) && stream_exit.harness_error.is_none() && stream_exit.exit_code == 0 =>
                 Some("The engine did not confirm its applied budget and saved continuation; unfinished work is retained.".to_owned()),
@@ -6381,6 +6388,12 @@ fn run_session(
             if confirmation_error.is_some() {
                 receipt.continuation.resumable = false;
             }
+        }
+        if !stream_exit.budget_queries_complete {
+            // Its receipt belongs to an earlier query. Keep it as durable
+            // evidence above, but do not present its outcome/count as the
+            // final unconfirmed query's applied result.
+            budget_result = None;
         }
         let exit_code = if confirmation_error.is_some() {
             1

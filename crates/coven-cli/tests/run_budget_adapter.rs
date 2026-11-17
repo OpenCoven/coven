@@ -65,6 +65,128 @@ fn frames(o: &Output) -> Vec<Value> {
 }
 
 #[test]
+fn later_streamed_input_needs_its_own_saved_result_before_continuation() {
+    use std::io::Write;
+    for (complete, exit) in [(false, 0), (false, 7), (true, 0)] {
+        let f = Fixture::new();
+        let engine = f.0.path().join("engine");
+        let complete_python = if complete { "True" } else { "False" };
+        let source = fs::read_to_string(&engine).unwrap().replace(
+            "print(os.environ.get('TEST_BUDGET_RESULT',json.dumps(normal)))",
+            &format!(
+                "sys.stdin.readline()\nprint(json.dumps(normal),flush=True)\nsys.stdin.readline()\npathlib.Path('later-effect').write_text('performed')\nprint(json.dumps({{'type':'text_delta','text':'later partial work'}}),flush=True)\nif {complete_python}: print(json.dumps(normal),flush=True)\n"
+            ),
+        );
+        fs::write(engine, source).unwrap();
+        let mut child = f
+            .command()
+            .env("TEST_ENGINE_EXIT", exit.to_string())
+            .args([
+                "run",
+                "coven-code",
+                "--max-turns",
+                "12",
+                "--stream-json",
+                "--stream-json-input",
+                "--",
+                "work",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = format!("{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{}\"}}}}\n{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"second\"}}}}\n", "x".repeat(8192));
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            fs::read_to_string(f.0.path().join("later-effect")).unwrap(),
+            "performed"
+        );
+        let all = frames(&output);
+        let last = all.last().unwrap();
+        if complete {
+            assert_eq!(last["continuation"]["resumable"], exit == 0, "{output:?}");
+        } else {
+            assert!(last.get("continuation").is_none(), "{output:?}");
+            assert!(last.get("outcome").is_none(), "{output:?}");
+        }
+        if !complete {
+            assert_eq!(last["is_error"], true, "{output:?}");
+            fs::remove_file(f.0.path().join("argv.json")).unwrap();
+            let resumed = f
+                .command()
+                .args([
+                    "run",
+                    "coven-code",
+                    "--continue",
+                    last["session_id"].as_str().unwrap(),
+                    "--max-turns",
+                    "12",
+                    "--",
+                    "resume",
+                ])
+                .output()
+                .unwrap();
+            assert!(!resumed.status.success(), "{resumed:?}");
+            assert!(!f.0.path().join("argv.json").exists());
+        }
+    }
+}
+
+#[test]
+fn a_fresh_budgeted_history_is_pending_before_other_aliases_can_resume_it() {
+    use std::io::{BufRead, BufReader, Read};
+    let f = Fixture::new();
+    let mut child = f
+        .command()
+        .env("TEST_RESULT_GATE", "1")
+        .args([
+            "run",
+            "coven-code",
+            "--max-turns",
+            "12",
+            "--stream-json",
+            "--",
+            "work",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    reader.read_line(&mut first).unwrap();
+    let init: Value = serde_json::from_str(&first).unwrap();
+    let resumed = f
+        .command()
+        .args([
+            "run",
+            "coven-code",
+            "--continue",
+            init["session_id"].as_str().unwrap(),
+            "--",
+            "do not replay unfinished work",
+        ])
+        .output()
+        .unwrap();
+    fs::write(f.0.path().join("release"), "").unwrap();
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).unwrap();
+    let _settled = child.wait_with_output().unwrap();
+    assert!(!resumed.status.success(), "{resumed:?}");
+    assert!(
+        String::from_utf8_lossy(&resumed.stderr).contains("not confirmed saved"),
+        "{resumed:?}"
+    );
+}
+
+#[test]
 fn explicit_budget_is_forwarded_before_prompt_and_declared_to_consumers() {
     let f = Fixture::new();
     let listed = f
@@ -130,9 +252,16 @@ fn invalid_and_unsupported_budgets_never_launch_work() {
 
 #[test]
 fn typed_exhaustion_survives_successful_stream_process_exit() {
+    use std::io::Write;
     let f = Fixture::new();
+    let engine = f.0.path().join("engine");
+    let source = fs::read_to_string(&engine).unwrap().replace(
+        "print(os.environ.get('TEST_BUDGET_RESULT',json.dumps(normal)))",
+        "sys.stdin.readline()\nprint(os.environ.get('TEST_BUDGET_RESULT',json.dumps(normal)),flush=True)",
+    );
+    fs::write(engine, source).unwrap();
     let receipt = json!({"type":"result","subtype":"error_during_execution","is_error":true,"outcome":"turn_budget_exhausted","run_budget_version":1,"session_id":"engine-session","num_turns":10,"turn_budget":{"max_turns":10,"source":"explicit","consumed":10},"continuation":{"session_id":"engine-session","resumable":true},"error":"unfinished"});
-    let o = f
+    let mut child = f
         .command()
         .env("TEST_BUDGET_RESULT", receipt.to_string())
         .args([
@@ -145,8 +274,18 @@ fn typed_exhaustion_survives_successful_stream_process_exit() {
             "--",
             "hello",
         ])
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n")
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
     let all = frames(&o);
     let last = all
         .last()
@@ -179,6 +318,51 @@ fn process_failure_cannot_be_erased_by_a_successful_budget_receipt() {
         .unwrap();
     assert_eq!(o.status.code(), Some(7));
     assert_eq!(frames(&o).last().unwrap()["is_error"], true, "{o:?}");
+}
+
+#[test]
+fn streamed_provider_failure_stays_distinct_from_unconfirmed_query_history() {
+    use std::io::Write;
+    let f = Fixture::new();
+    let engine = f.0.path().join("engine");
+    let source = fs::read_to_string(&engine).unwrap().replace(
+        "print(os.environ.get('TEST_BUDGET_RESULT',json.dumps(normal)))",
+        "sys.stdin.readline()\nprint(os.environ.get('TEST_BUDGET_RESULT',json.dumps(normal)),flush=True)",
+    );
+    fs::write(engine, source).unwrap();
+    let receipt = json!({"type":"result","is_error":true,"error":"Authentication failed","run_budget_version":1,"session_id":"engine-session","num_turns":1,"turn_budget":{"max_turns":12,"source":"explicit","consumed":1},"continuation":{"session_id":"engine-session","resumable":true}});
+    let mut child = f
+        .command()
+        .env("TEST_BUDGET_RESULT", receipt.to_string())
+        .env("TEST_ENGINE_EXIT", "7")
+        .args([
+            "run",
+            "coven-code",
+            "--max-turns",
+            "12",
+            "--stream-json",
+            "--stream-json-input",
+            "--",
+            "hello",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let all = frames(&output);
+    let last = all.last().unwrap();
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    assert_eq!(last["error"], "Authentication failed");
+    assert_eq!(last["continuation"]["resumable"], false);
+    assert!(last.get("outcome").is_none());
 }
 
 #[test]

@@ -10,6 +10,20 @@ pub struct Claim {
     ledger_session_id: String,
 }
 
+pub fn start_fresh(conn: &Connection, record: &crate::store::SessionRecord) -> Result<()> {
+    crate::store::durable_transaction(conn, || {
+        crate::store::insert_session(conn, record)?;
+        // Before the engine's first result, legacy aliases fall back to this
+        // ledger id (also the requested fresh engine id). Fence that alias
+        // before publishing initialization, including unbudgeted resumes.
+        conn.execute(
+            "INSERT INTO engine_continuations (engine_session_id, latest_ledger_id, resumable, updated_at) VALUES (?1, ?1, 0, ?2)",
+            params![record.id, record.updated_at],
+        )?;
+        Ok(())
+    })
+}
+
 pub fn start(
     conn: &Connection,
     record: &crate::store::SessionRecord,
