@@ -194,13 +194,12 @@ fn expected_for(boundary: Boundary) -> Expected {
         Stage::Due | Stage::Settled => Run::TimedOut,
         Stage::Fenced | Stage::Stopped => Run::Contained,
     };
-    // The pass after the lease takes the expired fence as an unknown stop and
-    // needs recovery. The next pass settles the run `failed` on its ended
-    // session and releases the fence (#1461).
-    let (run_after_pass, run_after_settle) = match stage {
-        Stage::Due | Stage::Settled => (Run::TimedOut, Run::TimedOut),
-        Stage::Fenced | Stage::Stopped => (Run::Ambiguous, Run::Failed),
-    };
+    // The pass after the lease settles the run behind the expired timeout
+    // fence by the deadline rule, as if no fence had committed: the fence is
+    // only taken after the deadline, so the session ended after it. The pass
+    // releases the fence (#1489).
+    let run_after_pass = Run::TimedOut;
+    let run_after_settle = Run::TimedOut;
     Expected {
         initial_outcome: if boundary == Boundary::None {
             InitialOutcome::Responded
@@ -852,9 +851,9 @@ mod tests {
             (2, "workerStops", json!(0)),
             (2, "runAfterSettle", json!("ambiguous")),
             (3, "runAfterExit", json!("contained")),
-            (4, "runAfterPass", json!("timed_out")),
+            (4, "runAfterPass", json!("ambiguous")),
             (5, "laterStops", json!(1)),
-            (6, "runAfterSettle", json!("timed_out")),
+            (6, "runAfterSettle", json!("failed")),
             (7, "runAfterExit", json!("timed_out")),
             (8, "restartIsNoop", json!(false)),
             (8, "runAfterRestart", json!("failed")),

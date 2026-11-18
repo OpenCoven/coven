@@ -87,7 +87,7 @@
         { "from": "started", "to": "ambiguous", "on": "evidence_lost", "actor": "scheduler", "guard": "session vanished before evidence" },
         { "from": "observing", "to": "succeeded", "on": "run_settled", "actor": "worker", "guard": "verified completion evidence" },
         { "from": "observing", "to": "failed", "on": "run_settled", "actor": "worker", "guard": "verified failure evidence" },
-        { "from": "observing", "to": "timed_out", "on": "timeout", "actor": "scheduler", "guard": "perRunMinutes elapsed" },
+        { "from": "observing", "to": "timed_out", "on": "timeout", "actor": "scheduler", "guard": "perRunMinutes elapsed; also when the session has durable terminal evidence behind the run's own expired timeout stop fence, which is taken only after the deadline, so settlement applies the deadline rule and releases the fence in the same transaction wherever exactly one active attempt is on the fenced session and the deadline is readable; an expired recovery or cancellation fence still records an unknown stop" },
         { "from": "observing", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler", "guard": "cancellation acknowledged by runtime" },
         { "from": "observing", "to": "ambiguous", "on": "evidence_lost", "actor": "scheduler", "guard": "heartbeat/lease evidence expired mid-observation" }
       ]

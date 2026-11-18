@@ -3717,6 +3717,37 @@ fn mark_unconfirmed_stop(
         .map_err(|error| format!("failed to commit ambiguous stop settlement: {error}"))
 }
 
+/// Whether settlement may apply the deadline rule behind a run's own expired
+/// timeout fence (#1489): only in the shape where holding the run for
+/// recovery would have succeeded, with exactly one active attempt bound to
+/// the fenced session and a live occurrence, and with a deadline settlement
+/// can read. Any other shape keeps the unknown-stop path and its refusals.
+fn deadline_rule_reaches(
+    conn: &Connection,
+    run_id: &str,
+    fenced_session: &str,
+    timeout_at: Option<&str>,
+) -> Result<bool, String> {
+    if !timeout_at.is_some_and(|timeout_at| DateTime::parse_from_rfc3339(timeout_at).is_ok()) {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT (
+             SELECT COUNT(*) FROM automation_attempts
+             WHERE run_id = ?1 AND state IN ('dispatching', 'started', 'observing')
+               AND (session_id = ?2 OR (state = 'dispatching' AND session_id IS NULL))
+         ) = 1
+         AND EXISTS (
+             SELECT 1 FROM automation_occurrences o
+             JOIN automation_runs r ON r.occurrence_id = o.id
+             WHERE r.id = ?1 AND o.state IN ('claimed', 'running', 'recovery_required')
+         )",
+        rusqlite::params![run_id, fenced_session],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("failed to inspect expired timeout fence: {error}"))
+}
+
 fn mark_unconfirmed_stop_for_recovery_in(
     conn: &Connection,
     run_id: &str,
@@ -4265,6 +4296,7 @@ pub(crate) fn settle_finished_runs_with(
             )
             .optional()
             .map_err(|error| format!("failed to inspect settlement stop ownership: {error}"))?;
+        let mut deadline_fence = false;
         if let Some((fenced_session, owner, expires_at)) =
             stop_fence.filter(|_| attempt_state.as_deref() != Some("ambiguous"))
         {
@@ -4276,28 +4308,46 @@ pub(crate) fn settle_finished_runs_with(
                     continue;
                 }
             };
-            if expired
-                && matches!(owner.as_str(), "timeout" | "recovery")
+            let live_fenced_attempt = expired
                 && session_id.as_deref() == Some(fenced_session.as_str())
                 && matches!(
                     attempt_state.as_deref(),
                     Some("dispatching" | "started" | "observing")
-                )
-            {
-                // Expiry is evidence of an unknown stop, never acknowledgement.
-                // Cancellation fences have their own durable command reconciler.
-                mark_unconfirmed_stop_for_recovery_in(
+                );
+            if live_fenced_attempt
+                && owner == "timeout"
+                && deadline_rule_reaches(
                     &transaction,
                     &run_id,
-                    None,
-                    "stop owner expired after terminal session evidence",
-                    now,
-                )?;
-                transaction
-                    .commit()
-                    .map_err(|error| format!("failed to commit expired stop recovery: {error}"))?;
+                    &fenced_session,
+                    timeout_at.as_deref(),
+                )?
+            {
+                // A timeout fence is only taken from a live session once the
+                // deadline has passed, so whatever ended the session behind it
+                // ended it after the deadline. Settle by the deadline rule, as
+                // if no fence had committed, and release the fence (#1489).
+                deadline_fence = true;
+            } else {
+                // Any other expired timeout fence keeps the unknown-stop path,
+                // which fails the pass where it did before.
+                if live_fenced_attempt && matches!(owner.as_str(), "timeout" | "recovery") {
+                    // Expiry is evidence of an unknown stop, never
+                    // acknowledgement. Cancellation fences have their own
+                    // durable command reconciler.
+                    mark_unconfirmed_stop_for_recovery_in(
+                        &transaction,
+                        &run_id,
+                        None,
+                        "stop owner expired after terminal session evidence",
+                        now,
+                    )?;
+                    transaction.commit().map_err(|error| {
+                        format!("failed to commit expired stop recovery: {error}")
+                    })?;
+                }
+                continue;
             }
-            continue;
         }
 
         let deadline = timeout_at
@@ -4346,19 +4396,21 @@ pub(crate) fn settle_finished_runs_with(
             continue;
         }
         let ambiguous = attempt_state.as_deref() == Some("ambiguous");
-        let timed_out = !ambiguous
-            && match (timeout_at.as_deref(), terminal_at.as_deref()) {
-                (Some(timeout_at), Some(terminal_at)) => {
-                    let timeout_at = DateTime::parse_from_rfc3339(timeout_at).map_err(|error| {
-                        format!("run `{run_id}` has invalid timeout_at: {error}")
-                    })?;
-                    let terminal_at = DateTime::parse_from_rfc3339(terminal_at).map_err(|error| {
+        let timed_out = deadline_fence
+            || (!ambiguous
+                && match (timeout_at.as_deref(), terminal_at.as_deref()) {
+                    (Some(timeout_at), Some(terminal_at)) => {
+                        let timeout_at =
+                            DateTime::parse_from_rfc3339(timeout_at).map_err(|error| {
+                                format!("run `{run_id}` has invalid timeout_at: {error}")
+                            })?;
+                        let terminal_at = DateTime::parse_from_rfc3339(terminal_at).map_err(|error| {
                     format!("session for run `{run_id}` has invalid terminal timestamp: {error}")
                 })?;
-                    terminal_at >= timeout_at
-                }
-                _ => false,
-            };
+                        terminal_at >= timeout_at
+                    }
+                    _ => false,
+                });
         let succeeded = !ambiguous
             && session_status.as_deref() == Some("completed")
             && exit_code == Some(0)
@@ -4501,7 +4553,7 @@ pub(crate) fn settle_finished_runs_with(
                 .map_err(|error| format!("failed to commit held run: {error}"))?;
             continue;
         }
-        if ambiguous {
+        if ambiguous || deadline_fence {
             // Terminal evidence settles the stop whose outcome was unknown. A
             // finished run keeps no stop ownership, whoever claimed it.
             transaction
@@ -10150,8 +10202,10 @@ mod tests {
     }
 
     #[test]
-    fn expired_stop_fence_preserves_unknown_terminal_outcome() {
-        for owner in ["timeout", "recovery"] {
+    fn expired_recovery_fence_preserves_unknown_terminal_outcome() {
+        // An expired timeout fence settles by the deadline rule instead
+        // (`expired_timeout_fence_settles_by_the_deadline_rule`, #1489).
+        for owner in ["recovery"] {
             let (_temp, conn) = temp_store();
             let routine = definition("expired-stop");
             insert_definition(&conn, &routine).unwrap();
@@ -10545,6 +10599,92 @@ mod tests {
                 })
                 .collect();
             assert_eq!(states, ["running", "cancelled"], "{damage}");
+        }
+    }
+
+    #[test]
+    fn expired_timeout_fence_settles_by_the_deadline_rule() {
+        for (status, exit_code) in [
+            ("completed", Some(0)),
+            ("failed", Some(1)),
+            ("killed", None),
+        ] {
+            let (_temp, conn) = temp_store();
+            let routine = definition("expired-timeout-stop");
+            insert_definition(&conn, &routine).unwrap();
+            let now = Utc::now();
+            let outcome =
+                run_routine_now(&conn, &crate::api::NoopSessionRuntime, &routine, now).unwrap();
+            let session = outcome.session_id.as_deref().unwrap();
+            let past_deadline = now + chrono::Duration::minutes(31);
+            assert!(matches!(
+                claim_stop_fence(
+                    &conn,
+                    &outcome.run_id,
+                    session,
+                    "timeout",
+                    None,
+                    None,
+                    past_deadline
+                )
+                .unwrap(),
+                StopFenceClaim::Acquired
+            ));
+            crate::store::update_session_terminal_if_active(
+                &conn,
+                session,
+                status,
+                exit_code,
+                &past_deadline.to_rfc3339(),
+            )
+            .unwrap();
+            assert_eq!(
+                settle_finished_runs(&conn, past_deadline).unwrap(),
+                SettlementReport::default(),
+                "{status}: a live timeout owner is still trusted"
+            );
+            let expired = past_deadline + chrono::Duration::seconds(31);
+            assert_eq!(
+                settle_finished_runs(&conn, expired).unwrap().failed,
+                1,
+                "{status}"
+            );
+            let states: (String, String, String) = conn
+                .query_row(
+                    "SELECT r.status, o.state, a.state FROM automation_runs r
+                     JOIN automation_occurrences o ON o.id = r.occurrence_id
+                     JOIN automation_attempts a ON a.run_id = r.id WHERE r.id = ?1",
+                    [&outcome.run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                states,
+                ("failed".into(), "failed".into(), "timed_out".into()),
+                "{status}"
+            );
+            let fences: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM automation_stop_fences WHERE run_id = ?1",
+                    [&outcome.run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(fences, 0, "{status}: settlement releases the timeout fence");
+            let held_for_recovery: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM automation_events
+                     WHERE stream_kind = 'occurrence'
+                       AND stream_id = (SELECT occurrence_id FROM automation_runs WHERE id = ?1)
+                       AND event_json LIKE '%recovery_required%'",
+                    [&outcome.run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                held_for_recovery, 0,
+                "{status}: no operator action is signalled"
+            );
         }
     }
 
