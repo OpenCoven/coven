@@ -5,6 +5,7 @@ read_when:
   - Reviewing supported harness behavior
   - Evaluating a future harness adapter
 description: "How Coven harness adapters work, how external adapters graduate, and why OpenClaw/Hermes should not be hardcoded into the daemon."
+source_adjacent_reason: "Defines adapter declarations and executable negotiation implemented alongside harness.rs and run_budget.rs."
 ---
 
 # Harness adapter guide
@@ -381,3 +382,23 @@ flowchart LR
 ```
 
 A harness skipping any stage is **not** ready for public support, even if it appears to work on a maintainer's machine.
+
+
+## Finite model-round budgets
+
+The built-in Coven Code adapter declares `run_budget: {"version":1,"flag":"--max-turns"}` in `coven adapter list --json`. This is an adapter declaration, not evidence that the installed engine supports it. Other harnesses and external adapters do not receive engine budget flags.
+
+`coven run coven-code --max-turns N` accepts positive finite u32 values (1 through 4294967295). Before creating a run, Coven probes the actual resolved engine executable with its offline `--run-budget-capabilities` command and verifies the additive run-budget v1 contract. Missing, malformed or unsupported capabilities fail visibly; the value is never silently discarded or appended to prompt text. Forwarding places the native flag before the prompt delimiter on fresh, resumed, ordinary and stream-input launches. Runs that omit the option retain their existing engine defaults.
+
+A round is an engine model dispatch and its tool batch, not a chat message, individual tool call, token, dollar or wall-clock allowance. Applied value, source and consumed rounds come from the engine result's `turn_budget` receipt. An explicit request requires a matching explicit receipt before Coven can report successful settlement. The existing one-shot successful result envelope may omit `is_error`; error and exhaustion results retain their explicit error envelope.
+
+Coven preserves `outcome: "turn_budget_exhausted"`, `run_budget_version`, `turn_budget`, `num_turns` and authoritative `continuation` metadata on its terminal result. Exhaustion is unfinished work, even when a stream-input engine exits zero at EOF. Provider errors, cancellation and a nonzero process exit remain failures independent of the model receipt; a successful model receipt cannot erase a later process failure. Ordinary budgeted text runs use the same receipt-bearing protocol internally, render response text rather than JSON, and report the observed round count after settlement.
+
+The engine session id is distinct from Coven's ledger session id. Coven records the engine id as the conversation identity and forwards it on `--continue`; it does not reconstruct tool history from text. Each resumed query receives a fresh finite allowance. A continuation receipt promises resumability only to the extent reported by the engine after persistence. Missing or mismatched engine sessions fail before new model work rather than creating a replacement conversation. Stop may terminate before persistence, so cancellation alone does not promise resumability. No released engine version or installed Chat capability is implied by the declaration.
+
+
+Continuation confirmation follows the mutable engine history across all its ledger aliases. Before a confirmed continuation starts, a durable compare-and-set reserves that history and marks its latest confirmation pending. A failed or unconfirmed save prevents every older alias from selecting stale tool history; selecting an older ledger row cannot bypass the latest state. Confirmed v1 histories keep receipt-bearing settlement even on an ordinary unbudgeted resume. Explicit budgeted continuity requires confirmed backing; an unbudgeted legacy history never observed under v1 retains its previous adapter path.
+
+The negotiated executable is canonicalized and bound to the launch, so a managed engine selector changing after the probe cannot substitute an unchecked binary. An already parsed one-shot receipt and its engine identity survive stdout delivery failure. A stream-input disconnect retains observed identity and evidence but cannot promise safe resumption when later queries may have begun without being observed.
+
+Stream-input continuation is confirmed only when every work-bearing user query has its own budget result and the engine settles at EOF. Bounded JSONL accounting runs before forwarding and spans read boundaries. Recognized control frames and empty user input do not require query receipts; assistant prefill is covered by the next saved query. Trailing unsaved prefill, partial input and unclassified frames conservatively deny confirmation. The engine does not emit user-start frames, so output echoes cannot establish query boundaries. A later query that exits without its result cannot reuse an earlier saved receipt, even after a zero exit. Fresh explicitly budgeted histories are fenced before initialization is published, including against unbudgeted legacy resume attempts.

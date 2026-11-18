@@ -167,6 +167,15 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
             transcript_path TEXT
         );
 
+        -- This confirmation must survive pruning one ledger row while older
+        -- aliases still name the same mutable engine history. No cascading FK.
+        CREATE TABLE IF NOT EXISTS engine_continuations (
+            engine_session_id TEXT PRIMARY KEY NOT NULL CHECK (length(engine_session_id) BETWEEN 1 AND 4096),
+            latest_ledger_id TEXT NOT NULL,
+            resumable INTEGER NOT NULL CHECK (resumable IN (0, 1)),
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS request_adoptions (
             id TEXT PRIMARY KEY NOT NULL,
             adoption_key TEXT,
