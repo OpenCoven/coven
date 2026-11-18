@@ -105,6 +105,8 @@ The daemon advertises `capabilities.hostSync: true` over owner-local IPC. An abs
 
 The daemon runs sync and resolution operations one at a time. Each resolution receives its own ticket and preserves submission order. Consecutive sync requests can share a run. A sync submitted after a resolution observes its outcome. While these operations are active, configuration changes return 409. Tickets identify one daemon instance and its 32 most recent completed runs. An expired or unknown ticket returns 404. The daemon polls every two seconds while a watcher is present, with backoff up to 30 seconds when offline. A watcher renews its eight-second lease through the watch route. Outstanding transfers finish after the last watcher leaves.
 
+Host routes use the structured error envelope. Invalid JSON, unknown fields and invalid run ticket syntax return `400 invalid_request`. A non-owner transport returns `403 owner_local_required`. Unknown routes and expired or unknown tickets return `404 not_found`. An unsupported method returns `405 method_not_allowed`. Operation failures such as a full queue, configuration contention or failed resolution return `409 host_sync_failed`. A missing worker returns `503 unavailable`. A reconciliation result can report `offline` or `needs attention` in a successful result response. Inspect its `phase` and `error` before treating the folder as synchronized.
+
 The daemon stores the client database in the `host` subdirectory of its profile. On Linux the default profile recognizes a stopped Python client's existing `~/.local/state/coven-host/client/client.sqlite` when the new profile has no client database. A daemon launched with `COVEN_HOST_STATE` set to an absolute state directory uses that directory.
 
 ### Mobile connection observations
@@ -129,6 +131,7 @@ The reusable Rust client exposes `DaemonEndpoint::discover_until` and `DaemonCli
   "apiVersion": "coven.daemon.v1",
   "covenVersion": "0.4.2",
   "capabilities": {
+    "hostSync": true,
     "sessions": true,
     "events": true,
     "travel": true,
@@ -196,12 +199,13 @@ durability.
 
 ### Capability fields
 
-The health example contains all 18 common capability fields.
+The health example contains all 19 common capability fields.
 
-Windows adds the optional 19th capability field, `lifecycleShutdown: "observed-workers-v1"`, alongside these 18 common fields. Older Windows daemons and non-Windows daemons omit it. Unknown values or types fail closed and do not permit legacy termination.
+Windows adds the optional 20th capability field, `lifecycleShutdown: "observed-workers-v1"`, alongside these 19 common fields. Older Windows daemons and non-Windows daemons omit it. Unknown values or types fail closed and do not permit legacy termination.
 
 | Field             | Type    | Description                                                       |
 |-------------------|---------|-------------------------------------------------------------------|
+| `hostSync` | boolean | Host folder sync is available over owner-local IPC. Always `false` over TCP. Treat a missing field as unavailable. |
 | `sessions`        | boolean | Sessions API (`/sessions`, `/sessions/:id`) is available.        |
 | `events`          | boolean | Events API (`/events`) is available.                             |
 | `travel`          | boolean | Travel profile, delta, and state APIs are available.             |

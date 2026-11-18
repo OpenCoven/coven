@@ -503,7 +503,7 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
             for path in module.SESSION_LAUNCH_POLICY_DOCS
         }
         expected_count = len(module.HEALTH_CAPABILITY_FIELDS)
-        self.assertEqual(expected_count, 18)
+        self.assertEqual(expected_count, 19)
         for path in module.HEALTH_CAPABILITY_COUNT_DOCS:
             with self.subTest(path=path):
                 changed = dict(documents)
@@ -2429,11 +2429,11 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
                 changed = self.o3_structure_documents()
                 self.mutate_health_capability(changed, path, heading, "lifecycleShutdown", "observed-workers-v1", request_line=request_line)
                 errors = module.validate_o3_document_structures(changed)
-                self.assertIn(f"{path}: {label} capabilities must contain exactly 18 fields (found 19)", errors)
+                self.assertIn(f"{path}: {label} capabilities must contain exactly 19 fields (found 20)", errors)
 
     def test_windows_optional_capability_notes_reject_omission_and_wrong_contract(self) -> None:
         for path in module.HEALTH_CAPABILITY_LIST_DOCS:
-            for replacement in ("", 'Windows adds the optional 19th capability field, `lifecycleShutdown: "other"`.'):
+            for replacement in ("", 'Windows adds the optional 20th capability field, `lifecycleShutdown: "other"`.'):
                 with self.subTest(path=path, replacement=replacement):
                     changed = self.o3_structure_documents()
                     note = module.markdown_paragraph(changed[path], "Windows adds the optional")
@@ -2478,7 +2478,7 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
 
     def test_openclaw_optional_windows_dto_count_and_token_are_required(self) -> None:
         path = "packages/openclaw-coven/README.md"
-        for old, new in (("19th field", "18th field"), ('`lifecycleShutdown: "observed-workers-v1"`', '`lifecycleShutdown: "other"`')):
+        for old, new in (("20th field", "19th field"), ('`lifecycleShutdown: "observed-workers-v1"`', '`lifecycleShutdown: "other"`')):
             with self.subTest(old=old):
                 changed = self.o3_structure_documents()
                 section = module.markdown_section(changed[path], "Version compatibility")

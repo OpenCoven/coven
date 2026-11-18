@@ -120,6 +120,7 @@ COVEN_DAEMON_API_VERSION = "coven.daemon.v1"
 EXECUTION_BINDING_CONTRACT = "psyche.execution_binding.v1"
 REQUEST_ADOPTION_CONTRACT = "psyche.request_adoption.v1"
 HEALTH_CAPABILITY_FIELDS = (
+    "hostSync",
     "sessions",
     "events",
     "travel",
@@ -139,7 +140,7 @@ HEALTH_CAPABILITY_FIELDS = (
     "requestAdoptionContracts",
     "sessionPolicyContracts",
 )
-WINDOWS_LIFECYCLE_CAPABILITY_NOTE = 'Windows adds the optional 19th capability field, `lifecycleShutdown: "observed-workers-v1"`, alongside these 18 common fields. Older Windows daemons and non-Windows daemons omit it. Unknown values or types fail closed and do not permit legacy termination.'
+WINDOWS_LIFECYCLE_CAPABILITY_NOTE = 'Windows adds the optional 20th capability field, `lifecycleShutdown: "observed-workers-v1"`, alongside these 19 common fields. Older Windows daemons and non-Windows daemons omit it. Unknown values or types fail closed and do not permit legacy termination.'
 WINDOWS_LIFECYCLE_IDENTITY_CLAIM = 'The Windows stop client retains the authenticated daemon process HANDLE and opens a new owner-validated pipe bound to the same PID and process creation time. It sends `POST /api/v1/internal/lifecycle/shutdown` with `apiVersion: "coven.daemon.v1"` and the exact `daemon` object obtained from authenticated health. The daemon validates the serving identity before accepting shutdown; this internal owner-local route grants no TCP or mobile authority.'
 WINDOWS_LIFECYCLE_STOP_CLAIM = 'When health advertises `lifecycleShutdown: "observed-workers-v1"`, the client requires HTTP `202` with `ok: true`, the exact named `apiVersion`, `capabilities.structuredErrors: true`, the exact lifecycle contract, and the same `daemon` object. This acknowledgement accepts shutdown; it is not a stopped receipt. The client retains the pipe and process HANDLE and waits for daemon exit within its original two-second lifecycle deadline. The daemon observes owned mobile-worker exit and joins cleanup before releasing ownership. A timeout, malformed response, identity change, or required-contract refusal never permits root-termination fallback or status clearing. Legacy root termination is allowed only when the capability is absent and the authenticated same-instance pipe explicitly returns `404` or `405`; an absent capability alone is insufficient.'
 WINDOWS_LIFECYCLE_TABLE_DESCRIPTION = 'Windows only. Currently `"observed-workers-v1"`. Omitted on other platforms and older daemons; see [Windows lifecycle shutdown](#windows-lifecycle-shutdown).'
@@ -262,6 +263,7 @@ LIFECYCLE_RECOVERY_CLAIMS = {
     ),
 }
 EXPECTED_HEALTH_CAPABILITIES = {
+    "hostSync": True,
     "sessions": True,
     "events": True,
     "travel": True,
@@ -2402,7 +2404,7 @@ def validate_o3_negotiation_claims(
 
 
 def validate_windows_lifecycle_docs(documents: dict[str, str], errors: list[str]) -> None:
-    # Keep the common JSON examples exactly 18 fields; validate the platform
+    # Keep the common JSON examples limited to shared fields; validate the platform
     # extension separately in its owning prose/table, never as arbitrary extras.
     for path in HEALTH_CAPABILITY_LIST_DOCS:
         heading = "Capability fields" if path == "docs/API-CONTRACT.md" else HEALTH_CAPABILITY_LISTS[path][0]
@@ -2578,6 +2580,7 @@ def validate_o3_document_structures(documents: dict[str, str]) -> list[str]:
             f"optional Windows-only {len(HEALTH_CAPABILITY_FIELDS) + 1}th field",
             '`lifecycleShutdown: "observed-workers-v1"`',
             "../../docs/API-CONTRACT.md#get-apiv1health",
+            "`hostSync`",
             "`requestAdoptionContracts`",
             "`sessionPolicyContracts`",
         )
