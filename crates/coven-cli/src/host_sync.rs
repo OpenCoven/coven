@@ -34,12 +34,23 @@ struct Shared {
 struct Jobs {
     running: bool,
     stopping: bool,
+    configuring: bool,
     current: Option<Running>,
     pending: VecDeque<(Uuid, Task)>,
     last_sync: Option<Value>,
     completed: VecDeque<(Uuid, Outcome)>,
     watching_until: Option<Instant>,
     next_poll: Option<Instant>,
+}
+
+struct Configuration<'a>(&'a Worker);
+
+impl Drop for Configuration<'_> {
+    fn drop(&mut self) {
+        let mut jobs = self.0.jobs();
+        jobs.configuring = false;
+        self.0.shared.wake.notify_one();
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -149,15 +160,24 @@ impl Worker {
     }
 
     fn configure(&self, apply: impl FnOnce() -> Result<()>) -> Result<()> {
-        let mut jobs = self.jobs();
-        ensure!(
-            !jobs.stopping && jobs.current.is_none() && jobs.pending.is_empty(),
-            "host operation in progress; retry afterward"
-        );
+        let _configuration = {
+            let mut jobs = self.jobs();
+            ensure!(
+                !jobs.stopping
+                    && !jobs.configuring
+                    && jobs.current.is_none()
+                    && jobs.pending.is_empty(),
+                "host operation in progress; retry afterward"
+            );
+            jobs.configuring = true;
+            Configuration(self)
+        };
+        // Filesystem and database operations can block. Keep the queue mutex
+        // available for ticket polling and the daemon's bounded shutdown.
         apply()?;
+        let mut jobs = self.jobs();
         jobs.last_sync = None;
         jobs.next_poll = Some(Instant::now());
-        self.shared.wake.notify_one();
         Ok(())
     }
 
@@ -217,6 +237,13 @@ fn reconcile(shared: &Shared) {
         if jobs.stopping {
             jobs.running = false;
             return;
+        }
+        if jobs.configuring {
+            jobs = shared
+                .wake
+                .wait(jobs)
+                .unwrap_or_else(|err| err.into_inner());
+            continue;
         }
         let (id, task) = match jobs.pending.pop_front() {
             Some(job) => job,
@@ -396,6 +423,40 @@ pub(crate) fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_stays_available_while_host_configuration_is_blocked() {
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let worker = Arc::new(Worker::new(temp.path()));
+        let (entered, configuring) = mpsc::channel();
+        let (resume, blocked) = mpsc::channel();
+        let config_worker = Arc::clone(&worker);
+        let config = std::thread::spawn(move || {
+            config_worker.configure(|| {
+                entered.send(()).unwrap();
+                blocked.recv().unwrap();
+                Ok(())
+            })
+        });
+        configuring.recv().unwrap();
+
+        let (shutdown, stopped) = mpsc::channel();
+        let stop = std::thread::spawn(move || {
+            worker.stop();
+            shutdown.send(()).unwrap();
+        });
+        // The daemon has a two-second shutdown budget even when file I/O stalls.
+        let completed = stopped.recv_timeout(Duration::from_secs(2));
+        resume.send(()).unwrap();
+        config.join().unwrap().unwrap();
+        stop.join().unwrap();
+        assert!(
+            completed.is_ok(),
+            "host configuration blocked daemon shutdown"
+        );
+    }
 
     #[test]
     fn resolutions_are_distinct_and_fence_sync_coalescing() {
