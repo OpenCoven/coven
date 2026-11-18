@@ -174,13 +174,14 @@ pub(crate) fn run(command: Command) -> Result<()> {
     };
     let mut client = daemon_client(&crate::paths::coven_home_dir()?)?;
     match op {
-        HostOperation::Sync => {
+        HostOperation::Sync | HostOperation::Resolve(_) => {
+            let sync = matches!(op, HostOperation::Sync);
             let run: HostRun = serde_json::from_value(client.host(op)?)?;
             loop {
                 let reply = client.host(HostOperation::Result(HostRun { id: run.id.clone() }))?;
                 if !reply.is_null() {
                     println!("{}", serde_json::to_string_pretty(&reply)?);
-                    if reply["phase"] != "synced" {
+                    if sync && reply["phase"] != "synced" {
                         bail!(
                             "{}",
                             reply["error"]

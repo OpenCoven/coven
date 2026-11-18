@@ -39,9 +39,11 @@ pub struct HostRun {
 pub enum HostOperation {
     Init(HostInit),
     Connect(HostConnect),
+    /// Returns a run ticket. Poll Result until the worker finishes.
     Sync,
     Result(HostRun),
     Status,
     Watch,
+    /// Enqueues a distinct resolution and returns its run ticket.
     Resolve(HostResolve),
 }

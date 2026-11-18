@@ -467,6 +467,112 @@ fn daemon_start_names_a_coven_home_too_long_for_its_socket() -> anyhow::Result<(
 }
 
 #[test]
+fn host_resolve_waits_for_a_peer_beyond_one_daemon_response_deadline() -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let temporary = tempfile::tempdir()?;
+    let base = temporary.path().canonicalize()?;
+    let home = base.join("home");
+    let root = base.join("folder");
+    let token = base.join("access");
+    fs::write(
+        &token,
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ),
+    )?;
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600))?;
+    let binary = coven_bin();
+    let _cleanup = DaemonGuard {
+        coven: binary.clone(),
+        coven_home: home.clone(),
+        path: std::env::var_os("PATH").unwrap_or_default(),
+    };
+    let host = |args: &[&str]| {
+        Command::new(&binary)
+            .arg("host")
+            .args(args)
+            .env("COVEN_HOME", &home)
+            .env_remove("COVEN_HOST_STATE")
+            .output()
+    };
+    assert_success(
+        "initialize folder",
+        &host(&["init", "--root", root.to_str().unwrap()])?,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let slow = Arc::new(AtomicBool::new(false));
+    let delay_peer = slow.clone();
+    let peer = thread::spawn(move || -> anyhow::Result<()> {
+        let remote = b"remote";
+        let inventory = serde_json::to_vec(&json!({
+            "host": "a".repeat(32),
+            "files": [{"path":"files/note","revision":1,"sha256":coven_host::digest(remote),"size":remote.len()}]
+        }))?;
+        loop {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let mut request = String::new();
+            let mut reader = BufReader::new(&stream);
+            reader.read_line(&mut request)?;
+            let mut header = String::new();
+            loop {
+                header.clear();
+                anyhow::ensure!(
+                    reader.read_line(&mut header)? > 0,
+                    "incomplete test request"
+                );
+                if header == "\r\n" {
+                    break;
+                }
+            }
+            let transfer = match request.split_whitespace().nth(1) {
+                Some("/v1/castles/demo/files") => false,
+                Some("/v1/castles/demo/files/files/note") => true,
+                _ => anyhow::bail!("unexpected test peer request"),
+            };
+            let slow = delay_peer.load(Ordering::Acquire);
+            // Each GET fits the peer's five seconds. Together the inventory and
+            // body require longer than the local daemon's five-second IPC budget.
+            if slow {
+                thread::sleep(Duration::from_secs(3));
+            }
+            let bytes: &[u8] = if transfer { remote } else { &inventory };
+            write!(stream,"HTTP/1.1 200 OK\r\nConnection: close\r\nX-Revision: 1\r\nContent-Length: {}\r\n\r\n",bytes.len())?;
+            stream.write_all(bytes)?;
+            if transfer && slow {
+                return Ok(());
+            }
+        }
+    });
+    assert_success(
+        "configure peer",
+        &host(&["connect", &url, "--token-file", token.to_str().unwrap()])?,
+    );
+    let file = root.join("Castles/demo/files/note");
+    fs::write(&file, b"local")?;
+    let conflict = host(&["sync"])?;
+    assert_failure("create conflict", &conflict);
+    assert!(String::from_utf8_lossy(&conflict.stdout).contains("unresolved conflicts"));
+    slow.store(true, Ordering::Release);
+    let resolved = host(&["resolve", "files/note", "--remote"])?;
+    assert_success("await delayed resolution", &resolved);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&resolved.stdout)?,
+        json!({"ok":true})
+    );
+    assert_eq!(fs::read(&file)?, b"remote");
+    peer.join().expect("peer thread")?;
+    Ok(())
+}
+
+#[test]
 fn host_status_recovers_a_stale_socket_after_daemon_crash() -> anyhow::Result<()> {
     let temporary = tempfile::tempdir()?;
     let base = temporary.path().canonicalize()?;

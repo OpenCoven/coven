@@ -16,6 +16,7 @@ use uuid::Uuid;
 const POLL: Duration = Duration::from_secs(2);
 const WATCH_LEASE: Duration = Duration::from_secs(8);
 const MAX_COMPLETED: usize = 32;
+const MAX_QUEUED: usize = 32;
 type Outcome = std::result::Result<Value, String>;
 
 pub struct Worker {
@@ -33,10 +34,61 @@ struct Shared {
 struct Jobs {
     running: bool,
     stopping: bool,
-    current: Option<Uuid>,
+    current: Option<Running>,
+    pending: VecDeque<(Uuid, Task)>,
+    last_sync: Option<Value>,
     completed: VecDeque<(Uuid, Outcome)>,
     watching_until: Option<Instant>,
     next_poll: Option<Instant>,
+}
+
+#[derive(Copy, Clone)]
+struct Running {
+    id: Uuid,
+    sync: bool,
+}
+
+enum Task {
+    Sync,
+    Resolve(HostResolve),
+}
+
+impl Task {
+    fn perform(self, client: coven_host::Client) -> Result<Value> {
+        let Self::Resolve(input) = self else {
+            return client.sync();
+        };
+        match input.resolution {
+            HostResolution::Local => client.resolve(&input.path, "local", None)?,
+            HostResolution::Remote => client.resolve(&input.path, "remote", None)?,
+            HostResolution::Merged(file) => client.resolve(&input.path, "merged", Some(&file))?,
+        }
+        Ok(json!({"ok": true}))
+    }
+}
+
+impl Jobs {
+    fn enqueue(&mut self, task: Task) -> Result<Uuid> {
+        if matches!(task, Task::Sync) {
+            // Sharing a sync across a queued resolution could acknowledge state
+            // from before the caller's edit was applied.
+            let share = match self.pending.back() {
+                Some((id, Task::Sync)) => Some(*id),
+                Some(_) => None,
+                None => self.current.filter(|run| run.sync).map(|run| run.id),
+            };
+            if let Some(id) = share {
+                return Ok(id);
+            }
+        }
+        ensure!(
+            self.pending.len() < MAX_QUEUED,
+            "host operation queue is full; retry later"
+        );
+        let id = Uuid::new_v4();
+        self.pending.push_back((id, task));
+        Ok(id)
+    }
 }
 
 fn state_dir(home: &Path) -> PathBuf {
@@ -96,21 +148,32 @@ impl Worker {
         Ok(coven_host::Client::new(&self.shared.state_dir))
     }
 
-    fn schedule(&self, watch: bool) -> Result<Value> {
+    fn configure(&self, apply: impl FnOnce() -> Result<()>) -> Result<()> {
+        let mut jobs = self.jobs();
+        ensure!(
+            !jobs.stopping && jobs.current.is_none() && jobs.pending.is_empty(),
+            "host operation in progress; retry afterward"
+        );
+        apply()?;
+        jobs.last_sync = None;
+        jobs.next_poll = Some(Instant::now());
+        self.shared.wake.notify_one();
+        Ok(())
+    }
+
+    fn schedule(&self, task: Option<Task>) -> Result<Value> {
         self.client()?;
         let now = Instant::now();
         let mut jobs = self.jobs();
         ensure!(!jobs.stopping, "daemon is stopping");
-        if watch {
+        let id = if let Some(task) = task {
+            Some(jobs.enqueue(task)?)
+        } else {
             if jobs.watching_until.is_none_or(|until| until <= now) {
                 jobs.next_poll = Some(now);
             }
             jobs.watching_until = Some(now + WATCH_LEASE);
-        }
-        let id = if watch {
             None
-        } else {
-            Some(*jobs.current.get_or_insert_with(Uuid::new_v4))
         };
         if !jobs.running {
             let shared = Arc::clone(&self.shared);
@@ -118,22 +181,20 @@ impl Worker {
                 .name("coven-host-sync".into())
                 .spawn(move || reconcile(&shared))
             {
-                jobs.current = None;
+                jobs.pending.clear();
                 jobs.watching_until = None;
                 return Err(err.into());
             }
             jobs.running = true;
         }
         self.shared.wake.notify_one();
-        if let Some(id) = id {
-            Ok(json!(HostRun { id: id.to_string() }))
-        } else {
-            Ok(match jobs.completed.back().map(|(_, value)| value) {
-                Some(Ok(value)) => value.clone(),
-                Some(Err(error)) => json!({"phase": "needs attention", "error": error}),
-                None => json!({"phase": "syncing"}),
-            })
-        }
+        Ok(match id {
+            Some(id) => json!(HostRun { id: id.to_string() }),
+            None => jobs
+                .last_sync
+                .clone()
+                .unwrap_or_else(|| json!({"phase": "syncing"})),
+        })
     }
 
     pub(crate) fn stop(&self) {
@@ -157,8 +218,8 @@ fn reconcile(shared: &Shared) {
             jobs.running = false;
             return;
         }
-        let id = match jobs.current {
-            Some(id) => id,
+        let (id, task) = match jobs.pending.pop_front() {
+            Some(job) => job,
             None if jobs.watching_until.is_some_and(|until| until > now) => {
                 let wait = jobs
                     .next_poll
@@ -171,33 +232,45 @@ fn reconcile(shared: &Shared) {
                         .unwrap_or_else(|err| err.into_inner());
                     continue;
                 }
-                *jobs.current.get_or_insert_with(Uuid::new_v4)
+                (Uuid::new_v4(), Task::Sync)
             }
             None => {
                 jobs.running = false;
                 return;
             }
         };
+        let is_sync = matches!(task, Task::Sync);
+        jobs.current = Some(Running { id, sync: is_sync });
         drop(jobs);
         let outcome =
-            std::panic::catch_unwind(|| coven_host::Client::new(&shared.state_dir).sync())
-                .map_err(|_| "host reconciler panicked; inspect status and retry".to_owned())
+            std::panic::catch_unwind(|| task.perform(coven_host::Client::new(&shared.state_dir)))
+                .map_err(|_| "host worker panicked; inspect status before retrying".to_owned())
                 .and_then(|result| result.map_err(|err| format!("{err:#}")));
-        let offline = outcome
-            .as_ref()
-            .is_ok_and(|value| value["phase"] == "offline");
         jobs = shared.jobs.lock().unwrap_or_else(|err| err.into_inner());
         jobs.current = None;
+        if is_sync {
+            let offline = outcome
+                .as_ref()
+                .is_ok_and(|value| value["phase"] == "offline");
+            jobs.last_sync = Some(match &outcome {
+                Ok(value) => value.clone(),
+                Err(error) => json!({"phase":"needs attention","error":error}),
+            });
+            jobs.next_poll = Some(Instant::now() + if offline { backoff } else { POLL });
+            backoff = if offline {
+                (backoff * 2).min(Duration::from_secs(30))
+            } else {
+                POLL
+            };
+        }
+        if !is_sync && outcome.is_ok() {
+            jobs.last_sync = None;
+            jobs.next_poll = Some(Instant::now());
+        }
         if jobs.completed.len() == MAX_COMPLETED {
             jobs.completed.pop_front();
         }
         jobs.completed.push_back((id, outcome));
-        jobs.next_poll = Some(Instant::now() + if offline { backoff } else { POLL });
-        backoff = if offline {
-            (backoff * 2).min(Duration::from_secs(30))
-        } else {
-            POLL
-        };
     }
 }
 
@@ -240,27 +313,24 @@ fn dispatch(worker: &Worker, method: &str, route: &str, body: Option<&str>) -> R
                 !root.starts_with(&home) && !home.starts_with(&root),
                 "keep the daemon home and Castle folder separate"
             );
-            client.initialize(&input.root)?;
+            worker.configure(|| client.initialize(&input.root))?;
         }
         ("POST", "/host/connect") => {
             let input: HostConnect = decode(body)?;
             absolute(&input.token_file)?;
-            client.connect(&input.url, &input.token_file)?;
+            worker.configure(|| client.connect(&input.url, &input.token_file))?;
         }
         ("POST", "/host/resolve") => {
             let input: HostResolve = decode(body)?;
-            match input.resolution {
-                HostResolution::Local => client.resolve(&input.path, "local", None)?,
-                HostResolution::Remote => client.resolve(&input.path, "remote", None)?,
-                HostResolution::Merged(file) => {
-                    absolute(&file)?;
-                    client.resolve(&input.path, "merged", Some(&file))?;
-                }
+            if let HostResolution::Merged(file) = &input.resolution {
+                absolute(file)?;
             }
+            coven_host::validate_path(&input.path)?;
+            return worker.schedule(Some(Task::Resolve(input)));
         }
         ("POST", "/host/sync" | "/host/watch") => {
             decode::<Empty>(body)?;
-            return worker.schedule(route == "/host/watch");
+            return worker.schedule((route == "/host/sync").then_some(Task::Sync));
         }
         ("GET", "/host/status") => {
             decode::<Empty>(body)?;
@@ -296,7 +366,9 @@ pub(crate) fn route(
             return api_error(400, "invalid_request", "Expected a host run id.", None);
         };
         let jobs = worker.jobs();
-        if jobs.current == Some(id) {
+        if jobs.current.is_some_and(|run| run.id == id)
+            || jobs.pending.iter().any(|(pending, _)| *pending == id)
+        {
             return json_response(202, &Value::Null);
         }
         return match jobs.completed.iter().find(|(previous, _)| *previous == id) {
@@ -306,7 +378,14 @@ pub(crate) fn route(
         };
     }
     match dispatch(worker, method, route, body) {
-        Ok(value) => json_response(if route == "/host/sync" { 202 } else { 200 }, &value),
+        Ok(value) => json_response(
+            if matches!(route, "/host/sync" | "/host/resolve") {
+                202
+            } else {
+                200
+            },
+            &value,
+        ),
         Err(error) if error.is::<serde_json::Error>() => {
             api_error(400, "invalid_request", &error.to_string(), None)
         }
@@ -317,6 +396,39 @@ pub(crate) fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolutions_are_distinct_and_fence_sync_coalescing() {
+        let active = Uuid::new_v4();
+        let mut jobs = Jobs {
+            current: Some(Running {
+                id: active,
+                sync: true,
+            }),
+            ..Jobs::default()
+        };
+        assert_eq!(jobs.enqueue(Task::Sync).unwrap(), active);
+        let first = jobs
+            .enqueue(Task::Resolve(HostResolve {
+                path: "files/note".into(),
+                resolution: HostResolution::Local,
+            }))
+            .unwrap();
+        let second = jobs
+            .enqueue(Task::Resolve(HostResolve {
+                path: "files/note".into(),
+                resolution: HostResolution::Remote,
+            }))
+            .unwrap();
+        assert_ne!(first, second);
+        let final_sync = jobs.enqueue(Task::Sync).unwrap();
+        assert_ne!(final_sync, active);
+        assert_eq!(final_sync, jobs.enqueue(Task::Sync).unwrap());
+        assert_eq!(
+            jobs.pending.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [first, second, final_sync]
+        );
+    }
 
     #[test]
     fn tcp_refuses_the_whole_host_route_family_before_opening_state() {
@@ -393,9 +505,9 @@ mod tests {
                 )
                 .unwrap();
         });
-        let first = worker.schedule(false).unwrap();
+        let first = worker.schedule(Some(Task::Sync)).unwrap();
         at_peer.recv_timeout(Duration::from_secs(15)).unwrap();
-        assert_eq!(worker.schedule(false).unwrap(), first);
+        assert_eq!(worker.schedule(Some(Task::Sync)).unwrap(), first);
         let body = first.to_string();
         assert_eq!(
             route(&worker, "POST", "/host/result", Some(&body))
