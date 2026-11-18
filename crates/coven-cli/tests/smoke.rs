@@ -467,6 +467,51 @@ fn daemon_start_names_a_coven_home_too_long_for_its_socket() -> anyhow::Result<(
 }
 
 #[test]
+fn host_status_recovers_a_stale_socket_after_daemon_crash() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let base = temporary.path().canonicalize()?;
+    let coven_home = base.join("home");
+    let root = base.join("folder");
+    let binary = coven_bin();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let _cleanup = DaemonGuard {
+        coven: binary.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+    let mut daemon = ChildGuard::spawn(
+        Command::new(&binary)
+            .args(["daemon", "serve"])
+            .env("COVEN_HOME", &coven_home)
+            .env_remove("COVEN_HOST_STATE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
+    wait_for_daemon_health(&coven_home)?;
+    let host = |args: &[&str]| {
+        Command::new(&binary)
+            .arg("host")
+            .args(args)
+            .env("COVEN_HOME", &coven_home)
+            .env_remove("COVEN_HOST_STATE")
+            .output()
+    };
+    assert_success(
+        "initial host init",
+        &host(&["init", "--root", root.to_str().unwrap()])?,
+    );
+    daemon.terminate()?;
+    assert!(coven_home.join("coven.sock").exists());
+    let status = host(&["status"])?;
+    assert_success("status after daemon crash", &status);
+    let body: Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(body["root"].as_str(), root.to_str());
+    assert_ne!(daemon_status_pid(&coven_home)?, u64::from(daemon.id()));
+    Ok(())
+}
+
+#[test]
 fn managed_daemon_identity_matches_health_across_restart_and_stop() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");

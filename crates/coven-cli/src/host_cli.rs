@@ -102,6 +102,31 @@ fn peer_command(
     Ok(())
 }
 
+fn daemon_client(home: &Path) -> Result<DaemonClient> {
+    if let Ok(endpoint) = DaemonEndpoint::discover(home) {
+        let mut client = DaemonClient::new(endpoint);
+        match client.health() {
+            Ok(_) => return Ok(client),
+            // A crashed daemon can leave a discoverable socket. Only a failed
+            // connect proves it is absent. Preserve live peers' protocol and
+            // capability errors, and never replay a host mutation.
+            Err(ref err @ coven_client::ClientError::Io { ref source, .. })
+                if err.request_was_definitely_not_sent()
+                    && matches!(
+                        source.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    crate::daemon::ensure_background_server(
+        home,
+        &std::env::current_exe()?,
+        crate::current_timestamp(),
+    )?;
+    Ok(DaemonClient::new(DaemonEndpoint::discover(home)?))
+}
+
 pub(crate) fn run(command: Command) -> Result<()> {
     use Command::*;
     let op = match command {
@@ -147,21 +172,7 @@ pub(crate) fn run(command: Command) -> Result<()> {
         Sync => HostOperation::Sync,
         Watch => HostOperation::Watch,
     };
-    let home = crate::paths::coven_home_dir()?;
-    // Discover first so an older healthy daemon can report its own missing
-    // capability without a new CLI attempting to replace it.
-    let endpoint = match DaemonEndpoint::discover(&home) {
-        Ok(endpoint) => endpoint,
-        Err(_) => {
-            crate::daemon::ensure_background_server(
-                &home,
-                &std::env::current_exe()?,
-                crate::current_timestamp(),
-            )?;
-            DaemonEndpoint::discover(&home)?
-        }
-    };
-    let mut client = DaemonClient::new(endpoint);
+    let mut client = daemon_client(&crate::paths::coven_home_dir()?)?;
     match op {
         HostOperation::Sync => {
             let run: HostRun = serde_json::from_value(client.host(op)?)?;
