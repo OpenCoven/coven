@@ -7,6 +7,12 @@
       "githubUserId": 68980965,
       "sshSigningKeyId": 880193,
       "keyType": "ssh-ed25519"
+    },
+    {
+      "githubLogin": "BunsDev",
+      "githubUserId": 68980965,
+      "sshSigningKeyId": 1259375,
+      "keyType": "ssh-ed25519"
     }
   ]
 }

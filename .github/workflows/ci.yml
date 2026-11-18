@@ -139,6 +139,7 @@ jobs:
       - run: python3 scripts/dev-verify-test.py
       - run: python3 scripts/task-worktree-test.py
       - run: python3 scripts/branch-triage-test.py
+      - run: python3 scripts/propose-engine-bump-test.py
       - run: npm ci --prefix scripts/browser --ignore-scripts --no-audit --no-fund
       - run: node --test scripts/browser-capability.test.mjs
       - run: node --test scripts/package-github-release-test.mjs
@@ -267,8 +268,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  rust-test-linux:
-    name: Rust tests (Linux)
+  # Native audit and each workspace shard retain independent 20-minute
+  # acceptance budgets; all are required before the stable PR gate can pass.
+
+  native-audit-linux:
+    name: Native Automations audit (Linux)
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-latest
@@ -283,7 +287,8 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Cache packing belongs to the manual warmer, outside acceptance.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -294,8 +299,8 @@ jobs:
             ${{ runner.os }}-rust-test-
       - name: Install native link dependencies
         run: bash scripts/install-native-link-dependencies.sh
-      # Some workspace fixtures retain ignored evidence inside the checkout.
-      # Audit the clean source first; its own build cache stays outside it.
+      # This job owns a clean checkout at the same immutable source revision.
+      # Workspace fixtures and their retained evidence run in a separate job.
       - name: Audit native Automations against the exact checkout
         env:
           AUTOMATIONS_AUDIT_DIR: ${{ runner.temp }}/automations-audit
@@ -308,19 +313,61 @@ jobs:
           path: ${{ runner.temp }}/automations-audit
           retention-days: 14
           if-no-files-found: error
-      - run: cargo test --workspace --locked
+
+  rust-test-linux:
+    name: Rust tests (Linux, ${{ matrix.shard }})
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The native v2 storage matrices grew beyond one job's cold-cache budget
+    # (#1763). One name predicate and its exact complement retain every default
+    # test, including new tests, without serializing the matrices with the rest.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: storage
+            test-args: 'mobile_memory::transport::storage::v2'
+          - shard: rest
+            test-args: '--skip mobile_memory::transport::storage::v2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Keep build outputs outside the audited source
+        run: echo "CARGO_TARGET_DIR=${{ runner.temp }}/coven-target" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      # Cache packing belongs to the manual warmer, outside acceptance.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/coven-target
+          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-test-
+      - name: Install native link dependencies
+        run: bash scripts/install-native-link-dependencies.sh
+      - run: cargo test --workspace --locked -- ${{ matrix.test-args }}
       - name: Exercise passkey recovery through the real daemon
+        if: ${{ matrix.shard == 'rest' }}
         env:
           COVEN_PASSKEY_RECEIPT: ${{ runner.temp }}/passkey-recovery-receipt.json
         run: node crates/coven-cli/tests/fixtures/passkey-recovery/daemon-e2e.mjs "$CARGO_TARGET_DIR/debug/coven"
       - name: Upload passkey recovery receipt
+        if: ${{ matrix.shard == 'rest' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: passkey-recovery-linux-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/passkey-recovery-receipt.json
           if-no-files-found: error
 
-  # Workspace/audit and Threads retain independent bounded budgets. Their
+  # Workspace and Threads retain independent bounded budgets. Their
   # combined runtime can exhaust one job before the real-daemon tests finish.
   threads-test-linux:
     name: Threads tests (Linux)
@@ -362,7 +409,10 @@ jobs:
     runs-on: windows-latest
     # Keep the two build profiles in separate required jobs so feature
     # evidence cannot be cancelled after the workspace consumes its budget.
-    timeout-minutes: 30
+    # #1734: cold-cache rest runs exhausted 30m without a reported test failure.
+    # Only rest gets a 45m CI hang guard; hosted acceptance targets <=33.75m
+    # (at least 25% headroom), without changing test deadlines or coverage.
+    timeout-minutes: ${{ matrix.job-timeout }}
     # One libtest name predicate splits `cargo test --workspace` across two
     # runners (#1227). `named` runs every test whose name contains one of the
     # tokens and `rest` skips exactly those, so each test runs in exactly one
@@ -380,8 +430,10 @@ jobs:
         include:
           - shard: named
             test-args: 'automations:: api::tests::threads'
+            job-timeout: 30
           - shard: rest
             test-args: '--skip automations:: --skip api::tests::threads'
+            job-timeout: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -796,6 +848,10 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.changes.outputs.npm_packaging == 'true' }}
     runs-on: ${{ matrix.os }}
+    # A cold Intel optimized CLI build took 28m04s in queue 42802835255,
+    # leaving the 30m job unable to finish the required AFS helper and npm
+    # checks. Its 45m outer hang guard leaves about 15m beyond that observed
+    # build and setup; inner tests and production deadlines stay unchanged.
     timeout-minutes: ${{ matrix.job-timeout }}
     env:
       COVEN_NPM_DRY_RUN_VERSION: 999.0.0
@@ -814,7 +870,7 @@ jobs:
           - os: macos-15-intel
             npm-target: macos-x64
             rust-target: x86_64-apple-darwin
-            job-timeout: 30
+            job-timeout: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -865,8 +921,9 @@ jobs:
     needs: changes
     if: ${{ github.event_name == 'push' }}
     runs-on: ${{ matrix.os }}
-    # Intel release compilation consumed 17m43s before helper/npm work (#1380).
-    # This outer hang guard leaves every inner test and production deadline intact.
+    # Match the Intel PR/queue hang guard: cold CLI compilation alone has
+    # consumed 28m04s. Keep room for the required helper/npm checks without
+    # changing any inner test or production deadline; other rows stay at 20m.
     timeout-minutes: ${{ matrix.job-timeout }}
     strategy:
       fail-fast: false
@@ -879,7 +936,7 @@ jobs:
           - os: macos-15-intel
             npm-target: macos-x64
             rust-target: x86_64-apple-darwin
-            job-timeout: 30
+            job-timeout: 45
           - os: ubuntu-latest
             npm-target: linux-x64
             rust-target: x86_64-unknown-linux-gnu
@@ -918,11 +975,31 @@ jobs:
           COVEN_NPM_DRY_RUN_VERSION: 999.0.0
 
   engine-contract:
-    name: engine contract
+    name: engine contract (${{ matrix.platform }})
     needs: changes
     if: ${{ github.event_name == 'push' || needs.changes.outputs.engine == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.job-timeout }}
+    # One leg per engine archive that a hosted Linux or Windows runner can
+    # run (#1788). The pin names a different archive for each, and Windows
+    # unpacks a .zip and runs coven-code.exe. `fail-fast: false` keeps one
+    # platform's failure from cancelling the others' evidence.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            job-timeout: 20
+          - platform: linux-aarch64
+            os: ubuntu-24.04-arm
+            job-timeout: 20
+          - platform: windows-x86_64
+            os: windows-latest
+            job-timeout: 30
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -934,19 +1011,27 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-rust-engine-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-engine-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-rust-engine-
-      - name: Install native link dependencies
-        run: bash scripts/install-native-link-dependencies.sh
+            ${{ runner.os }}-${{ runner.arch }}-rust-engine-
+      # libopenblas-dev links coven; the Linux engine binary loads
+      # libasound.so.2 at start (OpenCoven/coven-code#505).
+      - name: Install native link dependencies and the engine's ALSA library (Linux only)
+        if: runner.os == 'Linux'
+        run: bash scripts/install-native-link-dependencies.sh libopenblas-dev libasound2t64
       - name: Build coven
         run: cargo build -p coven-cli --locked
       - name: Install the pinned engine
         run: cargo run -p coven-cli --locked -- engine install
       - name: Run contract tests against the pinned engine
         run: |
-          ENGINE="$HOME/.coven/engine/$(cat "$HOME/.coven/engine/current")/coven-code"
+          cargo run --quiet -p coven-cli --locked -- engine status
+          ENGINE="$(cargo run --quiet -p coven-cli --locked -- engine which)"
           echo "engine: $ENGINE"
+          case "$ENGINE" in
+            *.coven*engine*) ;;
+            *) echo "::error::coven resolved an engine outside its managed directory: $ENGINE"; exit 1 ;;
+          esac
           "$ENGINE" --version
           COVEN_ENGINE_BIN="$ENGINE" cargo test -p coven-cli --locked contract -- --nocapture
 
@@ -1007,6 +1092,7 @@ jobs:
       - automations-protocol-bundle
       - automations-authority-profile-bundle
       - rust-lint-linux
+      - native-audit-linux
       - rust-test-linux
       - threads-test-linux
       - rust-test-windows
@@ -1041,6 +1127,8 @@ jobs:
               if data["result"] not in {"success", "skipped"}
           }
           required_jobs = ["changes", "policy-guard", "automations-protocol-bundle", "automations-authority-profile-bundle"]
+          if jobs["changes"]["outputs"].get("rust") == "true":
+              required_jobs.extend(["native-audit-linux", "rust-test-linux"])
           if os.environ["GITHUB_EVENT_NAME"] == "push":
               required_jobs.append("npm-onboarding-main")
           elif jobs["changes"]["outputs"].get("npm_packaging") == "true":

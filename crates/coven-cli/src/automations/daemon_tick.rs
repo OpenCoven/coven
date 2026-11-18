@@ -837,7 +837,9 @@ mod tests {
         let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
         insert_definition(&conn, &definition("generation-pinned")).unwrap();
         set_created_at(&conn, "generation-pinned", "2020-01-01T08:00:00.000Z");
-        drop(conn);
+        // Keep this observer initialized while the scheduler finishes dispatch.
+        // The runtime signal precedes pass completion: reopening here can race
+        // the scheduler's last-connection WAL cleanup, unrelated to pinning.
         let (started_tx, started_rx) = sync_channel(1);
 
         let handle = start_automations_scheduler(
@@ -851,7 +853,6 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("startup pass should publish runtime ownership");
 
-        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
         let (occurrence_generation, authority_generation): (i64, i64) = conn
             .query_row(
                 "SELECT o.scheduler_generation, authority.generation

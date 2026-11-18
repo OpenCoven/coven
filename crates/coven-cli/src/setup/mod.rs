@@ -575,6 +575,43 @@ fn run_action(
             .map(verify::EphemeralState::env_overrides)
             .unwrap_or_default(),
     };
+    let requires_version = version_resolution.is_some();
+    let version = version_resolution.and_then(|resolution| {
+        resolution.cached.map(str::to_owned).or_else(|| {
+            let version_request = LaunchRequest {
+                args: resolution.command.args.clone(),
+                ..request.clone()
+            };
+            // Discovery pins the canonical executable, whose filename may be
+            // npm-loader.js or a numeric install path rather than its brand.
+            let version = process::probe_version(
+                &version_request,
+                provider.id,
+                timeout.min(Duration::from_secs(2)),
+            );
+            #[cfg(test)]
+            match &version {
+                Ok(None) => {
+                    eprintln!("setup fixture failure: phase=version probe result=Ok(None)");
+                }
+                Err(error) => trace_setup_test_failure("version probe", error),
+                Ok(Some(_)) => {}
+            }
+            version.unwrap_or_default()
+        })
+    });
+    // Required report metadata must be usable before a potentially billable
+    // verification turn. Consent still precedes every provider command.
+    if requires_version
+        && version
+            .as_deref()
+            .is_none_or(|value| !process::valid_version(value) || !safe_report_value(value))
+    {
+        return ActionResult {
+            outcome: failure_outcome(action),
+            version,
+        };
+    }
     let mut process = match runtime.launcher.launch(&request) {
         Ok(process) => process,
         Err(_error) => {
@@ -583,7 +620,7 @@ fn run_action(
             return action_result(failure_outcome(action));
         }
     };
-    let mut outcome = match wait_bounded(process.as_mut(), runtime.clock, timeout) {
+    let outcome = match wait_bounded(process.as_mut(), runtime.clock, timeout) {
         Ok(BoundedProcessResult::TimedOut) => Outcome::TimedOut,
         Ok(BoundedProcessResult::Exited(ProcessExit::Exited(0))) => Outcome::Completed,
         Ok(BoundedProcessResult::Exited(ProcessExit::Exited(_))) => failure_outcome(action),
@@ -595,37 +632,6 @@ fn run_action(
         }
     };
     drop(process);
-    let mut version = None;
-    if outcome == Outcome::Completed {
-        if let Some(version_resolution) = version_resolution {
-            version = version_resolution.cached.map(str::to_owned).or_else(|| {
-                let request = LaunchRequest {
-                    executable: executable.to_path_buf(),
-                    args: version_resolution.command.args.clone(),
-                    current_dir: ephemeral_state
-                        .as_ref()
-                        .map(|state| state.current_dir().to_path_buf()),
-                    env_overrides: ephemeral_state
-                        .as_ref()
-                        .map(verify::EphemeralState::env_overrides)
-                        .unwrap_or_default(),
-                };
-                let version = process::probe_version(&request, timeout.min(Duration::from_secs(2)));
-                #[cfg(test)]
-                match &version {
-                    Ok(None) => {
-                        eprintln!("setup fixture failure: phase=version probe result=Ok(None)");
-                    }
-                    Err(error) => trace_setup_test_failure("version probe", error),
-                    Ok(Some(_)) => {}
-                }
-                version.unwrap_or_default()
-            });
-            if version.is_none() {
-                outcome = failure_outcome(action);
-            }
-        }
-    }
     if let Some(state) = ephemeral_state {
         if let Err(_error) = state.cleanup() {
             #[cfg(test)]
@@ -765,6 +771,9 @@ fn publish_report(
         .first()
         .filter(|_| summary.results.len() == 1)
         .ok_or(SetupError::ReportRequiresSingleProvider)?;
+    if result.outcome != Outcome::Completed {
+        return Err(SetupError::Rejected);
+    }
     let report = SetupReport {
         harness: result.provider,
         cli_version: result.version.clone().ok_or(SetupError::Rejected)?,

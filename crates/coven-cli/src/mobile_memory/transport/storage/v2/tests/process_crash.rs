@@ -336,19 +336,35 @@ impl Drop for Owned {
         }
     }
 }
+/// One observation of a file the child publishes by rename before it may
+/// exit. The exit is sampled first: a child that publishes and exits between
+/// the two samples has then already published, so the file check that follows
+/// an observed exit is decisive (#1741).
+fn poll_file<S>(path: &Path, exited: impl FnOnce() -> Option<S>) -> Result<Option<Vec<u8>>, S> {
+    let status = exited();
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => status.map_or(Ok(None), Err),
+        Err(e) => panic!("reading {}: {e}", path.display()),
+    }
+}
 fn wait_file(child: &mut Owned, control: &Path, name: &str) -> Vec<u8> {
     let started = Instant::now();
     loop {
-        if control.join(name).exists() {
-            return fs::read(control.join(name)).unwrap();
-        }
-        if let Some(status) = child.child.as_mut().unwrap().try_wait().unwrap() {
-            let output = child.finish();
-            panic!(
-                "child exited {status} before {name}: {} {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+        let observed = poll_file(&control.join(name), || {
+            child.child.as_mut().unwrap().try_wait().unwrap()
+        });
+        match observed {
+            Ok(Some(bytes)) => return bytes,
+            Ok(None) => {}
+            Err(status) => {
+                let output = child.finish();
+                panic!(
+                    "child exited {status} before {name}: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
         }
         // Explicit readiness, with early exit detection. This is only a hang
         // guard, not a short budget selecting a valid persistence outcome.
@@ -359,6 +375,22 @@ fn wait_file(child: &mut Owned, control: &Path, name: &str) -> Vec<u8> {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+#[test]
+fn a_file_published_just_before_the_child_exits_is_not_an_early_exit() {
+    let control = tempfile::tempdir().unwrap();
+    let path = control.path().join("checkpoint");
+    // Still running, nothing published.
+    assert_eq!(poll_file(&path, || None::<i32>), Ok(None));
+    // Exited without publishing: a real early exit.
+    assert_eq!(poll_file(&path, || Some(101)), Err(101));
+    // The child publishes and exits while the parent is sampling the exit,
+    // which is the latest moment the two can interleave.
+    let observed = poll_file(&path, || {
+        publish(control.path(), "checkpoint", b"cut");
+        Some(101)
+    });
+    assert_eq!(observed, Ok(Some(b"cut".to_vec())));
 }
 pub(crate) fn round(
     f: &Fixture,

@@ -32,6 +32,8 @@ pub(crate) mod admission;
 #[cfg(unix)]
 pub(crate) mod channel;
 pub(crate) mod credential;
+#[cfg(unix)]
+pub(crate) mod launch_reaper;
 pub(crate) mod open;
 pub(crate) mod scope;
 pub(crate) mod service;

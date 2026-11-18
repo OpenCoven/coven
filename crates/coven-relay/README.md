@@ -75,13 +75,18 @@ Proven cases include:
   data frames and fragmented messages; ping/pong stays local;
 - queue and global byte-budget exhaustion with a blocked writer; permits remain
   charged during sends and are released on delivery, failure, or teardown;
-- graceful and abrupt disconnect, disconnect with a full data queue, failed
-  HTTP upgrade, broken socket writes, send deadline and idle expiry;
+- graceful and abrupt disconnect, disconnect with a full data queue, messages
+  queued before a disconnect delivered ahead of its close, failed HTTP upgrade,
+  broken socket writes, send deadline and idle expiry;
 - captured verbose diagnostics exclude rendezvous secrets and payload markers.
 
 Disconnect signaling has its own bounded slot, so a full data queue cannot
 silently discard it. An in-flight send may finish or reach its deadline before
-closure; queued application frames are discarded when the connection exits.
+closure. Application messages the departing peer queued before it left are then
+delivered in order ahead of its close, so a peer that answers and ends its
+channel does not lose the answer (#1781). That delivery and the close share one
+send lifetime; messages still queued when it ends, or after a send fails, are
+discarded when the connection exits.
 
 This is **relay-server conformance**, not completion of trusted-device
 reconnection. This crate neither implements nor proves endpoint authentication,

@@ -102,7 +102,7 @@ fn v2_signed_preimages_bind_generation_host_floor_and_room() {
 }
 
 type Capture = Arc<Mutex<Vec<Vec<u8>>>>;
-struct Pipe {
+pub(super) struct Pipe {
     sender: mpsc::Sender<Vec<u8>>,
     receiver: mpsc::Receiver<Vec<u8>>,
     capture: Capture,
@@ -124,7 +124,7 @@ impl Records for Pipe {
         self.receive(Instant::now() + Duration::from_secs(30))
     }
 }
-fn pipes() -> (Pipe, Pipe, Capture) {
+pub(super) fn pipes() -> (Pipe, Pipe, Capture) {
     let (a_tx, a_rx) = mpsc::channel();
     let (b_tx, b_rx) = mpsc::channel();
     let capture = Arc::new(Mutex::new(Vec::new()));
@@ -769,4 +769,57 @@ fn relay_configuration_is_opt_in_and_private() {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(storage::RelayConfig::load(home.path()).is_err());
     }
+}
+
+#[test]
+fn migration_refuses_stale_and_foreign_candidates_and_keeps_active_on_failure() {
+    use super::{
+        connection::{ConnectionState, Transport},
+        migration::Migration,
+    };
+    let (private, public) = generate_noise_key().unwrap();
+    let pairing = pairing(public);
+    let binding = pairing.sign_noise_binding(&identity(1)).unwrap();
+    let migration = Migration::new(pairing.clone(), binding.clone(), identity(2)).unwrap();
+    let foreign = Migration::new(pairing.clone(), binding, identity(2)).unwrap();
+    let authenticate = |candidate: super::migration::Candidate| {
+        let (client, server, _) = pipes();
+        thread::scope(|scope| {
+            let host = scope.spawn(|| {
+                accept(
+                    server,
+                    &pairing,
+                    &private,
+                    &identity(1),
+                    &[9; 32],
+                    false,
+                    |_, _| Ok(()),
+                )
+            });
+            let authenticated = candidate.authenticate(client, &[9; 32]).unwrap();
+            // Joining proves the host received the final completion record.
+            assert!(host.join().unwrap().unwrap().is_open());
+            authenticated
+        })
+    };
+    let stale = migration.begin(Transport::Relay).unwrap();
+    let latest = migration.begin(Transport::Relay).unwrap();
+    assert!(migration
+        .commit(authenticate(stale))
+        .unwrap_err()
+        .to_string()
+        .contains("stale"));
+    migration.commit(authenticate(latest)).unwrap();
+    assert!(migration
+        .commit(authenticate(foreign.begin(Transport::Relay).unwrap()))
+        .unwrap_err()
+        .to_string()
+        .contains("another pairing"));
+    let candidate = migration.begin(Transport::Direct).unwrap();
+    let (client, server, _) = pipes();
+    drop(server); // The candidate fails deterministically before endpoint proof.
+    assert!(candidate.authenticate(client, &[9; 32]).is_err());
+    let status = migration.status().unwrap().unwrap();
+    assert_eq!(status.state, ConnectionState::Online);
+    assert_eq!(status.transport, Transport::Relay);
 }

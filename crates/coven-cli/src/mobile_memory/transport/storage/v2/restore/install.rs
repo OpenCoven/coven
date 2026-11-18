@@ -671,6 +671,7 @@ mod tests {
 
 #[cfg(test)]
 mod snapshot_install_tests {
+    mod mixed;
     mod process;
     use super::*;
     use crate::mobile_memory::transport::storage::v2::tests::Fixture;
@@ -865,6 +866,43 @@ mod snapshot_install_tests {
                 "barrier {barrier} mutated selected snapshot"
             );
         }
+    }
+    #[test]
+    fn snapshot_command_names_interrupted_identity_installation_before_retry() {
+        let c = case();
+        let destination = tempfile::tempdir().unwrap();
+        ensure_private_mobile_dir(destination.path()).unwrap();
+        let operation = Uuid::new_v4();
+        crate::durable_fs::fail_directory_sync_after(4);
+        assert!(install_from_snapshot(
+            destination.path(),
+            c.snapshot.path(),
+            &c.authority,
+            c.pin,
+            operation,
+        )
+        .is_err());
+        let error = check_installation(destination.path()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("mobile restore was interrupted while installing host identity"),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "retry the original restore operation with the same snapshot and signed authority source"
+            ),
+            "{message}"
+        );
+        install_from_snapshot(
+            destination.path(),
+            c.snapshot.path(),
+            &c.authority,
+            c.pin,
+            operation,
+        )
+        .unwrap();
+        check_installation(destination.path()).unwrap();
     }
     #[test]
     fn snapshot_command_rejects_changed_snapshot_on_partial_identity_retry() {

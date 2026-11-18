@@ -319,8 +319,12 @@ pub fn verify_native_profile(program: &str) -> Result<()> {
         current_dir: None,
         env_overrides: Vec::new(),
     };
-    let version = crate::setup::process::probe_version(&request, Duration::from_secs(2))?
-        .context("could not establish the Claude scoped-write profile")?;
+    let version = crate::setup::process::probe_version(
+        &request,
+        crate::setup::ProviderId::Claude,
+        Duration::from_secs(2),
+    )?
+    .context("could not establish the Claude scoped-write profile")?;
     ensure!(
         native_version_is_qualified(&version),
         "Claude scoped-write profile is unsupported; qualified versions start at 2.1.318"

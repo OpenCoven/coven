@@ -2109,11 +2109,8 @@ fn lifecycle_shutdown_validates_a_malformed_404_before_base_fallback() {
     use std::{
         io::{Read, Write},
         os::unix::{fs::PermissionsExt, net::UnixListener},
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        },
-        time::{Duration, Instant},
+        sync::mpsc,
+        time::Duration,
     };
 
     let home = TestHome::new();
@@ -2123,10 +2120,43 @@ fn lifecycle_shutdown_validates_a_malformed_404_before_base_fallback() {
     let listener = UnixListener::bind(&socket).expect("bind lifecycle socket");
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
         .expect("make lifecycle socket private");
-    let fallback_observed = Arc::new(AtomicBool::new(false));
-    let fallback_for_server = Arc::clone(&fallback_observed);
+    let (completed_tx, completed_rx) = mpsc::channel();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept shutdown");
+        listener
+            .set_nonblocking(true)
+            .expect("make shutdown and fallback detection nonblocking");
+        let mut client_completed = false;
+        let mut accept_until_completed = || loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // macOS inherits the listener's nonblocking mode; request
+                    // reads must still wait for the client's write-side EOF.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("make accepted fixture connection blocking");
+                    return Some(stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if client_completed {
+                        return None;
+                    }
+                    // This interval only lets us service requests while waiting
+                    // for the explicit completion event. Always check accept
+                    // again after completion to drain a queued connection.
+                    match completed_rx.recv_timeout(Duration::from_millis(1)) {
+                        Ok(()) => client_completed = true,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            panic!("shutdown caller dropped without announcing completion")
+                        }
+                    }
+                }
+                Err(error) => panic!("failed accepting shutdown or fallback request: {error}"),
+            }
+        };
+        let Some(mut stream) = accept_until_completed() else {
+            return false;
+        };
         let mut request = String::new();
         stream.read_to_string(&mut request).expect("read shutdown");
         assert!(request.starts_with("POST /api/v1/internal/lifecycle/shutdown HTTP/1.1\r\n"));
@@ -2135,43 +2165,37 @@ fn lifecycle_shutdown_validates_a_malformed_404_before_base_fallback() {
             .expect("write malformed missing-route response");
         drop(stream);
 
-        listener
-            .set_nonblocking(true)
-            .expect("make fallback detection nonblocking");
-        let deadline = Instant::now() + Duration::from_millis(100);
-        while Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut fallback, _)) => {
-                    fallback_for_server.store(true, Ordering::Release);
-                    let mut request = String::new();
-                    fallback
-                        .read_to_string(&mut request)
-                        .expect("read fallback request");
-                    fallback
-                        .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n")
-                        .expect("reject unexpected fallback");
-                    return;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(error) => panic!("failed checking for fallback request: {error}"),
-            }
+        if let Some(mut fallback) = accept_until_completed() {
+            let mut request = String::new();
+            fallback
+                .read_to_string(&mut request)
+                .expect("read fallback request");
+            fallback
+                .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n")
+                .expect("reject unexpected fallback");
+            true
+        } else {
+            false
         }
     });
 
-    let error = shutdown_unix_daemon(&home.path, &expected, Duration::from_secs(1))
-        .expect_err("reject malformed 404 framing before fallback");
+    // Framing validation, not shutdown timing, is the contract under test.
+    // This is only a hang guard: a descheduled fixture must have ample time to
+    // write its response rather than race a one-second caller deadline.
+    let result = shutdown_unix_daemon(&home.path, &expected, Duration::from_secs(30));
+    let _ = completed_tx.send(());
+    let fallback_observed = server.join().expect("server thread");
+    let error = result.expect_err("reject malformed 404 framing before fallback");
 
-    assert!(matches!(
-        error,
-        ClientError::InvalidHttpResponse(message) if message.contains("bytes after")
-    ));
-    server.join().expect("server thread");
     assert!(
-        !fallback_observed.load(Ordering::Acquire),
-        "malformed 404 triggered BASE fallback"
+        matches!(
+            &error,
+            ClientError::InvalidHttpResponse(message)
+                if message == "daemon sent bytes after its lifecycle response completed"
+        ),
+        "expected trailing-byte rejection, got {error:?}"
     );
+    assert!(!fallback_observed, "malformed 404 triggered BASE fallback");
 }
 
 #[test]

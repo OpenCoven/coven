@@ -287,6 +287,7 @@ fn serve(connection: Connection) -> Result<()> {
         authenticated,
         consumption,
     } = connection;
+    let _storage_scope = state.storage_runtime.enter();
     let mut connection = state
         .connections
         .begin(transport::connection::Transport::Relay)?;

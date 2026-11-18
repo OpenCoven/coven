@@ -1,5 +1,7 @@
 //! Native installer interruption. Process death is not a power-loss simulation.
 #[cfg(unix)]
+mod mixed_sources;
+#[cfg(unix)]
 mod retained_images;
 use super::*;
 use crate::mobile_memory::config;
@@ -60,6 +62,25 @@ impl Drop for Owned {
     }
 }
 fn run(c: &Case, home: &Path, operation: Uuid, cut: usize, kill: bool) -> Vec<String> {
+    run_sources(
+        c.snapshot.path(),
+        &c.authority,
+        c.pin,
+        home,
+        operation,
+        cut,
+        kill,
+    )
+}
+fn run_sources(
+    snapshot: &Path,
+    authority: &Path,
+    pin: [u8; 32],
+    home: &Path,
+    operation: Uuid,
+    cut: usize,
+    kill: bool,
+) -> Vec<String> {
     let control = tempfile::tempdir().unwrap();
     let trace = control.path().join("trace");
     let stdout = control.path().join("stdout");
@@ -68,11 +89,11 @@ fn run(c: &Case, home: &Path, operation: Uuid, cut: usize, kill: bool) -> Vec<St
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", ENTRY, "--ignored", "--nocapture"])
             .env("RESTORE_TEST_HOME", home)
-            .env("RESTORE_TEST_SNAPSHOT", c.snapshot.path())
-            .env("RESTORE_TEST_AUTHORITY", &c.authority)
+            .env("RESTORE_TEST_SNAPSHOT", snapshot)
+            .env("RESTORE_TEST_AUTHORITY", authority)
             .env("RESTORE_TEST_TRACE", &trace)
             .env("RESTORE_TEST_OPERATION", operation.to_string())
-            .env("RESTORE_TEST_PIN", URL_SAFE_NO_PAD.encode(c.pin))
+            .env("RESTORE_TEST_PIN", URL_SAFE_NO_PAD.encode(pin))
             .env("RESTORE_TEST_CUT", cut.to_string())
             .env("RESTORE_TEST_KILL", kill.to_string())
             .stdin(Stdio::null())
@@ -351,8 +372,9 @@ fn interrupted_restore_repairs_partial_new_protocol_floor_only_under_its_fence()
         .path()
         .join("mobile")
         .join(format!(".transport-v2-{}.required", c.f.id));
-    // Explicit retained image: create/write happened before file/namespace sync.
-    // An empty retained new file is legal; SIGKILL alone did not produce it.
+    // Explicit legacy retained image from the former direct-create writer.
+    // The staged writer cannot produce this canonical truncation; retain
+    // fenced recovery coverage for images left by older installations.
     atomic_replace_private(&marker, b"").unwrap();
     let registry = DeviceRegistry::load(destination.path()).unwrap();
     assert!(check_application(destination.path(), &registry, c.f.id).is_err());

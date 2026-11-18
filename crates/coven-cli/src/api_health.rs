@@ -55,6 +55,10 @@ pub struct HealthCapabilities {
     pub executor_dispatch: bool,
     pub event_cursor: String,
     pub structured_errors: bool,
+    /// Internal lifecycle contract for clients retaining the authenticated
+    /// Windows root while its separately owned authority workers exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_shutdown: Option<String>,
     pub session_handoff: bool,
     /// Whether `POST /sessions` accepts the exact, fail-closed
     /// `launchPolicy` contract documented for unattended Codex work.
@@ -170,6 +174,11 @@ pub(crate) fn health_response_for_authority(
             executor_dispatch: true,
             event_cursor: "sequence".to_string(),
             structured_errors: true,
+            lifecycle_shutdown: if cfg!(windows) {
+                Some("observed-workers-v1".into())
+            } else {
+                None
+            },
             session_handoff: true,
             session_launch_policy: authority.allows_session_launch_policy(),
             session_claude_write_scope: authority.allows_session_launch_policy(),

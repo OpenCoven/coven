@@ -981,3 +981,5 @@ fn retained_registry_restore_epoch_blocks_loss_of_both_global_fence_files() {
 pub(super) mod process_crash;
 
 mod authenticated_race;
+
+mod contention;

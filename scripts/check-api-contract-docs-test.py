@@ -2376,11 +2376,7 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
         section = module.markdown_section(
             duplicate_dto[path], "Version compatibility"
         )
-        marker = (
-            "The complete current "
-            f"{len(module.HEALTH_CAPABILITY_FIELDS)}-field Rust "
-            "health-capability DTO"
-        )
+        marker = "The complete current Rust health-capability DTO"
         paragraph = module.markdown_paragraph(section or "", marker)
         self.assertIsNotNone(paragraph)
         corrupt_paragraph = (paragraph or "").replace(
@@ -2405,10 +2401,7 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
         path = "packages/openclaw-coven/README.md"
         changed = self.o3_structure_documents()
         expected_count = len(module.HEALTH_CAPABILITY_FIELDS)
-        marker = (
-            f"The complete current {expected_count}-field Rust "
-            "health-capability DTO"
-        )
+        marker = "The complete current Rust health-capability DTO"
         section = module.markdown_section(
             changed[path], "Version compatibility"
         )
@@ -2416,8 +2409,8 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
         self.assertIsNotNone(paragraph)
         stale = self.replace_once(
             paragraph or "",
-            f"{expected_count}-field",
-            f"{expected_count - 1}-field",
+            f"{expected_count} common fields",
+            f"{expected_count - 1} common fields",
         )
         changed[path] = self.replace_once(
             changed[path], paragraph or "", stale
@@ -2428,6 +2421,72 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
             f"{path}: canonical health DTO reference is missing",
             errors,
         )
+
+
+    def test_common_health_examples_still_reject_the_windows_only_field(self) -> None:
+        for path, heading, request_line, label in self.health_example_cases():
+            with self.subTest(path=path):
+                changed = self.o3_structure_documents()
+                self.mutate_health_capability(changed, path, heading, "lifecycleShutdown", "observed-workers-v1", request_line=request_line)
+                errors = module.validate_o3_document_structures(changed)
+                self.assertIn(f"{path}: {label} capabilities must contain exactly 18 fields (found 19)", errors)
+
+    def test_windows_optional_capability_notes_reject_omission_and_wrong_contract(self) -> None:
+        for path in module.HEALTH_CAPABILITY_LIST_DOCS:
+            for replacement in ("", 'Windows adds the optional 19th capability field, `lifecycleShutdown: "other"`.'):
+                with self.subTest(path=path, replacement=replacement):
+                    changed = self.o3_structure_documents()
+                    note = module.markdown_paragraph(changed[path], "Windows adds the optional")
+                    self.assertIsNotNone(note)
+                    changed[path] = self.replace_once(changed[path], note or "", replacement)
+                    changed[path] += "\n\n# Unrelated decoy\n" + (note or "")
+                    errors: list[str] = []
+                    module.validate_windows_lifecycle_docs(changed, errors)
+                    self.assertIn(f"{path}: optional Windows lifecycle capability note is missing or invalid", errors)
+
+    def test_windows_optional_capability_row_rejects_omission_type_and_contract(self) -> None:
+        path = "docs/API-CONTRACT.md"
+        for kind in ("omit", "type", "contract"):
+            with self.subTest(kind=kind):
+                changed = self.o3_structure_documents()
+                section = module.markdown_section(changed[path], "Capability fields", level=3)
+                table = module.markdown_table(section or "", ("Field", "Type", "Description"))
+                rows = module.markdown_table_rows(table, {"Field": "lifecycleShutdown"})
+                self.assertEqual(len(rows), 1)
+                row = rows[0].source
+                replacement = {"omit": "", "type": row.replace("optional string", "boolean"), "contract": row.replace("observed-workers-v1", "other")}[kind]
+                changed[path] = self.replace_once(changed[path], row, replacement)
+                changed[path] += "\n\n# Unrelated decoy\n" + row
+                errors: list[str] = []
+                module.validate_windows_lifecycle_docs(changed, errors)
+                self.assertIn(f"{path}: optional Windows lifecycle capability row is missing or invalid", errors)
+
+    def test_windows_shutdown_claim_rejects_weaker_ack_and_legacy_fallback(self) -> None:
+        path = "docs/API-CONTRACT.md"
+        for old, new in (("HTTP `202`", "HTTP `200`"), ("the capability is absent and", "the capability is absent or"), ("never permits root-termination fallback", "permits root-termination fallback")):
+            with self.subTest(old=old):
+                changed = self.o3_structure_documents()
+                section = module.markdown_section(changed[path], "Windows lifecycle shutdown", level=2)
+                claim = module.markdown_paragraph(section or "", "When health advertises")
+                self.assertIsNotNone(claim)
+                corrupt = self.replace_once(claim or "", old, new)
+                changed[path] = self.replace_once(changed[path], claim or "", corrupt)
+                changed[path] += "\n\n# Unrelated decoy\n" + (claim or "")
+                errors: list[str] = []
+                module.validate_windows_lifecycle_docs(changed, errors)
+                self.assertTrue(any("owner-validated Windows shutdown claim" in error for error in errors))
+
+    def test_openclaw_optional_windows_dto_count_and_token_are_required(self) -> None:
+        path = "packages/openclaw-coven/README.md"
+        for old, new in (("19th field", "18th field"), ('`lifecycleShutdown: "observed-workers-v1"`', '`lifecycleShutdown: "other"`')):
+            with self.subTest(old=old):
+                changed = self.o3_structure_documents()
+                section = module.markdown_section(changed[path], "Version compatibility")
+                paragraph = module.markdown_paragraph(section or "", "The complete current Rust health-capability DTO")
+                self.assertIsNotNone(paragraph)
+                changed[path] = self.replace_once(changed[path], paragraph or "", self.replace_once(paragraph or "", old, new))
+                errors = module.validate_o3_document_structures(changed)
+                self.assertIn(f"{path}: canonical health DTO reference is missing", errors)
 
     def test_health_examples_ignore_request_adoption_decoys(self) -> None:
         examples = {

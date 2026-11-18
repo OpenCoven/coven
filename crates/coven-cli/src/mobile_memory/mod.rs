@@ -17,6 +17,7 @@ pub mod policy_cli;
 pub mod recovery;
 pub mod registry;
 pub mod relay;
+mod store_lock;
 pub mod transport;
 
 use std::net::SocketAddr;
@@ -606,8 +607,7 @@ fn post_mobile_control_inner(
     stream
         .write_all(request.as_bytes())
         .context("failed to write mobile pairing control request")?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
+    crate::daemon::finish_daemon_request(&stream)
         .context("failed to finish mobile pairing control request")?;
     let deadline = Instant::now() + io_deadline;
     let mut response = Vec::new();
@@ -770,6 +770,10 @@ mod connection_probe_tests {
                         Err(error) => panic!("fixture accept failed: {error}"),
                     }
                 };
+                // On macOS the accepted socket inherits the listener's
+                // non-blocking mode (#1776), which makes the read below return
+                // WouldBlock before the request arrives and ignore its timeout.
+                stream.set_nonblocking(false).unwrap();
                 // Hang guard for a broken request producer, far above the probe budget.
                 stream
                     .set_read_timeout(Some(Duration::from_secs(30)))

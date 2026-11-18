@@ -23,6 +23,19 @@ impl Fixture {
         Self::with_home(home)
     }
     fn with_home(home: tempfile::TempDir) -> Self {
+        Self::configured(home, false)
+    }
+    fn with_authorization() -> Self {
+        Self::configured(tempfile::tempdir().unwrap(), true)
+    }
+    fn configured(home: tempfile::TempDir, with_authorization: bool) -> Self {
+        Self::configured_after(home, with_authorization, 0)
+    }
+    fn configured_after(
+        home: tempfile::TempDir,
+        with_authorization: bool,
+        preceding: usize,
+    ) -> Self {
         let registry = Arc::new(DeviceRegistry::load(home.path()).unwrap());
         let identity = load_or_create_host_identity(home.path(), "192.0.2.1").unwrap();
         let host = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
@@ -41,12 +54,46 @@ impl Fixture {
             scopes: vec![DeviceScope::MemoryRead],
         };
         let grant = DeviceGrant::for_device(id, &public_key, record.scopes.clone(), now).unwrap();
-        registry.register_with_grant(record, grant).unwrap();
+        let authorization =
+            with_authorization.then(|| super::super::assurance::NewAuthorizationKey {
+                public_key_x963: URL_SAFE_NO_PAD.encode(
+                    SigningKey::from_slice(&[43; 32])
+                        .unwrap()
+                        .verifying_key()
+                        .to_sec1_point(false)
+                        .as_bytes(),
+                ),
+                assurance_class: super::super::assurance::AssuranceClass::BiometricOnly,
+                enrolled_at: now,
+            });
+        for index in 0..preceding {
+            let mut other = record.clone();
+            other.id = Uuid::new_v4();
+            let other_key =
+                SigningKey::from_slice(&[u8::try_from(index + 100).unwrap(); 32]).unwrap();
+            other.public_key_x963 =
+                URL_SAFE_NO_PAD.encode(other_key.verifying_key().to_sec1_point(false).as_bytes());
+            let other_grant = DeviceGrant::for_device(
+                other.id,
+                &other.public_key_x963,
+                other.scopes.clone(),
+                now,
+            )
+            .unwrap();
+            registry
+                .register_with_grant_and_authorization(other, other_grant, None)
+                .unwrap();
+        }
+        registry
+            .register_with_grant_and_authorization(record, grant, authorization)
+            .unwrap();
         let pairing = storage::load_or_provision(home.path(), &registry, &host, id)
             .unwrap()
             .pairing;
         let state = MobileGatewayState {
+            storage_runtime: super::super::store_lock::Runtime::current(),
             connections: Default::default(),
+            network: Default::default(),
             coven_home: home.path().to_path_buf(),
             host_fingerprint: identity.public_key_fingerprint,
             pairing: PairingManager::new(Arc::clone(&registry)),
@@ -263,6 +310,36 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
         command.env("PATH", path);
     }
     let mut daemon = OwnedDaemon(command.spawn().unwrap());
+    let authority_before = fixture
+        .state
+        .registry
+        .authorization_record(fixture.pairing.device_id)
+        .unwrap()
+        .unwrap();
+    let observe_phase = |daemon: &mut OwnedDaemon, expected| {
+        let started = Instant::now();
+        // Hang guard only: wait on the actual daemon observation, never a sleep
+        // selected to race TLS/Noise setup. Child exit reports failure early.
+        let deadline = started + Duration::from_secs(120);
+        loop {
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "daemon exited while waiting for {expected:?}"
+            );
+            if let Some(observed) = crate::mobile_memory::relay_connection_for_doctor(home) {
+                if observed.state == expected {
+                    assert_eq!(observed.transport, transport::connection::Transport::Relay);
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon never reported {expected:?}; observed wait {:?}",
+                started.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
     // Startup/store initialization is outside the strict stop budget. This is
     // only a hang guard; process exit reports early failure while retrying.
     let startup_deadline = Instant::now() + Duration::from_secs(120);
@@ -293,8 +370,16 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
         // Receiving ClientHello proves the worker reached the real TLS path.
         // Send nothing back: shutdown must interrupt the pending handshake.
         stalled_socket = Some(socket);
+        observe_phase(
+            &mut daemon,
+            transport::connection::ConnectionState::Connecting,
+        );
         None
     } else {
+        observe_phase(
+            &mut daemon,
+            transport::connection::ConnectionState::Authenticating,
+        );
         let mut channel = loop {
             assert!(
                 daemon.0.try_wait().unwrap().is_none(),
@@ -341,6 +426,9 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
         Some(channel)
     };
 
+    if !stall_tls {
+        observe_phase(&mut daemon, transport::connection::ConnectionState::Online);
+    }
     let started = Instant::now();
     assert!(crate::daemon::stop_background_server(home).unwrap());
     let elapsed = started.elapsed();
@@ -362,6 +450,19 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert!(
+        crate::mobile_memory::relay_connection_for_doctor(home).is_none(),
+        "stopped daemon retained a live connection observation"
+    );
+    assert_eq!(
+        authority_before,
+        fixture
+            .state
+            .registry
+            .authorization_record(fixture.pairing.device_id)
+            .unwrap()
+            .unwrap()
+    );
     if let Some(channel) = channel.as_mut() {
         assert!(channel
             .receive_message(
@@ -625,7 +726,7 @@ fn direct_only_bootstrap_omits_relay_endpoints_and_relay_still_refuses() {
     // and a reachable endpoint, yet the device's relay session is refused.
     // The same material derives the same routing secret the host uses.
     let provisioning = material.provisioning(&signer).unwrap();
-    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+    let runtime = start_mobile_gateway_native_for_daemon(&fixture.state.coven_home)
         .unwrap()
         .unwrap();
     let registry_path = fixture.state.coven_home.join("mobile/devices.json");
@@ -829,7 +930,7 @@ fn relay_only_runtime_reconnects_without_identity_change_and_stops_idle_workers(
             relay_config.enabled = true;
             relay_config.save(&fixture.state.coven_home).unwrap();
         }
-        let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+        let runtime = start_mobile_gateway_native_for_daemon(&fixture.state.coven_home)
             .unwrap()
             .unwrap();
         assert!(
@@ -887,7 +988,7 @@ fn relay_only_runtime_reconnects_without_identity_change_and_stops_idle_workers(
                     Instant::now() + Duration::from_secs(8),
                 )
                 .unwrap_err();
-            assert_eq!(error.to_string(), "unexpected relay record");
+            assert_eq!(error.to_string(), "unexpected relay record: close 1001");
         }
         if round == 2 {
             fixture
@@ -967,7 +1068,7 @@ fn relay_worker_holds_an_idle_authenticated_channel_and_serves_a_later_signed_re
     .unwrap()
     .unwrap();
     let provisioning = material.provisioning(&signer).unwrap();
-    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+    let runtime = start_mobile_gateway_native_for_daemon(&fixture.state.coven_home)
         .unwrap()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -1001,7 +1102,7 @@ fn relay_worker_holds_an_idle_authenticated_channel_and_serves_a_later_signed_re
             .and_then(|()| channel.receive_message(MAX_MOBILE_RESPONSE_BYTES, deadline))
     };
     assert!(exchange(&mut channel).unwrap().starts_with(b"HTTP/1.1 200"));
-    let observed = handle_local_control("POST", LOCAL_CONNECTION_PATH, Some("{}"))
+    let observed = handle_local_control_native("POST", LOCAL_CONNECTION_PATH, Some("{}"))
         .unwrap()
         .unwrap();
     assert_eq!(observed.status, 200);
@@ -1010,7 +1111,7 @@ fn relay_worker_holds_an_idle_authenticated_channel_and_serves_a_later_signed_re
         serde_json::json!({"state":"online", "transport":"relay"})
     );
     assert_eq!(
-        handle_local_control("GET", LOCAL_CONNECTION_PATH, None)
+        handle_local_control_native("GET", LOCAL_CONNECTION_PATH, None)
             .unwrap()
             .unwrap()
             .status,
@@ -1058,7 +1159,7 @@ fn relay_worker_holds_an_idle_authenticated_channel_and_serves_a_later_signed_re
         "relay runtime stop exceeded two seconds with an idle channel: {:?}",
         started.elapsed()
     );
-    let observed = handle_local_control("POST", LOCAL_CONNECTION_PATH, Some("{}"))
+    let observed = handle_local_control_native("POST", LOCAL_CONNECTION_PATH, Some("{}"))
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -1158,7 +1259,7 @@ fn relay_runtime_recovers_a_missed_slot_and_closes_rotated_or_revoked_sessions()
     .unwrap();
     let provisioning = material.provisioning(&signer).unwrap();
     let pairing = material.pairing.clone();
-    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+    let runtime = start_mobile_gateway_native_for_daemon(&fixture.state.coven_home)
         .unwrap()
         .unwrap();
 
@@ -1247,7 +1348,7 @@ fn relay_runtime_recovers_a_missed_slot_and_closes_rotated_or_revoked_sessions()
     drop(runtime);
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(exchange(&mut channel).is_err());
-    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+    let runtime = start_mobile_gateway_native_for_daemon(&fixture.state.coven_home)
         .unwrap()
         .unwrap();
     let mut channel = connect_current(&rotated_provisioning, &rotated_pairing);
@@ -1570,7 +1671,7 @@ fn counter_runtime_advertises_four_rooms_per_endpoint_and_serves_durable_device(
         &ack,
     )
     .unwrap();
-    let runtime = start_mobile_gateway_for_daemon(&fixture.state.coven_home)
+    let runtime = start_mobile_gateway_native_for_daemon(&fixture.state.coven_home)
         .unwrap()
         .unwrap();
     assert!(runtime._direct.is_none());
@@ -1748,6 +1849,8 @@ fn restore_fence_rejects_signed_direct_https_effects_until_fresh_handover() {
 
 mod v2_authority;
 mod v2_control_loss;
+#[cfg(unix)]
+mod v2_deadline;
 
 #[test]
 fn online_connection_never_overrides_denial_or_restores_device_authority() {
@@ -1813,6 +1916,796 @@ fn online_connection_never_overrides_denial_or_restores_device_authority() {
     }
 }
 
+// Fixture hang guard only: role connect and its registration barrier each allow
+// 30s, and consumption may span additional connect/authentication/exchange phases.
+// The channel event proves ordering; 240s leaves scheduler margin for those phases
+// without changing any production deadline. A worker panic drops its sole sender
+// so the parent fails immediately instead of waiting out the hang guard.
+fn wait_for_migration_fixture_event(receiver: std::sync::mpsc::Receiver<()>, phase: &str) {
+    let budget = Duration::from_secs(240);
+    let started = Instant::now();
+    receiver.recv_timeout(budget).unwrap_or_else(|error| {
+        panic!(
+            "{phase} after {:?} (fixture hang guard {budget:?}): {error}",
+            started.elapsed()
+        )
+    });
+}
+
+#[test]
+fn migration_overlapping_real_relay_channels_preserves_pending_operation_and_applies_once() {
+    use super::super::transport::{
+        self,
+        connection::{ConnectionState, Transport},
+        migration::Migration,
+        test_support::Relay,
+        websocket,
+    };
+    use std::sync::mpsc;
+    let fixture = Fixture::with_authorization();
+    let before = fixture
+        .state
+        .registry
+        .authorization_record(fixture.pairing.device_id)
+        .unwrap()
+        .unwrap();
+    let identity =
+        super::super::identity::load_existing_host_identity(&fixture.state.coven_home).unwrap();
+    let host = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    let material = storage::load_existing(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        host.verifying_key(),
+        fixture.pairing.device_id,
+    )
+    .unwrap()
+    .unwrap();
+    let provisioning = material.provisioning(&host).unwrap();
+    let slot = u64::try_from(Utc::now().timestamp()).unwrap() / storage::SLOT_SECONDS;
+    let (room, credential) = provisioning.rendezvous(slot, false).unwrap();
+    let relays = [Relay::start(), Relay::start()];
+    let migration = Migration::new(
+        fixture.pairing.clone(),
+        provisioning.binding_signature.clone(),
+        fixture.device.clone(),
+    )
+    .unwrap();
+    let pending = migration
+        .prepare("POST", "/api/v1/mobile/assurance/challenge", &[])
+        .unwrap();
+    let operation_id = pending.id();
+    let request_hashes = Arc::new(Mutex::new(Vec::new()));
+    std::thread::scope(|scope| {
+        let (applied_tx, applied_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (consumed_tx, consumed_rx) = mpsc::channel();
+        let first_relay = &relays[0];
+        let state = &fixture.state;
+        let pairing = &fixture.pairing;
+        let host_ref = &host;
+        let material_ref = &material;
+        let credential_ref = &credential;
+        let hashes = Arc::clone(&request_hashes);
+        let (old_ready_tx, old_ready_rx) = mpsc::channel();
+        let old_host = scope.spawn(move || {
+            let records = first_relay
+                .connect(websocket::Role::Host, &room, credential_ref)
+                .unwrap();
+            old_ready_tx.send(()).unwrap();
+            let mut channel = transport::accept(
+                records,
+                pairing,
+                &material_ref.noise_private,
+                host_ref,
+                &room,
+                false,
+                |pairing, direct| {
+                    transport::authority::check_current(
+                        &state.registry,
+                        pairing,
+                        direct,
+                        Utc::now(),
+                    )
+                },
+            )
+            .unwrap();
+            let encoded = channel
+                .receive_message(
+                    MAX_MOBILE_REQUEST_BYTES + 16 * 1024,
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .unwrap();
+            hashes
+                .lock()
+                .unwrap()
+                .push(Sha256::digest(&*encoded).to_vec());
+            let (response, _) = handle_transport_message(state, pairing, false, &encoded).unwrap();
+            assert_eq!(response.status, 200);
+            applied_tx.send(()).unwrap();
+            // Explicit post-effect fault: the old request has executed, but its
+            // response is lost while a freshly authenticated channel takes over.
+            // Test-only hang guard: registration, connect and authentication
+            // each permit 30s, and two exchanges permit 15s each. Leave ample
+            // scheduler margin beyond those roughly 120s of valid phases.
+            let budget = Duration::from_secs(240);
+            let started = Instant::now();
+            release_rx.recv_timeout(budget).unwrap_or_else(|error| {
+                panic!(
+                    "handoff never released old response fault after {:?} (budget {budget:?}): {error}",
+                    started.elapsed()
+                )
+            });
+            channel.close();
+        });
+        let candidate = migration.begin(Transport::Relay).unwrap();
+        wait_for_migration_fixture_event(old_ready_rx, "old relay host registration");
+        let records = relays[0]
+            .connect(websocket::Role::Client, &room, &credential)
+            .unwrap();
+        migration
+            .commit(candidate.authenticate(records, &room).unwrap())
+            .unwrap();
+        let old_request = scope.spawn(|| migration.exchange(&pending));
+        applied_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("old operation never reached its side effect");
+
+        let next_relay = &relays[1];
+        let hashes = Arc::clone(&request_hashes);
+        let (next_ready_tx, next_ready_rx) = mpsc::channel();
+        let next_host = scope.spawn(move || {
+            let records = next_relay
+                .connect(websocket::Role::Host, &room, credential_ref)
+                .unwrap();
+            next_ready_tx.send(()).unwrap();
+            let mut channel = transport::accept(
+                records,
+                pairing,
+                &material_ref.noise_private,
+                host_ref,
+                &room,
+                false,
+                |pairing, direct| {
+                    transport::authority::check_current(
+                        &state.registry,
+                        pairing,
+                        direct,
+                        Utc::now(),
+                    )
+                },
+            )
+            .unwrap();
+            for index in 0..3 {
+                let encoded = channel
+                    .receive_message(
+                        MAX_MOBILE_REQUEST_BYTES + 16 * 1024,
+                        Instant::now() + Duration::from_secs(30),
+                    )
+                    .unwrap();
+                if index == 0 {
+                    hashes
+                        .lock()
+                        .unwrap()
+                        .push(Sha256::digest(&*encoded).to_vec());
+                }
+                let (response, _) =
+                    handle_transport_message(state, pairing, false, &encoded).unwrap();
+                channel
+                    .send_message(
+                        &response.to_http(),
+                        MAX_MOBILE_RESPONSE_BYTES + 16 * 1024,
+                        Instant::now() + Duration::from_secs(30),
+                    )
+                    .unwrap();
+            }
+            // A successful send only queues the relay record. Keep the new host
+            // alive until the client consumes the final response: relay peer
+            // disconnect may correctly take priority over queued application data.
+            consumed_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("client never consumed the final handoff response");
+        });
+        let candidate = migration.begin(Transport::Relay).unwrap();
+        wait_for_migration_fixture_event(next_ready_rx, "next relay host registration");
+        let records = relays[1]
+            .connect(websocket::Role::Client, &room, &credential)
+            .unwrap();
+        migration
+            .commit(candidate.authenticate(records, &room).unwrap())
+            .unwrap();
+        let replay = migration.exchange(&pending).unwrap();
+        assert_eq!(replay.operation_id, operation_id);
+        assert!(replay.bytes.starts_with(b"HTTP/1.1 409"));
+        assert!(std::str::from_utf8(&replay.bytes)
+            .unwrap()
+            .contains("request_replayed"));
+        let control = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&control)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+        release_tx.send(()).unwrap();
+        assert!(old_request.join().unwrap().is_err());
+        assert_eq!(
+            migration.status().unwrap().unwrap().state,
+            ConnectionState::Online
+        );
+        let control = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&control)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+        consumed_tx.send(()).unwrap();
+        old_host.join().unwrap();
+        next_host.join().unwrap();
+    });
+    let hashes = request_hashes.lock().unwrap();
+    assert_eq!(hashes.len(), 2);
+    assert_eq!(
+        hashes[0], hashes[1],
+        "handoff changed the pending signed request"
+    );
+    let challenges: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            fixture
+                .state
+                .coven_home
+                .join("mobile")
+                .join(super::super::assurance::ASSURANCE_CHALLENGES_FILE),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        challenges["challenges"].as_array().unwrap().len(),
+        1,
+        "overlapping replay repeated the side effect"
+    );
+    assert_eq!(
+        before,
+        fixture
+            .state
+            .registry
+            .authorization_record(fixture.pairing.device_id)
+            .unwrap()
+            .unwrap()
+    );
+    assert_eq!(pending.id(), operation_id);
+}
+
+struct FirstFlight<R> {
+    inner: R,
+    first: Arc<Mutex<Option<Vec<u8>>>>,
+}
+impl<R: super::super::transport::Records> super::super::transport::Records for FirstFlight<R> {
+    fn send(&mut self, bytes: &[u8], deadline: Instant) -> Result<()> {
+        let mut first = self.first.lock().unwrap();
+        if first.is_none() {
+            *first = Some(bytes.to_vec());
+        }
+        drop(first);
+        self.inner.send(bytes, deadline)
+    }
+    fn receive(&mut self, deadline: Instant) -> Result<Vec<u8>> {
+        self.inner.receive(deadline)
+    }
+    fn receive_idle(&mut self) -> Result<Vec<u8>> {
+        self.inner.receive_idle()
+    }
+}
+
+#[test]
+fn migration_relay_direct_relay_uses_fresh_keys_and_same_pinned_authority() {
+    use super::super::transport::{
+        self,
+        cancellation::Cancellation,
+        connection::{ConnectionState, Transport},
+        migration::Migration,
+        test_support::Relay,
+        websocket,
+    };
+    use std::sync::mpsc;
+    // The registry admits 128 devices. A direct candidate must still route to
+    // a provisioned pairing after 32 earlier active, unprovisioned records.
+    let fixture = Fixture::configured_after(tempfile::tempdir().unwrap(), false, 32);
+    assert_eq!(
+        fixture.state.registry.list_status().unwrap()[32].id,
+        fixture.pairing.device_id
+    );
+    let before = fixture
+        .state
+        .registry
+        .authorization_record(fixture.pairing.device_id)
+        .unwrap()
+        .unwrap();
+    let identity =
+        super::super::identity::load_existing_host_identity(&fixture.state.coven_home).unwrap();
+    let host = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    let tls_config = tls_server_config(
+        identity.certificate_der.clone(),
+        identity.private_key_der.to_vec(),
+    )
+    .unwrap();
+    let material = storage::load_existing(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        host.verifying_key(),
+        fixture.pairing.device_id,
+    )
+    .unwrap()
+    .unwrap();
+    let provisioning = material.provisioning(&host).unwrap();
+    let slot = u64::try_from(Utc::now().timestamp()).unwrap() / storage::SLOT_SECONDS;
+    let (relay_room, relay_credential) = provisioning.rendezvous(slot, false).unwrap();
+    let (direct_room, direct_credential) = provisioning.rendezvous(slot, true).unwrap();
+    let relays = [Relay::start(), Relay::start()];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let direct_endpoint = websocket::EndpointConfig {
+        url: format!("wss://192.0.2.1:{}/ws", address.port()),
+        ca_certificates: vec![URL_SAFE_NO_PAD.encode(&identity.certificate_der)],
+    }
+    .parse()
+    .unwrap();
+    let flights: Vec<_> = (0..3).map(|_| Arc::new(Mutex::new(None))).collect();
+    std::thread::scope(|scope| {
+        let migration = Migration::new(
+            fixture.pairing.clone(),
+            provisioning.binding_signature.clone(),
+            fixture.device.clone(),
+        )
+        .unwrap();
+        let state = &fixture.state;
+        let pairing = &fixture.pairing;
+        let material_ref = &material;
+        let host_ref = &host;
+        let relay_credential_ref = &relay_credential;
+        let first_relay = &relays[0];
+        let (first_ready_tx, first_ready_rx) = mpsc::channel();
+        let (first_consumed_tx, first_consumed_rx) = mpsc::channel();
+        let first_host = scope.spawn(move || {
+            let records = first_relay
+                .connect(websocket::Role::Host, &relay_room, relay_credential_ref)
+                .unwrap();
+            first_ready_tx.send(()).unwrap();
+            let mut channel = transport::accept(
+                records,
+                pairing,
+                &material_ref.noise_private,
+                host_ref,
+                &relay_room,
+                false,
+                |pairing, direct| {
+                    transport::authority::check_current(
+                        &state.registry,
+                        pairing,
+                        direct,
+                        Utc::now(),
+                    )
+                },
+            )
+            .unwrap();
+            for _ in 0..2 {
+                serve_transport_with_state(state, &mut channel).unwrap();
+            }
+            // Relay disconnect takes priority over queued responses. Hold the
+            // sender through the client's last response consumption.
+            wait_for_migration_fixture_event(first_consumed_rx, "first relay response consumption");
+        });
+        let candidate = migration.begin(Transport::Relay).unwrap();
+        wait_for_migration_fixture_event(first_ready_rx, "first relay host registration");
+        let records = relays[0]
+            .connect(websocket::Role::Client, &relay_room, &relay_credential)
+            .unwrap();
+        migration
+            .commit(
+                candidate
+                    .authenticate(
+                        FirstFlight {
+                            inner: records,
+                            first: Arc::clone(&flights[0]),
+                        },
+                        &relay_room,
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+        let request = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&request)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+
+        let direct_host = scope.spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket.set_nonblocking(false).unwrap();
+            serve_tls_connection(socket, tls_config, state)
+        });
+        let candidate = migration.begin(Transport::Direct).unwrap();
+        let records = websocket::connect_cancellable(
+            &direct_endpoint,
+            address,
+            websocket::Role::Client,
+            &direct_room,
+            &direct_credential,
+            Instant::now() + Duration::from_secs(30),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        let candidate = candidate
+            .authenticate(
+                FirstFlight {
+                    inner: records,
+                    first: Arc::clone(&flights[1]),
+                },
+                &direct_room,
+            )
+            .unwrap();
+        assert_eq!(
+            migration.status().unwrap().unwrap().transport,
+            Transport::Relay
+        );
+        // The old relay remains useful after the direct endpoint has proved its
+        // identity, until the caller explicitly commits the handoff.
+        let request = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&request)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+        first_consumed_tx.send(()).unwrap();
+        migration.commit(candidate).unwrap();
+        assert_eq!(
+            migration.status().unwrap().unwrap().transport,
+            Transport::Direct
+        );
+        let request = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&request)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+        assert_eq!(
+            state.connections.snapshot(Transport::Direct).unwrap().state,
+            ConnectionState::Online
+        );
+
+        let last_relay = &relays[1];
+        let (last_ready_tx, last_ready_rx) = mpsc::channel();
+        let (last_consumed_tx, last_consumed_rx) = mpsc::channel();
+        let last_host = scope.spawn(move || {
+            let records = last_relay
+                .connect(websocket::Role::Host, &relay_room, relay_credential_ref)
+                .unwrap();
+            last_ready_tx.send(()).unwrap();
+            let mut channel = transport::accept(
+                records,
+                pairing,
+                &material_ref.noise_private,
+                host_ref,
+                &relay_room,
+                false,
+                |pairing, direct| {
+                    transport::authority::check_current(
+                        &state.registry,
+                        pairing,
+                        direct,
+                        Utc::now(),
+                    )
+                },
+            )
+            .unwrap();
+            serve_transport_with_state(state, &mut channel).unwrap();
+            wait_for_migration_fixture_event(last_consumed_rx, "last relay response consumption");
+        });
+        let candidate = migration.begin(Transport::Relay).unwrap();
+        wait_for_migration_fixture_event(last_ready_rx, "last relay host registration");
+        let records = relays[1]
+            .connect(websocket::Role::Client, &relay_room, &relay_credential)
+            .unwrap();
+        let candidate = candidate
+            .authenticate(
+                FirstFlight {
+                    inner: records,
+                    first: Arc::clone(&flights[2]),
+                },
+                &relay_room,
+            )
+            .unwrap();
+        let request = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&request)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+        migration.commit(candidate).unwrap();
+        let request = migration
+            .prepare("GET", "/api/v1/mobile/device", &[])
+            .unwrap();
+        assert!(migration
+            .exchange(&request)
+            .unwrap()
+            .bytes
+            .starts_with(b"HTTP/1.1 200"));
+        assert_eq!(
+            migration.status().unwrap().unwrap().transport,
+            Transport::Relay
+        );
+        last_consumed_tx.send(()).unwrap();
+        state.stop_network_connections();
+        first_host.join().unwrap();
+        let _ = direct_host.join().unwrap();
+        last_host.join().unwrap();
+        assert_eq!(
+            state.connections.snapshot(Transport::Direct).unwrap().state,
+            ConnectionState::Offline
+        );
+    });
+    let first_keys: Vec<_> = flights
+        .iter()
+        .map(|flight| flight.lock().unwrap().as_ref().unwrap()[..32].to_vec())
+        .collect();
+    assert_ne!(
+        first_keys[0], first_keys[1],
+        "direct handoff reused a Noise ephemeral key"
+    );
+    assert_ne!(
+        first_keys[1], first_keys[2],
+        "relay handoff reused a Noise ephemeral key"
+    );
+    assert_ne!(
+        first_keys[0], first_keys[2],
+        "reconnect reused a Noise ephemeral key"
+    );
+    assert_eq!(
+        before,
+        fixture
+            .state
+            .registry
+            .authorization_record(fixture.pairing.device_id)
+            .unwrap()
+            .unwrap()
+    );
+}
+
+#[test]
+fn direct_wss_rejects_invalid_routing_before_upgrade() {
+    use super::super::transport::{routing, storage::v2};
+    use rustls::{pki_types::ServerName, ClientConfig, ClientConnection, RootCertStore};
+
+    let fixture = Fixture::with_authorization();
+    let identity =
+        super::super::identity::load_existing_host_identity(&fixture.state.coven_home).unwrap();
+    let host = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    let id = fixture.pairing.device_id;
+    let handover = v2::prepare_direct(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        &host,
+        id,
+    )
+    .unwrap();
+    let device_home = tempfile::tempdir().unwrap();
+    let ack = v2::device::adopt_direct(
+        device_home.path(),
+        handover,
+        host.verifying_key(),
+        id,
+        fixture.device.verifying_key(),
+    )
+    .unwrap();
+    v2::acknowledge_direct(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        &host,
+        id,
+        &ack,
+    )
+    .unwrap();
+    let snapshot = v2::load(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        host.verifying_key(),
+        id,
+        routing::Transport::Direct,
+    )
+    .unwrap()
+    .unwrap();
+    let (room, credential) = snapshot.rendezvous(routing::Transport::Direct, 0).unwrap();
+    let room = URL_SAFE_NO_PAD.encode(room);
+    let bearer = format!("Bearer {}", URL_SAFE_NO_PAD.encode(credential.as_slice()));
+    let valid = format!("/ws?v=1&role=client&room={room}");
+    let before = fixture.state.registry.authorization_record(id).unwrap();
+    let server_tls = tls_server_config(
+        identity.certificate_der.clone(),
+        identity.private_key_der.to_vec(),
+    )
+    .unwrap();
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(
+            identity.certificate_der,
+        ))
+        .unwrap();
+    let client_tls = Arc::new(
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let try_upgrade = |method: &str, target: &str, authorization: &str| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Hang guards only. Queue both socket ends before spawning the TLS
+        // worker so early fixture failure cannot leave an accept() waiting.
+        let socket =
+            TcpStream::connect_timeout(&listener.local_addr().unwrap(), Duration::from_secs(30))
+                .unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        std::thread::scope(|scope| {
+            let worker = scope
+                .spawn(|| serve_tls_connection(server, Arc::clone(&server_tls), &fixture.state));
+            let connection = ClientConnection::new(
+                Arc::clone(&client_tls),
+                ServerName::try_from("192.0.2.1").unwrap(),
+            )
+            .unwrap();
+            let mut tls = StreamOwned::new(connection, socket);
+            let request = format!("{method} {target} HTTP/1.1\r\nHost: 192.0.2.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nAuthorization: {authorization}\r\n\r\n");
+            tls.write_all(request.as_bytes()).unwrap();
+            let mut status = [0_u8; 12];
+            let upgraded = tls.read_exact(&mut status).is_ok() && &status == b"HTTP/1.1 101";
+            // Close before joining: the positive control deliberately stops
+            // after upgrade, before it sends any Noise possession proof.
+            drop(tls);
+            (upgraded, worker.join().unwrap())
+        })
+    };
+    assert!(
+        try_upgrade("GET", &valid, &bearer).0,
+        "positive upgrade control failed"
+    );
+    let cases = [
+        (
+            "version",
+            "GET",
+            format!("/ws?v=2&role=client&room={room}"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "role",
+            "GET",
+            format!("/ws?v=1&role=host&room={room}"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "missing",
+            "GET",
+            format!("/ws?role=client&room={room}"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "duplicate",
+            "GET",
+            format!("{valid}&v=1"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "unknown",
+            "GET",
+            format!("{valid}&extra=1"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "padded room",
+            "GET",
+            format!("/ws?v=1&role=client&room={room}%3D"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "wrong room",
+            "GET",
+            format!(
+                "/ws?v=1&role=client&room={}",
+                URL_SAFE_NO_PAD.encode([255; 32])
+            ),
+            bearer.clone(),
+            "direct pairing unavailable",
+        ),
+        (
+            "wrong credential",
+            "GET",
+            valid.clone(),
+            format!("Bearer {}", URL_SAFE_NO_PAD.encode([255; 32])),
+            "direct pairing unavailable",
+        ),
+        (
+            "padded credential",
+            "GET",
+            valid.clone(),
+            format!("{bearer}="),
+            "invalid direct routing",
+        ),
+        (
+            "authorization scheme",
+            "GET",
+            valid.clone(),
+            "Basic synthetic".into(),
+            "invalid direct routing",
+        ),
+        (
+            "fragment",
+            "GET",
+            format!("{valid}#fragment"),
+            bearer.clone(),
+            "invalid direct routing",
+        ),
+        (
+            "method",
+            "POST",
+            valid.clone(),
+            bearer.clone(),
+            "invalid direct upgrade",
+        ),
+    ];
+    for (case, method, target, authorization, expected) in cases {
+        let (upgraded, result) = try_upgrade(method, &target, &authorization);
+        assert!(!upgraded, "{case} reached the WebSocket upgrade");
+        let error = result
+            .expect_err("invalid routing was accepted")
+            .to_string();
+        assert!(error.contains(expected), "{case}: {error}");
+    }
+    assert!(
+        try_upgrade("GET", &valid, &bearer).0,
+        "rejections damaged positive upgrade control"
+    );
+    assert_eq!(
+        before,
+        fixture.state.registry.authorization_record(id).unwrap()
+    );
+    let after = v2::load(
+        &fixture.state.coven_home,
+        &fixture.state.registry,
+        host.verifying_key(),
+        id,
+        routing::Transport::Direct,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        snapshot.floors, after.floors,
+        "upgrade spent a routing counter before endpoint proof"
+    );
+}
+
 #[test]
 fn connection_observation_query_refuses_ambiguous_or_private_fields() {
     let _guard = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
@@ -1822,13 +2715,13 @@ fn connection_observation_query_refuses_ambiguous_or_private_fields() {
         "{\"transport\":\"direct\",\"room\":\"private\"}",
         "[]",
     ] {
-        let response = handle_local_control("POST", LOCAL_CONNECTION_PATH, Some(body))
+        let response = handle_local_control_native("POST", LOCAL_CONNECTION_PATH, Some(body))
             .unwrap()
             .unwrap();
         assert_eq!(response.status, 400);
         assert!(!response.body.contains("private"));
     }
-    let response = handle_local_control(
+    let response = handle_local_control_native(
         "POST",
         LOCAL_CONNECTION_PATH,
         Some("{\"transport\":\"direct\"}"),
@@ -1839,3 +2732,1113 @@ fn connection_observation_query_refuses_ambiguous_or_private_fields() {
     assert_eq!(response["transport"], "direct");
     assert_eq!(response.as_object().unwrap().len(), 2);
 }
+
+mod v2_migration;
+
+mod v2_journeys;
+
+/// Initial store loading has no runtime handle to drop yet. Bound admission
+/// while the competing store lock remains held, and retain exact authority.
+#[test]
+fn relay_startup_bounds_initial_store_contention_without_mutating_authority() {
+    use fs2::FileExt;
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    let mut failures = Vec::new();
+    for lock_name in [
+        ".devices.lock",
+        ".authorization-keys.lock",
+        ".assurance-challenges.lock",
+    ] {
+        let fixture = Fixture::new();
+        let relay = super::super::transport::test_support::Relay::start();
+        let home = fixture.state.coven_home.clone();
+        storage::RelayConfig {
+            listener_limit: storage::MAX_LISTENERS,
+            version: 1,
+            enabled: true,
+            endpoints: vec![relay.configuration()],
+        }
+        .save(&home)
+        .unwrap();
+        let files = [
+            "devices.json",
+            "authorization-keys.json",
+            "assurance-challenges.json",
+        ];
+        let before: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+            .collect();
+        let lock_path = home.join("mobile").join(lock_name);
+        let held = crate::state_lock::open_lock_file(&lock_path).unwrap();
+        held.lock_exclusive().unwrap();
+        let (_observation, waiting) = super::super::store_lock::observe(&lock_path);
+        let (finished, result) = std::sync::mpsc::sync_channel(1);
+        let worker_home = home.clone();
+        let worker = std::thread::spawn(move || {
+            // Do not send a live runtime to another thread: cleanup remains
+            // owned by this producer even if the old implementation succeeds.
+            let outcome = start_mobile_gateway_native_for_daemon(&worker_home).map(drop);
+            let _ = finished.send(outcome);
+        });
+        // A 30-second hang guard permits loaded scheduling. The actual failed
+        // file-lock attempt, rather than a sleep, selects the contended path.
+        let observed = waiting.recv_timeout(Duration::from_secs(30));
+        let started = Instant::now();
+        let bounded = if observed.is_ok() {
+            result.recv_timeout(Duration::from_secs(2))
+        } else {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        };
+        let elapsed = started.elapsed();
+        // Cleanup precedes assertions so a red regression never leaves a
+        // blocked producer or competing store lock behind.
+        FileExt::unlock(&held).unwrap();
+        worker.join().unwrap();
+        assert!(
+            observed.is_ok(),
+            "no failed acquisition observed for {lock_name}: {observed:?}"
+        );
+        match bounded {
+            Ok(Err(error)) => assert!(
+                error.to_string().contains("deadline"),
+                "startup failed for an unrelated reason at {lock_name}: {error:#}"
+            ),
+            other => failures.push(format!(
+                "{lock_name}: admission was not bounded while held ({elapsed:?}): {other:?}"
+            )),
+        }
+        let after: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+            .collect();
+        assert_eq!(after, before, "startup changed authority at {lock_name}");
+        assert!(
+            DeviceRegistry::load(&home).is_ok(),
+            "startup failure poisoned future registry at {lock_name}"
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+/// A real encrypted relay request can hold the runtime in an authority-store
+/// wait after socket cancellation. Keep each competing file lock held until
+/// either shutdown completes or the strict contract has failed.
+#[test]
+fn relay_shutdown_cancels_contended_authority_stores_without_mutating_bytes() {
+    use super::super::transport::{self, test_support::Relay, websocket};
+    use fs2::FileExt;
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    let mut failures = Vec::new();
+    for lock_name in [
+        ".authorization-keys.lock",
+        ".assurance-challenges.lock",
+        ".audit.lock",
+    ] {
+        let fixture = Fixture::with_authorization();
+        let home = fixture.state.coven_home.clone();
+        let relay = Relay::start();
+        storage::RelayConfig {
+            listener_limit: storage::MAX_LISTENERS,
+            version: 1,
+            enabled: true,
+            endpoints: vec![relay.configuration()],
+        }
+        .save(&home)
+        .unwrap();
+        let identity = super::super::identity::load_existing_host_identity(&home).unwrap();
+        let signer = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+        let provisioning = storage::load_existing(
+            &home,
+            &fixture.state.registry,
+            signer.verifying_key(),
+            fixture.pairing.device_id,
+        )
+        .unwrap()
+        .unwrap()
+        .provisioning(&signer)
+        .unwrap();
+        let runtime = start_mobile_gateway_native_for_daemon(&home)
+            .unwrap()
+            .unwrap();
+        // This is only a room-arrival hang guard, independent of stop's strict budget.
+        let connect_deadline = Instant::now() + Duration::from_secs(60);
+        let mut channel = loop {
+            let slot = u64::try_from(Utc::now().timestamp()).unwrap() / storage::SLOT_SECONDS;
+            let (room, credential) = provisioning.rendezvous(slot, false).unwrap();
+            let attempt = relay
+                .connect(websocket::Role::Client, &room, &credential)
+                .and_then(|records| {
+                    transport::connect(
+                        records,
+                        &fixture.pairing,
+                        &provisioning.binding_signature,
+                        &fixture.device,
+                        &room,
+                        false,
+                    )
+                });
+            match attempt {
+                Ok(channel) => break channel,
+                Err(error) => {
+                    assert!(
+                        Instant::now() < connect_deadline,
+                        "relay arrival failed: {error:#}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        let files = [
+            "devices.json",
+            "authorization-keys.json",
+            "assurance-challenges.json",
+            "audit.jsonl",
+        ];
+        let before: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+            .collect();
+        let path = home.join("mobile").join(lock_name);
+        let held = crate::state_lock::open_lock_file(&path).unwrap();
+        held.lock_exclusive().unwrap();
+        let (_observation, waiting) = super::super::store_lock::observe(&path);
+        let mut wire = fixture.request(
+            "POST",
+            "/api/v1/mobile/assurance/challenge",
+            fixture.pairing.device_id,
+        );
+        if lock_name == ".audit.lock" {
+            // Preserve valid syntax and identity while invalidating the signature.
+            let text = String::from_utf8(wire).unwrap();
+            wire = text
+                .replace(
+                    "POST /api/v1/mobile/assurance/challenge",
+                    "GET /api/v1/mobile/device",
+                )
+                .into_bytes();
+        }
+        channel
+            .send_message(
+                &wire,
+                MAX_MOBILE_REQUEST_BYTES,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        let observed = waiting.recv_timeout(Duration::from_secs(30));
+        let (finished, stopped) = std::sync::mpsc::sync_channel(1);
+        let started = Instant::now();
+        let stopper = std::thread::spawn(move || {
+            drop(runtime);
+            let _ = finished.send(());
+        });
+        let bounded = stopped.recv_timeout(Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        FileExt::unlock(&held).unwrap();
+        stopper.join().unwrap();
+        assert!(
+            observed.is_ok(),
+            "no actual file-lock wait for {lock_name}: {observed:?}"
+        );
+        if bounded.is_err() {
+            failures.push(format!(
+                "{lock_name}: stop exceeded contract ({elapsed:?}): {bounded:?}"
+            ));
+        }
+        let after: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+            .collect();
+        if after != before {
+            failures.push(format!("{lock_name}: cancelled wait changed durable bytes"));
+        }
+        assert!(
+            DeviceRegistry::load(&home).is_ok(),
+            "shutdown poisoned fresh registry for {lock_name}"
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+/// A later contended startup store must not turn a failed admission into a
+/// durable registry migration. The original registry bytes are the oracle.
+#[test]
+fn relay_startup_contention_preserves_legacy_registry_until_all_stores_admit() {
+    use fs2::FileExt;
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    let mut failures = Vec::new();
+    for lock_name in [".authorization-keys.lock", ".assurance-challenges.lock"] {
+        let fixture = Fixture::new();
+        let home = fixture.state.coven_home.clone();
+        let relay = super::super::transport::test_support::Relay::start();
+        storage::RelayConfig {
+            listener_limit: storage::MAX_LISTENERS,
+            version: 1,
+            enabled: true,
+            endpoints: vec![relay.configuration()],
+        }
+        .save(&home)
+        .unwrap();
+        let record = fixture
+            .state
+            .registry
+            .device(fixture.pairing.device_id)
+            .unwrap()
+            .unwrap();
+        let legacy = serde_json::json!({
+            "version": 1,
+            "devices": [{
+                "id": record.id,
+                "displayName": record.display_name,
+                "publicKeyX963": record.public_key_x963,
+                "pairedAt": record.paired_at,
+                "revokedAt": null,
+                "scopes": ["memory_read"]
+            }]
+        });
+        let registry_path = home.join("mobile/devices.json");
+        super::super::config::atomic_replace_private(
+            &registry_path,
+            &serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(&registry_path).unwrap();
+        let path = home.join("mobile").join(lock_name);
+        let held = crate::state_lock::open_lock_file(&path).unwrap();
+        held.lock_exclusive().unwrap();
+        let (_observation, waiting) = super::super::store_lock::observe(&path);
+        let worker_home = home.clone();
+        let (finished, result) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let outcome = start_mobile_gateway_native_for_daemon(&worker_home).map(drop);
+            let _ = finished.send(outcome);
+        });
+        let observed = waiting.recv_timeout(Duration::from_secs(30));
+        let started = Instant::now();
+        let outcome = result.recv_timeout(Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        FileExt::unlock(&held).unwrap();
+        worker.join().unwrap();
+        assert!(
+            observed.is_ok(),
+            "no failed lock attempt at {lock_name}: {observed:?}"
+        );
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "startup was not refused while {lock_name} stayed held after {elapsed:?}: {outcome:?}"
+        );
+        if std::fs::read(&registry_path).unwrap() != before {
+            failures.push(format!(
+                "{lock_name}: failed startup migrated durable registry bytes"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+#[test]
+fn runtime_scope_cancels_policy_passkey_and_legacy_provisioning_waits() {
+    use super::super::{
+        owner_policy::OwnerPolicyStore, passkey::PasskeyStore, store_lock::Runtime,
+    };
+    use fs2::FileExt;
+    for lock_name in [
+        ".introduction-policy.lock",
+        ".passkeys.lock",
+        ".transport.lock",
+    ] {
+        let fixture = Fixture::with_authorization();
+        let home = fixture.state.coven_home.clone();
+        let identity = super::super::identity::load_existing_host_identity(&home).unwrap();
+        let signer = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+        let audience = identity.public_key_fingerprint;
+        let device_id = fixture.pairing.device_id;
+        let files = [
+            "devices.json",
+            "authorization-keys.json",
+            "assurance-challenges.json",
+            "introduction-policy.json",
+            "passkeys.json",
+            "audit.jsonl",
+        ];
+        let before: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+            .collect();
+        let path = home.join("mobile").join(lock_name);
+        let held = crate::state_lock::open_lock_file(&path).unwrap();
+        held.lock_exclusive().unwrap();
+        let (_observation, waiting) = super::super::store_lock::observe(&path);
+        let runtime = Runtime::default();
+        let worker_runtime = runtime.clone();
+        let worker_home = home.clone();
+        let state = fixture.state;
+        let (finished, stopped) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _scope = worker_runtime.enter();
+            let result = match lock_name {
+                ".introduction-policy.lock" => OwnerPolicyStore::open(&worker_home, audience)
+                    .and_then(|store| store.with_current_locked(|_| Ok(()))),
+                ".passkeys.lock" => PasskeyStore::open(&worker_home, audience)
+                    .and_then(|store| store.list().map(drop)),
+                ".transport.lock" => {
+                    storage::load_or_provision(&worker_home, &state.registry, &signer, device_id)
+                        .map(drop)
+                }
+                _ => unreachable!(),
+            };
+            let _ = finished.send(result.map_err(|error| format!("{error:#}")));
+        });
+        let observed = waiting.recv_timeout(Duration::from_secs(30));
+        let started = Instant::now();
+        runtime.cancel();
+        let result = stopped.recv_timeout(Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        FileExt::unlock(&held).unwrap();
+        worker.join().unwrap();
+        assert!(
+            observed.is_ok(),
+            "no failed file-lock attempt at {lock_name}: {observed:?}"
+        );
+        let error = result
+            .unwrap_or_else(|error| {
+                panic!("{lock_name} wait exceeded shutdown budget after {elapsed:?}: {error:?}")
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("cancelled"),
+            "wrong refusal at {lock_name}: {error}"
+        );
+        let after: Vec<_> = files
+            .iter()
+            .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+            .collect();
+        assert_eq!(
+            after, before,
+            "cancelled store wait changed bytes for {lock_name}"
+        );
+        assert!(
+            DeviceRegistry::load(&home).is_ok(),
+            "scope poisoned future registry at {lock_name}"
+        );
+    }
+}
+
+/// A held storage phase is a synthetic in-flight-I/O model, not a real disk
+/// stall. It distinguishes cancelled admission from already admitted work.
+#[test]
+fn relay_shutdown_contains_an_inflight_challenge_write_before_sync() {
+    use super::super::transport::{self, test_support::Relay, websocket};
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    let fixture = Fixture::with_authorization();
+    let _retained = process::RetainedOwnerGuard;
+    let home = fixture.state.coven_home.clone();
+    let relay = Relay::start();
+    storage::RelayConfig {
+        listener_limit: storage::MAX_LISTENERS,
+        version: 1,
+        enabled: true,
+        endpoints: vec![relay.configuration()],
+    }
+    .save(&home)
+    .unwrap();
+    let identity = super::super::identity::load_existing_host_identity(&home).unwrap();
+    let signer = SigningKey::from_pkcs8_der(&identity.private_key_der).unwrap();
+    let provisioning = storage::load_existing(
+        &home,
+        &fixture.state.registry,
+        signer.verifying_key(),
+        fixture.pairing.device_id,
+    )
+    .unwrap()
+    .unwrap()
+    .provisioning(&signer)
+    .unwrap();
+    let target = home.join("mobile/assurance-challenges.json");
+    let ready = home.join("held-write-ready");
+    let mut runtime = process::native_fixture::start_fixture(&home, Some(&target), None, &ready)
+        .unwrap()
+        .unwrap();
+    let observation = runtime.observation();
+    // This is only a room-arrival hang guard, independent of stop's strict budget.
+    let connect_deadline = Instant::now() + Duration::from_secs(60);
+    let connect = || loop {
+        let slot = u64::try_from(Utc::now().timestamp()).unwrap() / storage::SLOT_SECONDS;
+        let (room, credential) = provisioning.rendezvous(slot, false).unwrap();
+        let attempt = relay
+            .connect(websocket::Role::Client, &room, &credential)
+            .and_then(|records| {
+                transport::connect(
+                    records,
+                    &fixture.pairing,
+                    &provisioning.binding_signature,
+                    &fixture.device,
+                    &room,
+                    false,
+                )
+            });
+        match attempt {
+            Ok(channel) => break channel,
+            Err(error) => {
+                assert!(
+                    Instant::now() < connect_deadline,
+                    "relay arrival failed: {error:#}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    let mut channel = connect();
+    let before = std::fs::read(&target).ok();
+    let wire = fixture.request(
+        "POST",
+        "/api/v1/mobile/assurance/challenge",
+        fixture.pairing.device_id,
+    );
+    channel
+        .send_message(
+            &wire,
+            MAX_MOBILE_REQUEST_BYTES,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+    // The bridge only publishes after the CHILD enters the real pre-sync
+    // checkpoint. Keep that child hold installed through forced termination.
+    let phase_deadline = Instant::now() + Duration::from_secs(30);
+    while !ready.exists() {
+        assert!(!observation.exited(), "worker exited before the held write");
+        assert!(
+            Instant::now() < phase_deadline,
+            "request never reached held child write"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(std::fs::read(&ready).unwrap(), b"held-written\n");
+    let started = Instant::now();
+    let result = runtime.shutdown_until(started + Duration::from_millis(1800));
+    let elapsed = started.elapsed();
+    assert!(
+        result.is_ok() && elapsed < Duration::from_secs(2),
+        "in-flight write outlived the daemon stop contract ({elapsed:?}): {result:?}"
+    );
+    assert!(
+        observation.exited() && observation.reaped(),
+        "worker exit/reap unobserved"
+    );
+    drop(runtime);
+    drop(channel);
+    assert_eq!(
+        std::fs::read(&target).ok(),
+        before,
+        "a worker continued an uncommitted write after observed shutdown"
+    );
+
+    // Restart on the SAME profile. The interrupted staging file must never
+    // become authority; a newly acknowledged challenge must survive shutdown.
+    let mut restarted =
+        process::native_fixture::start_fixture(&home, None, None, &home.join("restart-ready"))
+            .unwrap()
+            .unwrap();
+    let mut channel = connect();
+    let request = fixture.request(
+        "POST",
+        "/api/v1/mobile/assurance/challenge",
+        fixture.pairing.device_id,
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    channel
+        .send_message(&request, MAX_MOBILE_REQUEST_BYTES, deadline)
+        .unwrap();
+    let response = channel
+        .receive_message(MAX_MOBILE_RESPONSE_BYTES, deadline)
+        .unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "restart request failed: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let acknowledged = std::fs::read(&target).unwrap();
+    assert_ne!(Some(acknowledged.clone()), before);
+    restarted.shutdown().unwrap();
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        acknowledged,
+        "acknowledged write changed after shutdown"
+    );
+    assert!(
+        AssuranceChallengeStore::load(&home).is_ok(),
+        "restart left unreadable authority"
+    );
+}
+
+#[test]
+fn oversized_owner_control_header_does_not_terminate_mobile_authority() {
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    let fixture = Fixture::with_authorization();
+    let _retained = process::RetainedOwnerGuard;
+    let home = &fixture.state.coven_home;
+    let relay = super::super::transport::test_support::Relay::start();
+    storage::RelayConfig {
+        listener_limit: storage::MAX_LISTENERS,
+        version: 1,
+        enabled: true,
+        endpoints: vec![relay.configuration()],
+    }
+    .save(home)
+    .unwrap();
+    let mut runtime =
+        process::native_fixture::start_fixture(home, None, None, &home.join("header-ready"))
+            .unwrap()
+            .unwrap();
+    let observation = runtime.observation();
+    let oversized = super::handle_local_control(
+        "GET",
+        &format!("{LOCAL_CONTROL_ROOT}/{}", "x".repeat(17 * 1024)),
+        None,
+    )
+    .unwrap();
+    let subsequent = super::handle_local_control("POST", LOCAL_CONNECTION_PATH, Some("{}"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        subsequent.status, 200,
+        "oversized header disabled authority: {}",
+        subsequent.body
+    );
+    assert!(
+        !observation.exited(),
+        "worker exited after rejecting oversized header"
+    );
+    assert!(
+        oversized.is_err() || oversized.is_ok_and(|response| (400..500).contains(&response.status)),
+        "oversized caller input was not rejected locally"
+    );
+    runtime.shutdown().unwrap();
+    assert_eq!(
+        observation.exit_code(),
+        Some(0),
+        "normal worker stop escalated to a forced exit"
+    );
+}
+
+#[test]
+fn process_startup_store_waits_exit_without_changing_authority() {
+    use fs2::FileExt;
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    for lock_name in [
+        ".devices.lock",
+        ".authorization-keys.lock",
+        ".assurance-challenges.lock",
+    ] {
+        let fixture = Fixture::with_authorization();
+        let _retained = process::RetainedOwnerGuard;
+        let home = fixture.state.coven_home.clone();
+        let relay = super::super::transport::test_support::Relay::start();
+        storage::RelayConfig {
+            listener_limit: storage::MAX_LISTENERS,
+            version: 1,
+            enabled: true,
+            endpoints: vec![relay.configuration()],
+        }
+        .save(&home)
+        .unwrap();
+        let files = [
+            "devices.json",
+            "authorization-keys.json",
+            "assurance-challenges.json",
+        ];
+        let snapshot = || {
+            files
+                .iter()
+                .map(|name| std::fs::read(home.join("mobile").join(name)).ok())
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        let lock_path = home.join("mobile").join(lock_name);
+        let held = crate::state_lock::open_lock_file(&lock_path).unwrap();
+        held.lock_exclusive().unwrap();
+        let ready = home.join("startup-lock-ready");
+        let (send_observation, receive_observation) = std::sync::mpsc::sync_channel(1);
+        let (send_result, receive_result) = std::sync::mpsc::sync_channel(1);
+        let child_home = home.clone();
+        let child_ready = ready.clone();
+        let start = Instant::now();
+        let starter = std::thread::spawn(move || {
+            let outcome = process::native_fixture::start_fixture_observing(
+                &child_home,
+                None,
+                Some(&lock_path),
+                &child_ready,
+                |handle| {
+                    send_observation.send(handle.observation()).unwrap();
+                },
+            )
+            .map(drop);
+            let _ = send_result.send(outcome);
+        });
+        let observation = receive_observation
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
+        let hang_guard = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() && !observation.exited() && Instant::now() < hang_guard {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Always join; keep the competing lock held THROUGH exit observation.
+        let outcome = receive_result.recv_timeout(Duration::from_secs(30));
+        starter.join().unwrap();
+        assert_eq!(
+            std::fs::read(&ready).unwrap(),
+            b"failed-file-lock\n",
+            "{lock_name}"
+        );
+        assert!(
+            outcome.unwrap().is_err(),
+            "startup unexpectedly admitted {lock_name}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "startup contention exceeded bound for {lock_name}: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            observation.exited() && observation.reaped(),
+            "startup child not reaped for {lock_name}"
+        );
+        assert_eq!(
+            snapshot(),
+            before,
+            "failed startup changed authority for {lock_name}"
+        );
+        FileExt::unlock(&held).unwrap();
+        let mut restarted = process::native_fixture::start_fixture(
+            &home,
+            None,
+            None,
+            &home.join("fresh-start-ready"),
+        )
+        .unwrap()
+        .unwrap();
+        restarted.shutdown().unwrap();
+        assert_eq!(
+            snapshot(),
+            before,
+            "fresh restart changed authority for {lock_name}"
+        );
+    }
+}
+
+#[test]
+fn native_shutdown_recovers_initial_enrollment_between_key_and_device_commit() {
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    let fixture = Fixture::with_authorization();
+    let _retained = process::RetainedOwnerGuard;
+    let home = &fixture.state.coven_home;
+    let relay = super::super::transport::test_support::Relay::start();
+    storage::RelayConfig {
+        listener_limit: storage::MAX_LISTENERS,
+        version: 1,
+        enabled: true,
+        endpoints: vec![relay.configuration()],
+    }
+    .save(home)
+    .unwrap();
+    let devices = home.join("mobile/devices.json");
+    let keys = home.join("mobile/authorization-keys.json");
+    let before_devices = std::fs::read(&devices).unwrap();
+    let before_keys = std::fs::read(&keys).unwrap();
+    let ready = home.join("registration-held-ready");
+    let prepared = home.join("registration-pending.json");
+    let mut runtime =
+        process::native_fixture::start_enrollment_fixture(home, &devices, &ready, &prepared)
+            .unwrap()
+            .unwrap();
+    let observation = runtime.observation();
+    let setup_deadline = Instant::now() + Duration::from_secs(30);
+    while !prepared.exists() {
+        assert!(!observation.exited(), "worker exited before pairing setup");
+        assert!(
+            Instant::now() < setup_deadline,
+            "native pairing setup never completed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let pending: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&prepared).unwrap()).unwrap();
+    let path = format!(
+        "{LOCAL_CONTROL_ROOT}/{}/confirm",
+        pending["id"].as_str().unwrap()
+    );
+    let body = serde_json::json!({ "phrase": pending["phrase"] }).to_string();
+    let confirmation = std::thread::spawn(move || {
+        super::handle_local_control("POST", &path, Some(&body)).unwrap()
+    });
+    let cut_deadline = Instant::now() + Duration::from_secs(30);
+    while !ready.exists() {
+        assert!(
+            !observation.exited(),
+            "worker exited before the registry write cut"
+        );
+        assert!(
+            Instant::now() < cut_deadline,
+            "registry write cut was not entered"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(std::fs::read(&ready).unwrap(), b"held-written\n");
+    assert_eq!(
+        std::fs::read(&devices).unwrap(),
+        before_devices,
+        "cut was after registry publication"
+    );
+    assert_ne!(
+        std::fs::read(&keys).unwrap(),
+        before_keys,
+        "cut did not follow durable key insertion"
+    );
+    let started = Instant::now();
+    let stopped = runtime.shutdown_until(started + Duration::from_millis(1800));
+    assert!(
+        stopped.is_ok() && started.elapsed() < Duration::from_secs(2),
+        "registration stop exceeded contract after {:?}: {stopped:?}",
+        started.elapsed()
+    );
+    assert!(
+        observation.exited() && observation.reaped(),
+        "registration worker was not observed exited/reaped"
+    );
+    let response = confirmation.join().unwrap().unwrap();
+    assert_eq!(
+        response.status, 503,
+        "lost confirmation must report uncertainty"
+    );
+    drop(runtime);
+    // Restart recovery is part of this assertion. The old parent Fixture
+    // cache does not stand in for the fresh worker's durable-state load.
+    let mut restarted = process::native_fixture::start_fixture(
+        home,
+        None,
+        None,
+        &home.join("registration-restart-ready"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&devices).unwrap(),
+        before_devices,
+        "interrupted registration gained a device"
+    );
+    assert_eq!(
+        std::fs::read(&keys).unwrap(),
+        before_keys,
+        "restart left an orphaned authorization key"
+    );
+    restarted.shutdown().unwrap();
+}
+
+/// These are synthetic holds at real child write checkpoints, selected by
+/// actual owner-confirm execution. They are process-kill/restart evidence;
+/// they do not model physical media stalls or establish power-loss durability.
+#[test]
+fn native_initial_enrollment_journal_cut_matrix_recovers_exact_images() {
+    use super::super::config::MobileWritePhase;
+    use process::native_fixture::{self, EnrollmentCut};
+    let _gateway = super::tests::TEST_GATEWAY_LOCK.lock().unwrap();
+    for (
+        label,
+        target_name,
+        phase,
+        skip,
+        failed_commit,
+        committed,
+        keys_visible,
+        journal_visible,
+    ) in [
+        (
+            "keys-written",
+            "authorization-keys.json",
+            MobileWritePhase::Written,
+            0,
+            false,
+            false,
+            false,
+            true,
+        ),
+        (
+            "keys-renamed",
+            "authorization-keys.json",
+            MobileWritePhase::Renamed,
+            0,
+            false,
+            false,
+            true,
+            true,
+        ),
+        (
+            "devices-renamed",
+            "devices.json",
+            MobileWritePhase::Renamed,
+            0,
+            false,
+            true,
+            true,
+            true,
+        ),
+        (
+            "journal-written",
+            ".initial-enrollment.json",
+            MobileWritePhase::Written,
+            0,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            "journal-retired",
+            ".initial-enrollment.json",
+            MobileWritePhase::RetainedParentSynced,
+            0,
+            false,
+            true,
+            true,
+            false,
+        ),
+        // The first matching key Written belongs to enrollment. The second
+        // belongs to actual compensation after the real registry write hook
+        // fails. No authority images are fabricated by the parent test.
+        (
+            "rollback-keys-written",
+            "authorization-keys.json",
+            MobileWritePhase::Written,
+            1,
+            true,
+            false,
+            true,
+            true,
+        ),
+    ] {
+        let fixture = Fixture::with_authorization();
+        let _retained = process::RetainedOwnerGuard;
+        let home = &fixture.state.coven_home;
+        let relay = super::super::transport::test_support::Relay::start();
+        storage::RelayConfig {
+            listener_limit: storage::MAX_LISTENERS,
+            version: 1,
+            enabled: true,
+            endpoints: vec![relay.configuration()],
+        }
+        .save(home)
+        .unwrap();
+        let devices = home.join("mobile/devices.json");
+        let keys = home.join("mobile/authorization-keys.json");
+        let journal = home.join("mobile/.initial-enrollment.json");
+        let before_devices = std::fs::read(&devices).unwrap();
+        let before_keys = std::fs::read(&keys).unwrap();
+        assert!(
+            !journal.exists(),
+            "fixture already has an enrollment intent: {label}"
+        );
+        let target = home.join("mobile").join(target_name);
+        let cut = EnrollmentCut {
+            target: &target,
+            phase,
+            skip_matching: skip,
+            fail_registry_commit: failed_commit,
+        };
+        let ready = home.join(format!("{label}-held-ready"));
+        let prepared = home.join(format!("{label}-pending.json"));
+        let mut runtime =
+            native_fixture::start_enrollment_cut_fixture(home, cut, &ready, &prepared)
+                .unwrap()
+                .unwrap();
+        let observation = runtime.observation();
+        let setup_deadline = Instant::now() + Duration::from_secs(30);
+        while !prepared.exists() && !observation.exited() && Instant::now() < setup_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !prepared.exists() {
+            let stopped = runtime.shutdown();
+            panic!(
+                "{label}: native pairing setup did not publish; exited={} shutdown={stopped:?}",
+                observation.exited()
+            );
+        }
+        let pending: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&prepared).unwrap()).unwrap();
+        assert_eq!(
+            pending["registryWriteFailureInjected"], failed_commit,
+            "fixture failed to select actual registry error: {label}"
+        );
+        let path = format!(
+            "{LOCAL_CONTROL_ROOT}/{}/confirm",
+            pending["id"].as_str().unwrap()
+        );
+        let body = serde_json::json!({ "phrase": pending["phrase"] }).to_string();
+        let confirmation = std::thread::spawn(move || {
+            super::handle_local_control("POST", &path, Some(&body)).unwrap()
+        });
+        let phase_deadline = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() && !observation.exited() && Instant::now() < phase_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let observed_marker = std::fs::read(&ready).ok();
+        let held_devices = std::fs::read(&devices).ok();
+        let held_keys = std::fs::read(&keys).ok();
+        let held_journal = std::fs::read(&journal).ok();
+        // Cleanup and join precede phase/state assertions, including a red
+        // regression. The parent never releases the child's held checkpoint.
+        let started = Instant::now();
+        let stopped = runtime.shutdown_until(started + Duration::from_millis(1800));
+        let elapsed = started.elapsed();
+        let confirmation = confirmation.join().unwrap();
+        drop(runtime);
+        assert_eq!(
+            observed_marker,
+            Some(cut.marker()),
+            "{label}: no matching held child checkpoint"
+        );
+        assert!(
+            stopped.is_ok() && elapsed < Duration::from_secs(2),
+            "{label}: native cut shutdown exceeded contract after {elapsed:?}: {stopped:?}"
+        );
+        assert!(
+            observation.exited() && observation.reaped(),
+            "{label}: child exit/reap not observed"
+        );
+        assert_ne!(
+            observation.exit_code(),
+            Some(0),
+            "{label}: selected hold was released or bypassed instead of contained"
+        );
+        let response = confirmation.unwrap();
+        assert_eq!(
+            response.status, 503,
+            "{label}: unacknowledged confirmation did not report uncertainty"
+        );
+        let uncertainty: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(
+            uncertainty["error"]["code"], "daemon_unavailable",
+            "{label}"
+        );
+        assert_eq!(
+            uncertainty["error"]["details"]["outcome"], "unknown",
+            "{label}"
+        );
+        assert_eq!(
+            uncertainty["error"]["details"]["retrySafe"], false,
+            "{label}"
+        );
+        assert_eq!(
+            held_journal.is_some(),
+            journal_visible,
+            "{label}: incorrect journal cut"
+        );
+        let held_devices = held_devices.unwrap();
+        let held_keys = held_keys.unwrap();
+        if committed {
+            assert_ne!(
+                held_devices, before_devices,
+                "{label}: device never committed"
+            );
+        } else {
+            assert_eq!(
+                held_devices, before_devices,
+                "{label}: device committed before the selected cut"
+            );
+        }
+        if keys_visible {
+            assert_ne!(
+                held_keys, before_keys,
+                "{label}: enrolled keys not published at cut"
+            );
+        } else {
+            assert_eq!(
+                held_keys, before_keys,
+                "{label}: keys published before the selected cut"
+            );
+        }
+        // Capture exact expected committed bytes only after proving that this
+        // real operation added one linked device/key to the prior profile.
+        if committed {
+            let before: serde_json::Value = serde_json::from_slice(&before_devices).unwrap();
+            let after: serde_json::Value = serde_json::from_slice(&held_devices).unwrap();
+            let prior_keys: serde_json::Value = serde_json::from_slice(&before_keys).unwrap();
+            let next_keys: serde_json::Value = serde_json::from_slice(&held_keys).unwrap();
+            let prior_devices = before["devices"].as_array().unwrap();
+            let next_devices = after["devices"].as_array().unwrap();
+            let prior_keys = prior_keys["keys"].as_array().unwrap();
+            let next_keys = next_keys["keys"].as_array().unwrap();
+            assert_eq!(next_devices.len(), prior_devices.len() + 1, "{label}");
+            assert_eq!(
+                &next_devices[..prior_devices.len()],
+                prior_devices,
+                "{label}: changed an existing device"
+            );
+            assert_eq!(next_keys.len(), prior_keys.len() + 1, "{label}");
+            assert_eq!(
+                &next_keys[..prior_keys.len()],
+                prior_keys,
+                "{label}: changed an existing authorization key"
+            );
+            assert_eq!(
+                next_devices.last().unwrap()["device"]["id"],
+                next_keys.last().unwrap()["deviceId"],
+                "{label}: committed device/key identities differ"
+            );
+        }
+        let expected_devices = if committed {
+            held_devices
+        } else {
+            before_devices
+        };
+        let expected_keys = if committed { held_keys } else { before_keys };
+        // SAME profile, fresh real worker. The parent's old Fixture cache is
+        // never used as evidence for the recovered authority state.
+        let mut restarted = native_fixture::start_fixture(
+            home,
+            None,
+            None,
+            &home.join(format!("{label}-restart-ready")),
+        )
+        .unwrap()
+        .unwrap();
+        let status = super::handle_local_control("POST", LOCAL_CONNECTION_PATH, Some("{}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            status.status, 200,
+            "{label}: restarted control plane unavailable"
+        );
+        assert_eq!(
+            std::fs::read(&devices).unwrap(),
+            expected_devices,
+            "{label}: restart selected the wrong device image"
+        );
+        assert_eq!(
+            std::fs::read(&keys).unwrap(),
+            expected_keys,
+            "{label}: restart selected the wrong key image"
+        );
+        assert!(
+            !journal.exists(),
+            "{label}: restart left enrollment recovery pending"
+        );
+        restarted.shutdown().unwrap();
+        assert_eq!(
+            std::fs::read(&devices).unwrap(),
+            expected_devices,
+            "{label}: device image changed after recovered shutdown"
+        );
+        assert_eq!(
+            std::fs::read(&keys).unwrap(),
+            expected_keys,
+            "{label}: key image changed after recovered shutdown"
+        );
+        assert!(
+            DeviceRegistry::load(home).is_ok(),
+            "{label}: recovered registry is unreadable"
+        );
+    }
+}
+
+mod native_v2_create_process_tests;

@@ -32,6 +32,33 @@ fn test_tempdir() -> Result<tempfile::TempDir> {
     Ok(tempfile::Builder::new().prefix("setup-").tempdir_in(root)?)
 }
 
+/// Writes a fixture script that the test later executes.
+///
+/// Other tests in this binary spawn processes concurrently. A child forked
+/// while `fs::write` still held the script open for writing keeps a copy of
+/// that descriptor until its own exec, and executing the script in that window
+/// fails with ETXTBSY (coven#1730). Writing through a short-lived shell leaves
+/// this process with no writable descriptor for the script, so no concurrent
+/// fork can copy one. Callers still set the mode the case needs.
+#[cfg(unix)]
+fn write_script(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let status = Command::new("/bin/sh")
+        .args(["-c", "printf '%s' \"$2\" > \"$1\"", "write-script"])
+        .arg(path)
+        .arg(std::ffi::OsStr::from_bytes(contents.as_ref()))
+        .stdin(Stdio::null())
+        .status()
+        .with_context(|| format!("spawning the writer for {}", path.display()))?;
+    anyhow::ensure!(
+        status.success(),
+        "writing fixture script {} failed: {status}",
+        path.display()
+    );
+    Ok(())
+}
+
 fn descriptor(id: ProviderId) -> ProviderDescriptor {
     ProviderDescriptor::new(
         id,
@@ -1239,7 +1266,7 @@ fn copilot_fixture_inherits_terminal_streams_and_records_exact_login() -> Result
     let args_path = temp.path().join("args.txt");
     let stdout_path = temp.path().join("terminal.stdout");
     let stderr_path = temp.path().join("terminal.stderr");
-    fs::write(
+    write_script(
         &fake_copilot,
         concat!(
             "#!/bin/sh\n",
@@ -1559,7 +1586,7 @@ fn verify_ephemeral_state_reaches_provider_then_is_removed() -> Result<()> {
     let report_path = temp.path().join("verification-report.json");
     let stdout_path = temp.path().join("verification.stdout");
     let stderr_path = temp.path().join("verification.stderr");
-    fs::write(
+    write_script(
         &fake_codex,
         concat!(
             "#!/bin/sh\n",
@@ -1672,7 +1699,7 @@ fn version_probe_reaps_detached_provider_descendants() -> Result<()> {
     let fake_codex = temp.path().join("codex");
     let pid_path = temp.path().join("version-descendant.pid");
     let report_path = temp.path().join("report.json");
-    fs::write(
+    write_script(
         &fake_codex,
         concat!(
             "#!/usr/bin/env python3\n",
@@ -1724,6 +1751,91 @@ fn version_probe_reaps_detached_provider_descendants() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
+fn canonical_provider_launchers_produce_reports_with_trusted_provider_versions() -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    for (provider, canonical_name, banner, expected_version) in [
+        (
+            copilot::descriptor(),
+            "npm-loader.js",
+            "GitHub Copilot CLI 1.0.107.\nRun 'copilot update' to check for updates.",
+            "1.0.107",
+        ),
+        (
+            codex::descriptor(),
+            "launcher.js",
+            "OpenAI Codex v0.167.0",
+            "v0.167.0",
+        ),
+        (
+            claude::descriptor(),
+            "2.1.322",
+            "2.1.322 (Claude Code)",
+            "2.1.322",
+        ),
+    ] {
+        let temp = test_tempdir()?;
+        let bin = temp.path().join("bin");
+        let package = temp.path().join("package");
+        fs::create_dir_all(&bin)?;
+        fs::create_dir_all(&package)?;
+        let executable = package.join(canonical_name);
+        write_script(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  cat <<'BANNER'\n{banner}\nBANNER\n  exit 0\nfi\nprintf '%s\\n' \"$@\" > \"${{0%/*}}/verification-args\"\n"
+            ),
+        )?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+        symlink(&executable, bin.join(&provider.executable))?;
+        let discovery =
+            SystemExecutableDiscovery::from_path(Some(std::env::join_paths([bin])?), None);
+        assert_eq!(
+            discovery
+                .discover(&provider)?
+                .context("provider discovered")?
+                .path,
+            fs::canonicalize(&executable)?,
+            "version recognition must retain canonical executable discovery"
+        );
+        let id = provider.id;
+        let providers = [provider];
+        let terminal = FixedTerminal(true);
+        let mut confirmer = FakeConfirmer::new([ConsentDecision::Accepted]);
+        let clock = SystemClock::new();
+        let mut launcher = SystemProcessLauncher;
+        let report_path = temp.path().join("report.json");
+        let mut setup_options = options(provider_selector(id));
+        setup_options.mode = SetupMode::VerifyOnly;
+        setup_options.report_json = Some(report_path.clone());
+        let mut runtime = SetupRuntime {
+            discovery: &discovery,
+            confirmer: &mut confirmer,
+            terminal: &terminal,
+            clock: &clock,
+            launcher: &mut launcher,
+        };
+
+        let summary = run_setup(&setup_options, &providers, &mut runtime)
+            .with_context(|| format!("report for {} via {canonical_name}", id.as_str()))?;
+
+        assert!(summary.completed());
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(report_path)?)?;
+        assert_eq!(report["cli_version"], expected_version);
+        assert_eq!(report["harness"], id.as_str());
+        assert_eq!(report["candidate_commit"], setup_options.candidate_commit);
+        assert_eq!(report["completed"], true);
+        assert_eq!(report.as_object().context("report object")?.len(), 7);
+        assert_eq!(
+            fs::read_to_string(package.join("verification-args"))?,
+            format!("{}\n", expected_verification_args(id))
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn version_probe_rejects_contextual_account_identifier() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1731,13 +1843,15 @@ fn version_probe_rejects_contextual_account_identifier() -> Result<()> {
     let fake_codex = temp.path().join("codex");
     let report_path = temp.path().join("report.json");
     let version_marker = temp.path().join("version-ran");
-    fs::write(
+    write_script(
         &fake_codex,
         concat!(
             "#!/bin/sh\n",
             "if [ \"$1\" = \"--version\" ]; then\n",
             "  printf 'probed\\n' > \"${0%/*}/version-ran\"\n",
             "  printf 'Authenticated account 123.456.789\\n'\n",
+            "else\n",
+            "  printf 'ran\\n' > \"${0%/*}/verification-ran\"\n",
             "fi\n",
         ),
     )?;
@@ -1771,6 +1885,10 @@ fn version_probe_rejects_contextual_account_identifier() -> Result<()> {
         fs::read_to_string(version_marker)?,
         "probed\n",
         "privacy refusal must exercise the hostile version output, not an earlier timeout"
+    );
+    assert!(
+        !temp.path().join("verification-ran").exists(),
+        "unusable report metadata must be refused before a potentially billable turn"
     );
     Ok(())
 }
@@ -1861,7 +1979,7 @@ fn declining_setup_does_not_execute_provider_version_command() -> Result<()> {
     fs::create_dir_all(&bin)?;
     let marker = temp.path().join("version-ran");
     let executable = bin.join("fake-codex");
-    fs::write(
+    write_script(
         &executable,
         format!(
             "#!/bin/sh\nprintf ran > '{}'\nprintf 'fake-codex 1.2.3\\n'\n",
@@ -1941,6 +2059,37 @@ fn completed_verification_reaps_detached_provider_descendants() -> Result<()> {
 }
 
 #[test]
+fn failed_verification_cannot_publish_a_preflight_version_report() -> Result<()> {
+    let temp = test_tempdir()?;
+    let report_path = temp.path().join("report.json");
+    let providers = [descriptor(ProviderId::Copilot)];
+    let discovery = FakeDiscovery::all_present(&providers, "1.0.107");
+    let terminal = FixedTerminal(true);
+    let mut confirmer = FakeConfirmer::new([ConsentDecision::Accepted]);
+    let clock = FakeClock::default();
+    let mut launcher = FakeLauncher::new([LaunchBehavior::exit(17)]);
+    let mut setup_options = options(Selector::Copilot);
+    setup_options.mode = SetupMode::VerifyOnly;
+    setup_options.report_json = Some(report_path.clone());
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+
+    let error = run_setup(&setup_options, &providers, &mut runtime)
+        .expect_err("a version preflight cannot certify a failed verification turn");
+
+    assert!(matches!(error, SetupError::Rejected));
+    assert_eq!(launcher.launches.len(), 1);
+    assert!(!report_path.exists());
+    assert_eq!(fs::read_dir(temp.path())?.count(), 0);
+    Ok(())
+}
+
+#[test]
 fn report_publication_is_fail_if_exists_atomic_and_redaction_closed() -> Result<()> {
     let temp = test_tempdir()?;
     let existing = temp.path().join("existing.json");
@@ -1989,6 +2138,10 @@ fn report_publication_is_fail_if_exists_atomic_and_redaction_closed() -> Result<
         .expect_err("unsafe report data must fail closed");
     assert!(matches!(error, SetupError::Rejected));
     assert!(!rejected.exists());
+    assert!(
+        launcher.launches.is_empty(),
+        "unsafe cached metadata must be refused before a potentially billable turn"
+    );
 
     let unresolved = temp.path().join("unresolved.json");
     let discovery = FixedDiscovery(Some(ResolvedExecutable {
@@ -2009,6 +2162,10 @@ fn report_publication_is_fail_if_exists_atomic_and_redaction_closed() -> Result<
         .expect_err("certification requires a resolved CLI version");
     assert!(matches!(error, SetupError::Rejected));
     assert!(!unresolved.exists());
+    assert!(
+        launcher.launches.is_empty(),
+        "unresolved metadata must be refused before a potentially billable turn"
+    );
 
     let published = temp.path().join("published.json");
     let discovery = FakeDiscovery::all_present(&providers, "1.2.3");
@@ -2070,7 +2227,7 @@ fn executable_discovery_is_injectable_and_rejects_non_executables() -> Result<()
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::write(&executable, b"#!/bin/sh\nprintf 'fake-cli 1.2.3\\n'\n")?;
+        write_script(&executable, b"#!/bin/sh\nprintf 'fake-cli 1.2.3\\n'\n")?;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
     }
     #[cfg(not(unix))]
@@ -2112,7 +2269,7 @@ fn executable_discovery_normalizes_explicit_relative_paths() -> Result<()> {
 
     let temp = test_tempdir()?;
     let executable = temp.path().join("relative-cli");
-    fs::write(&executable, b"#!/bin/sh\nprintf 'relative-cli 1.2.3\\n'\n")?;
+    write_script(&executable, b"#!/bin/sh\nprintf 'relative-cli 1.2.3\\n'\n")?;
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
     let relative = executable.strip_prefix(std::env::current_dir()?)?;
     let provider = ProviderDescriptor::new(
@@ -2617,7 +2774,7 @@ fn login_owns_the_terminal_so_an_interactive_provider_can_change_modes_and_read(
         let bin = temp.path().join("bin");
         fs::create_dir_all(&bin)?;
         let fake = bin.join(executable);
-        fs::write(
+        write_script(
             &fake,
             "#!/bin/sh\n\
              case \"$1\" in --version|-v|version) echo \"9.9.9\"; exit 0;; esac\n\

@@ -49,24 +49,39 @@ pub struct RelayConfig {
     pub endpoints: Vec<EndpointConfig>,
 }
 impl RelayConfig {
-    /// Serialize incremental operator changes across threads and processes.
-    pub fn update(home: &Path, operation: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
-        let _process = CONFIG_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("relay configuration lock poisoned"))?;
-        let directory = ensure_private_mobile_dir(home)?;
-        let lock = crate::state_lock::open_lock_file(&directory.join(".relay.lock"))?;
-        lock.lock_exclusive()?;
-        let mut config = Self::load(home)?.unwrap_or(Self {
+    fn disabled() -> Self {
+        Self {
             listener_limit: MAX_LISTENERS,
             version: 1,
             enabled: false,
             endpoints: Vec::new(),
-        });
-        operation(&mut config)?;
-        config.save(home)?;
+        }
+    }
+
+    fn with_config_lock(home: &Path, operation: impl FnOnce() -> Result<()>) -> Result<()> {
+        let _process = crate::mobile_memory::store_lock::process(&CONFIG_LOCK)
+            .context("relay configuration lock unavailable")?;
+        let directory = ensure_private_mobile_dir(home)?;
+        let lock = crate::state_lock::open_lock_file(&directory.join(".relay.lock"))?;
+        crate::mobile_memory::store_lock::lock_exclusive(&lock, &directory.join(".relay.lock"))?;
+        operation()?;
         FileExt::unlock(&lock)?;
         Ok(())
+    }
+
+    /// Serialize incremental operator changes across threads and processes.
+    pub fn update(home: &Path, operation: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        Self::with_config_lock(home, || {
+            let mut config = Self::load(home)?.unwrap_or_else(Self::disabled);
+            operation(&mut config)?;
+            config.save(home)
+        })
+    }
+
+    /// Replace configuration without decoding damaged state. Private-file and
+    /// atomic-replacement checks still apply; paired material is never opened.
+    pub fn reset(home: &Path) -> Result<()> {
+        Self::with_config_lock(home, || Self::disabled().save(home))
     }
 
     pub fn disable(home: &Path) -> Result<bool> {
@@ -107,6 +122,12 @@ impl RelayConfig {
         Ok(())
     }
     pub fn load(home: &Path) -> Result<Option<Self>> {
+        Self::load_inner(home).context(
+            "cannot read relay configuration; to discard relay settings and disable access, run `coven memory mobile relay reset --yes` (paired devices and identity are retained)",
+        )
+    }
+
+    fn load_inner(home: &Path) -> Result<Option<Self>> {
         let directory = home.join("mobile");
         if !exists(&directory)? {
             return Ok(None);
@@ -116,7 +137,16 @@ impl RelayConfig {
         if !exists(&path)? {
             return Ok(None);
         }
-        let config: Self = serde_json::from_slice(&read_private(&path)?)?;
+        let config: Self = serde_json::from_slice(&read_private(&path)?).map_err(|error| {
+            // Serde data errors can quote saved field names and values. The CLI
+            // prints error chains, so retain only structural parse diagnostics.
+            anyhow::anyhow!(
+                "invalid relay configuration JSON ({:?}, line {}, column {})",
+                error.classify(),
+                error.line(),
+                error.column()
+            )
+        })?;
         config.validate()?;
         Ok(Some(config))
     }
@@ -250,12 +280,11 @@ pub fn load_or_provision(
     host: &SigningKey,
     device_id: Uuid,
 ) -> Result<Material> {
-    let _process = MATERIAL_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("transport state lock poisoned"))?;
+    let _process = crate::mobile_memory::store_lock::process(&MATERIAL_LOCK)
+        .context("transport state lock unavailable")?;
     let directory = ensure_private_mobile_dir(home)?;
     let lock = crate::state_lock::open_lock_file(&directory.join(".transport.lock"))?;
-    lock.lock_exclusive()?;
+    crate::mobile_memory::store_lock::lock_exclusive(&lock, &directory.join(".transport.lock"))?;
     v2::restore::check_application(home, registry, device_id)?;
     ensure!(
         !requires_v2(home, device_id)?,
@@ -504,3 +533,7 @@ mod listener_config_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "storage/contention_tests.rs"]
+mod contention_tests;

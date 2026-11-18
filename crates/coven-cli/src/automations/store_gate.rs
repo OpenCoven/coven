@@ -304,6 +304,9 @@ pub(crate) struct StoreGate {
     /// order a deadline against the wait.
     #[cfg(test)]
     locking: Option<Box<dyn FnMut() + Send>>,
+    /// Observes successful write-lock acquisition before the clock is read.
+    #[cfg(test)]
+    acquired: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl StoreGate {
@@ -330,6 +333,8 @@ impl StoreGate {
             clock: Clock::default(),
             #[cfg(test)]
             locking: None,
+            #[cfg(test)]
+            acquired: None,
         })
     }
 
@@ -380,6 +385,10 @@ impl StoreGate {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| Refusal::AttemptClosed)?;
+        #[cfg(test)]
+        if let Some(acquired) = self.acquired.as_mut() {
+            acquired();
+        }
         // The time is read only once the write lock is held: the wait for it
         // can outlast the run's `timeout_at`, and P must hold when the row
         // commits, not when the call began to wait (#1605).

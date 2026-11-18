@@ -285,13 +285,11 @@ struct PolicyStoreLock {
 
 impl PolicyStoreLock {
     fn acquire(directory: &Path) -> Result<Self> {
-        let process = POLICY_WRITE_LOCK
-            .lock()
-            .map_err(|_| anyhow::anyhow!("introduction policy lock was poisoned"))?;
+        let process = super::store_lock::process(&POLICY_WRITE_LOCK)
+            .context("introduction policy lock unavailable")?;
         let lock_path = directory.join(POLICY_LOCK_FILE);
         let file = crate::state_lock::open_lock_file(&lock_path)?;
-        file.lock_exclusive()
-            .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+        super::store_lock::lock_exclusive(&file, &lock_path)?;
         Ok(Self {
             _process: process,
             file,

@@ -8,6 +8,8 @@ source_adjacent_reason: "Defines the repository task allocator and shared checko
 
 Run `python3 scripts/task-worktree.py inventory` at session start and after delivery. Fetch origin before making a decision based on remote counts. The budget is 12 linked task worktrees, 32 local branches excluding `main`, and 48 origin branches excluding `main` and symbolic `HEAD`. Detached, locked and missing worktree registrations count because they still need an explicit disposition. These are repository coordination limits, not a runtime authority policy.
 
+The inventory also reports `stray remote refs`: remote-tracking refs under `refs/remotes/<namespace>/` whose namespace is neither `origin` nor a configured remote, meaning one with a `remote.<name>.url`. Their limit is 0. A default fetch or prune of a configured remote does not reconcile them, so they accumulate unseen and crowd every branch picker. A custom refspec that maps a configured remote into another namespace still produces stray refs. A configured non-origin remote such as `upstream` is not stray, and its refs do not count toward the origin budget. `check` and `create` refuse while any stray ref exists; existing work and `publish` are unaffected.
+
 ## Allocate
 
 Inspect open PRs and `coven claim status`, fetch current main, then allocate through the shared helper:
@@ -19,7 +21,7 @@ cd /tmp/coven-42-example
 coven claim acquire issue-42
 ```
 
-The helper holds a common-Git-directory allocation lock while it reads counts and creates the branch/worktree at `origin/main` without upstream tracking. It refuses an existing destination, an invalid branch or missing base, a held allocator lock, and any projected budget excess. It never deletes existing work to satisfy a budget. Inspect the lock's recorded PID and owning issue before recovering a lock left by a terminated process; a timestamp alone is insufficient evidence. If claim acquisition fails after allocation, stop and reconcile ownership; do not start implementation.
+The helper holds a common-Git-directory allocation lock while it reads counts and creates the branch/worktree at `origin/main` without upstream tracking. It refuses an existing destination, an invalid branch or missing base, a held allocator lock, any stray remote ref, and any projected budget excess. It never deletes existing work to satisfy a budget. Inspect the lock's recorded PID and owning issue before recovering a lock left by a terminated process; a timestamp alone is insufficient evidence. If claim acquisition fails after allocation, stop and reconcile ownership; do not start implementation.
 
 Existing work can continue when counts already exceed the budget. Additional allocation is refused until cleanup makes room. A limit change requires an issue-backed reviewed policy change. All repository agents must use the helper; raw Git remains capable of bypassing this cooperative repository policy, so the allocator cannot constrain an unrelated external Git client.
 
@@ -30,6 +32,12 @@ After required verification, run `python3 scripts/task-worktree.py publish --iss
 If publication is necessary while the remote budget is full, use `--exception-issue <open-issue> --reason <reason>`. The helper verifies the tracking issue is open and records the branch, full SHA, live/projected counts and reason there before attempting the one push. Missing issue access, failed recording or a closed exception issue stops publication. This is an attributable one-publication exception, not a limit change, general bypass or release authorization. Follow up with the actual PR/push outcome and owned cleanup; a recorded request alone is not proof of publication.
 
 The shared lock serializes cooperating sessions in this common Git directory. Independent clones and external Git clients are not atomically constrained by that local lock; they must follow the same procedure and reconcile live counts. GitHub PR state and Git ref deletion also lack a shared atomic transaction, so preservation and exact-ref leases remain mandatory at cleanup time.
+
+## Inspect PR heads without storing refs
+
+PR-head evidence is ephemeral. Read the SHA alone with `git ls-remote origin refs/pull/<n>/head`, or fetch one head with `git fetch origin refs/pull/<n>/head`, which records it only in `FETCH_HEAD`. Never fetch with a wildcard refspec into `refs/remotes/`, such as `+refs/pull/*/head:refs/remotes/pr/*`: one such evidence fetch left 1,209 untracked refs in this checkout.
+
+To clear stray refs, list them with `git for-each-ref refs/remotes` and compare each against its live source. A ref whose exact SHA is still served by origin, for example at `refs/pull/<n>/head`, can be fetched again and needs no preservation. Preserve every other head in an owner-reviewed recovery bundle outside the checkout, with a ref-to-SHA manifest, and record the evidence on the owning issue. Then delete each ref with `git update-ref --no-deref -d <ref> <expected-sha>`, which refuses a changed ref. `--no-deref` matters for a leftover symbolic `refs/remotes/<namespace>/HEAD`: without it Git deletes the target and leaves a dangling symbolic ref that the inventory can no longer see. Delete such a `HEAD` first, then confirm `refs/remotes/<namespace>` is gone from the common Git directory. If the namespace belongs to a remote that should exist, configure that remote instead of deleting its refs.
 
 ## Prune after delivery and before new allocation
 
@@ -45,4 +53,4 @@ The scheduled branch-triage action operates on remote delivery state, not local 
 
 ## Verification
 
-`python3 scripts/task-worktree-test.py` exercises allocation and publication against disposable Git repositories and real bare remotes, including stale tracking refs, publication exceptions and non-fast-forward refusal. `python3 scripts/branch-triage-test.py` runs remote triage against a disposable real Git remote and proves preservation through dry-run, remote deletion and eligible OPEN merge paths. Both run in the required Policy guard. Run the repository's applicable required guards before publishing allocator or lifecycle-policy changes. Passing these tests does not establish that a legacy worktree is safe to delete.
+`python3 scripts/task-worktree-test.py` exercises allocation and publication against disposable Git repositories and real bare remotes, including stale tracking refs, stray remote refs, configured non-origin remotes, publication exceptions and non-fast-forward refusal. `python3 scripts/branch-triage-test.py` runs remote triage against a disposable real Git remote and proves preservation through dry-run, remote deletion and eligible OPEN merge paths. Both run in the required Policy guard. Run the repository's applicable required guards before publishing allocator or lifecycle-policy changes. Passing these tests does not establish that a legacy worktree is safe to delete.
