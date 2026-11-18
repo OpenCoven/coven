@@ -19,6 +19,9 @@ impl Progress {
     pub fn observe(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             if byte == b'\n' {
+                if self.line.len() == MAX_FRAME_BYTES {
+                    self.oversized = true;
+                }
                 self.finish_line();
             } else if self.line.len() < MAX_FRAME_BYTES {
                 self.line.push(byte);
@@ -133,4 +136,30 @@ fn classify(frame: &Value) -> Option<Frame> {
     } else {
         Frame::Query
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Progress, MAX_FRAME_BYTES};
+
+    #[test]
+    fn physical_line_limit_counts_newline_but_not_eof() {
+        for (content_bytes, terminator, accepted) in [
+            (MAX_FRAME_BYTES - 1, b"\n".as_slice(), true),
+            (MAX_FRAME_BYTES, b"\n".as_slice(), false),
+            (MAX_FRAME_BYTES, b"".as_slice(), true),
+        ] {
+            let mut progress = Progress::default();
+            progress.observe(&vec![b' '; content_bytes]);
+            progress.observe(terminator);
+            progress.eof();
+
+            assert_eq!(
+                progress.saved_queries_cover_input(0),
+                accepted,
+                "content_bytes={content_bytes}, newline={}",
+                !terminator.is_empty()
+            );
+        }
+    }
 }
