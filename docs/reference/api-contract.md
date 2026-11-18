@@ -176,3 +176,7 @@ See [Error envelope](/daemon/error-envelope) for the full code list.
 - [API reference](/reference/api)
 
 `sessionClaudeWriteScope` is owner-local only and advertises the separate Claude `writeScope` v1 request shape; it is false over TCP and does not prove runtime qualification or grant authority. See the [scoped-write contract](../API-CONTRACT.md#claude-scoped-writes-v1) for schema, native-profile restrictions, refusals, and the local `--write-scope` equivalent.
+
+## Host folder sync
+
+The owner-local daemon advertises `hostSync` for folder initialization, connection, reconciliation, status, watch and conflict resolution. `coven host sync` waits for a daemon-owned run to finish. `coven host serve` runs the peer independently. The full API contract documents request bodies, run tickets and watch lifetime. [Host routes](/API-CONTRACT#host-folder-sync)

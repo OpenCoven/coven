@@ -52,6 +52,8 @@ name = "threads_terminal_recovery"
 required-features = ["threads-test-clock"]
 
 [dependencies]
+# Rust Castle reconciliation and the independently runnable authenticated peer.
+coven-host = { git = "https://github.com/OpenCoven/coven-host", rev = "889fa8a45ecb5e827668dbddfdda1d01555c5ed1", version = "0.1.0" }
 coven-afs = { path = "../coven-afs", version = "0.1.0" }
 coven-client = { package = "opencoven-coven-client", path = "../coven-client", version = "0.1.0" }
 anyhow = "1"

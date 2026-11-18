@@ -89,6 +89,24 @@ corrupted or hand-composed value cannot smuggle a separator into the request
 target. Setting none of the three requests the inherited unpaginated array;
 setting any of them requests the envelope.
 
+### Host folder sync
+
+The daemon advertises `capabilities.hostSync: true` over owner-local IPC. An absent or false value means clients must stop before sending a host operation. TCP requests to the host routes return a structured 403. File contents travel exclusively through the authenticated peer protocol.
+
+| Method and route | Request | Successful response |
+| --- | --- | --- |
+| `POST /api/v1/host/init` | `{"root":"/absolute/folder"}` | `{"ok":true}` |
+| `POST /api/v1/host/connect` | `{"url":"http://127.0.0.1:8765","tokenFile":"/absolute/private/token"}` | `{"ok":true}` |
+| `POST /api/v1/host/sync` | Empty | HTTP 202 and `{"id":"<uuid>"}` |
+| `POST /api/v1/host/result` | `{"id":"<uuid>"}` | HTTP 202 and `null` while running, then HTTP 200 with `phase` and `error` |
+| `GET /api/v1/host/status` | Empty | Local state including phase, pending work, conflicts and recovery paths |
+| `POST /api/v1/host/watch` | Empty | Latest reconciliation result, or `{"phase":"syncing"}` before the first result |
+| `POST /api/v1/host/resolve` | `{"path":"files/note","resolution":"local"}`, `"remote"` or `{"merged":"/absolute/file"}` for the resolution | `{"ok":true}` |
+
+Overlapping sync requests share a run. Tickets identify one daemon instance and its 32 most recent completed runs. An expired or unknown ticket returns 404. The daemon polls every two seconds while a watcher is present, with backoff up to 30 seconds when offline. A watcher renews its eight-second lease through the watch route. Outstanding transfers finish after the last watcher leaves.
+
+The daemon stores the client database in the `host` subdirectory of its profile. On Linux the default profile recognizes a stopped Python client's existing `~/.local/state/coven-host/client/client.sqlite` when the new profile has no client database. A daemon launched with `COVEN_HOST_STATE` set to an absolute state directory uses that directory.
+
 ### Mobile connection observations
 
 `POST /api/v1/internal/mobile/connections` is an owner-local diagnostic read handled by the mobile runtime. An empty JSON object selects relay for compatibility; `{"transport":"direct"}` or `{"transport":"relay"}` explicitly selects an ingress. Unknown fields, malformed bodies and unknown transports return 400. A successful response contains exactly `state` and `transport`, with state chosen from `offline`, `connecting`, `authenticating`, and `online`. Other methods return 405. TCP/mobile ingress cannot dispatch the diagnostic. It does not create enrollment, mutate authorization or authorize an application action.

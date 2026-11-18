@@ -39,6 +39,8 @@ mod eval_loop;
 mod eval_loop_cli;
 mod event_writer;
 mod execution_binding;
+mod host_cli;
+mod host_sync;
 mod install_conflict;
 #[rustfmt::skip]
 mod request_adoption;
@@ -421,6 +423,11 @@ enum Command {
     Engine {
         #[command(subcommand)]
         command: EngineCommand,
+    },
+    /// Reconcile a local Castle folder or run an independent peer.
+    Host {
+        #[command(subcommand)]
+        command: host_cli::Command,
     },
     #[command(about = "Manage the local Coven daemon")]
     #[command(
@@ -2151,6 +2158,11 @@ fn main() -> Result<()> {
             }
         }
     }
+    // Peer commands are independent of the desktop profile. Client commands
+    // acquire their state through the daemon, including its existing startup gate.
+    if matches!(&cli.command, Some(Command::Host { .. })) {
+        return run_cli(cli);
+    }
     if matches!(
         &cli.command,
         Some(Command::Config {
@@ -2328,6 +2340,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
         Some(Command::Adapter { command }) => run_adapter_command(command),
         Some(Command::Engine { command }) => run_engine_command(command),
+        Some(Command::Host { command }) => host_cli::run(command),
         Some(Command::Daemon { command }) => run_daemon_command(command),
         Some(Command::ProcessSupervisor { .. }) => {
             unreachable!("process supervisor runs before state initialization")
