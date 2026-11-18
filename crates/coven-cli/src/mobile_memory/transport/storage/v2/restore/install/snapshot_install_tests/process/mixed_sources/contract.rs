@@ -174,6 +174,12 @@ impl<'a> Contract<'a> {
                 "fresh restore handover required".to_owned()
             }
         };
+        if before.contains_key("host-key.pem") && !before.contains_key("host-identity.json") {
+            assert_eq!(
+                reason, INTERRUPTED_IDENTITY_INSTALL_REASON,
+                "{label} {at}: incomplete host identity was refused for the wrong reason"
+            );
+        }
         *self
             .reasons
             .borrow_mut()
