@@ -13,7 +13,11 @@ source_adjacent_reason: "Tracks the retry command in crates/coven-cli/src/automa
 failure. When a run fails with no automatic retry left, the run and the
 routine's claims stay held until the run's deadline, and
 `coven automations explain` lists it as `retry_held`. The first scheduler pass
-at or after the deadline settles the run `failed`. Before then, this command
+at or after the deadline settles the run `failed`. Only a run this command
+could retry is held: when the routine is not active (for example paused) or is
+quarantined, which includes a routine whose automatic retries were just
+exhausted, the run settles `failed` at once with its failure class, and a new
+manual run is not refused for overlap. Before the deadline, this command
 sends `coven.automations.attempt.retry.v1` to the owner-local daemon. The daemon
 opens the next attempt, classified `operator_retry`, and returns the occurrence
 to `planned`, and the scheduler dispatches it.
@@ -67,19 +71,20 @@ fixed messages. The daemon's own error text is never printed.
 | The latest attempt is ambiguous | `the run's latest attempt is ambiguous; recover its occurrence instead` |
 | A stop fence or pending cancellation on the run | `the run has an unresolved stop, so it cannot be retried` |
 | The run's deadline has passed | `the run's deadline has passed; it cannot be retried` |
-| Any other reason the run is not held for a retry | `the run is not held for a retry: ...` |
+| The run is not running | `the run is not held for a retry: it is not running` |
+| The run has no occurrence | `the run is not held for a retry: it has no occurrence to plan` |
+| The run has no attempt | `the run is not held for a retry: it has no attempt` |
+| The latest attempt is still live | `the run is not held for a retry: its latest attempt has not failed, timed out or been cancelled` |
+| The run has used all ten attempts | `the run is not held for a retry: it has used all its attempts` |
+| The run has no deadline | `the run is not held for a retry: it has no original deadline` |
+| The routine is not active | `the run's routine is not active, so the run cannot be retried` |
+| The routine is quarantined | `the run's routine is quarantined; explicitly unquarantine it before retrying` |
+| The occurrence is no longer claimed or running | `the run's occurrence is not held for a retry` |
+| Any other reason the run is not held for a retry | `the run is not held for a retry: it needs to be running, ...` |
 
-The last row covers these cases:
-
-- the run is not running;
-- it has no occurrence or no attempt, or its occurrence is no longer claimed or
-  running;
-- its latest attempt is still live;
-- it has no deadline;
-- it has used all ten attempts;
-- its routine is not active, or is quarantined.
-
-Any other refusal reports only its HTTP status.
+The command picks each of these by matching the shape of the daemon's reason,
+and prints the fixed sentence, never the reason itself. Any other refusal
+reports only its HTTP status.
 
 ## Output
 

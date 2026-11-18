@@ -1226,6 +1226,8 @@ fn settle_rejected_launch(
 
 /// Retain a known failed pre-ownership attempt without inventing a running
 /// occurrence. The failed session stays bound as evidence; no lease stays live.
+/// Only a run `attempt.retry.v1` could retry is held: when its routine is not
+/// active or is quarantined, the caller settles the run terminally instead.
 fn hold_failed_preownership_attempt_in(
     conn: &Connection,
     run_id: &str,
@@ -1243,6 +1245,17 @@ fn hold_failed_preownership_attempt_in(
              WHERE r.id = ?1 AND r.occurrence_id = ?2 AND r.status = 'running'
                AND r.authority_profile IS NULL AND r.timeout_at > ?4
                AND a.state = 'failed' AND a.attempt_number < ?5
+               -- Hold only what `attempt.retry.v1` can retry: a routine that is
+               -- not active or is quarantined settles now (coven#1793).
+               AND EXISTS (
+                   SELECT 1 FROM automation_definitions d
+                   WHERE d.id = r.automation_id AND d.tombstoned_at IS NULL
+                     AND d.lifecycle_state = 'active'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM automation_retry_state q
+                   WHERE q.automation_id = r.automation_id AND q.quarantined_at IS NOT NULL
+               )
          )",
         rusqlite::params![run_id, occurrence_id,
             format!("{reason}; held for an operator retry until the run's deadline"),
@@ -10015,9 +10028,12 @@ mod tests {
     #[test]
     fn failed_launch_holds_the_run_until_its_original_deadline() {
         let (_temp, conn) = temp_store();
-        insert_definition(&conn, &definition("daily")).unwrap();
+        // Only an active routine's run can be retried, so only it is held.
+        let mut routine = definition("daily");
+        routine.status = RoutineStatus::Active;
+        insert_definition(&conn, &routine).unwrap();
         let now = Utc::now();
-        let outcome = run_routine_now(&conn, &RejectingRuntime, &definition("daily"), now).unwrap();
+        let outcome = run_routine_now(&conn, &RejectingRuntime, &routine, now).unwrap();
         assert_eq!(outcome.status, "running");
         assert!(outcome.error.as_deref().unwrap().contains("synthetic"));
 
@@ -10048,7 +10064,8 @@ mod tests {
     #[test]
     fn held_failure_expires_after_its_unowned_session_is_sacrificed() {
         let (_temp, conn) = temp_store();
-        let routine = definition("sacrificed-hold");
+        let mut routine = definition("sacrificed-hold");
+        routine.status = RoutineStatus::Active;
         insert_definition(&conn, &routine).unwrap();
         let outcome = run_routine_now(&conn, &RejectingRuntime, &routine, Utc::now()).unwrap();
         let (session, before): (String, String) = conn
@@ -10912,7 +10929,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_hold_after_launch_failure_preserves_quarantine_and_allows_explicit_retry() {
+    fn operator_hold_after_launch_failure_allows_explicit_retry_unless_quarantined() {
         use super::super::attempt_retry::{execute_attempt_retry, RetryExecution, RETRY_ACTION};
         for (runtime, quarantined) in [
             (&UnavailableRuntime as &dyn SessionRuntime, true),
@@ -10930,6 +10947,44 @@ mod tests {
             insert_definition(&conn, &routine).unwrap();
             let now = Utc::now();
             let outcome = run_routine_now(&conn, runtime, &routine, now).unwrap();
+            let request = |key| {
+                json!({"action": RETRY_ACTION, "adoptionKey": key,
+                "runId": outcome.run_id, "priorAttemptNumber": 1, "priorDisposition": "failed"})
+            };
+            if quarantined {
+                // Exhaustion quarantined the routine, so no operator retry can
+                // be admitted: the run settles at once with its failure class
+                // instead of blocking the routine until its deadline (#1793).
+                assert_eq!(outcome.status, "failed");
+                let settled: (String, String, String, Option<String>) = conn
+                    .query_row(
+                        "SELECT r.status, o.state, a.state, a.failure_class
+                         FROM automation_runs r
+                         JOIN automation_occurrences o ON o.id = r.occurrence_id
+                         JOIN automation_attempts a ON a.run_id = r.id WHERE r.id = ?1",
+                        [&outcome.run_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    settled,
+                    (
+                        "failed".into(),
+                        "failed".into(),
+                        "failed".into(),
+                        Some("runtime_unavailable".into())
+                    )
+                );
+                assert!(is_retry_quarantined(&conn, &routine.id).unwrap());
+                assert!(
+                    super::super::runs::clear_retry_quarantine(&conn, &routine.id, now).unwrap()
+                );
+                assert!(matches!(
+                    execute_attempt_retry(&conn, request("adopt:retry:settled"), now).unwrap(),
+                    RetryExecution::Rejected(_)
+                ));
+                continue;
+            }
             assert_eq!(
                 outcome.status, "running",
                 "failed launch must retain an operator retry window"
@@ -10945,23 +11000,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!((state.as_str(), attempt.as_str()), ("claimed", "failed"));
-            assert_eq!(
-                is_retry_quarantined(&conn, &routine.id).unwrap(),
-                quarantined
-            );
-            let request = |key| {
-                json!({"action": RETRY_ACTION, "adoptionKey": key,
-                "runId": outcome.run_id, "priorAttemptNumber": 1, "priorDisposition": "failed"})
-            };
-            if quarantined {
-                assert!(matches!(
-                    execute_attempt_retry(&conn, request("adopt:retry:quarantine"), now).unwrap(),
-                    RetryExecution::Rejected(_)
-                ));
-                assert!(
-                    super::super::runs::clear_retry_quarantine(&conn, &routine.id, now).unwrap()
-                );
-            }
+            assert!(!is_retry_quarantined(&conn, &routine.id).unwrap());
             // A graceful shutdown inside the hold window keeps the claim retryable.
             assert_eq!(
                 mark_active_attempts_for_restart_reconciliation(&conn, now).unwrap(),
@@ -11000,12 +11039,13 @@ mod tests {
     }
 
     #[test]
-    fn operator_hold_after_exhausted_lease_recovery_can_be_cancelled() {
-        use super::super::cancel_commands::{
-            execute_occurrence_cancel, CancelExecution, OCCURRENCE_CANCEL_ACTION,
-        };
+    fn exhausted_lease_recovery_settles_the_run_of_a_quarantined_routine() {
         let (temp, conn) = temp_store();
+        // Exhaustion quarantines the routine, and no operator retry of a
+        // quarantined routine is admitted, so recovery settles the run with
+        // its failure class instead of holding it until its deadline (#1793).
         let mut routine = definition("operator-lease-hold");
+        routine.status = RoutineStatus::Active;
         routine.retry = RoutineRetryPolicy {
             max_attempts: 1,
             backoff_policy: BackoffPolicy::None,
@@ -11045,40 +11085,35 @@ mod tests {
             recover_no_process_preownership_launches(temp.path(), &conn, recovered_at).unwrap(),
             1
         );
-        let state: (String, String, String, Option<String>) = conn
+        let state: (String, String, String, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT r.status, o.state, a.state, o.lease_owner FROM automation_runs r
+                "SELECT r.status, o.state, a.state, a.failure_class, o.lease_owner
+             FROM automation_runs r
              JOIN automation_occurrences o ON o.id = r.occurrence_id
              JOIN automation_attempts a ON a.run_id = r.id WHERE r.id = 'held-lease-run'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(
             state,
-            ("running".into(), "claimed".into(), "failed".into(), None)
+            (
+                "failed".into(),
+                "failed".into(),
+                "failed".into(),
+                Some("lease_expired".into()),
+                None
+            )
         );
         assert!(is_retry_quarantined(&conn, &routine.id).unwrap());
-        let result = execute_occurrence_cancel(
-            &conn,
-            &crate::api::NoopSessionRuntime,
-            json!({"action": OCCURRENCE_CANCEL_ACTION, "adoptionKey": "adopt:cancel:lease-hold",
-                   "occurrenceId": "held-lease-occurrence"}),
-            recovered_at,
-        )
-        .unwrap();
-        assert!(
-            matches!(result, CancelExecution::Success { .. }),
-            "{result:?}"
-        );
-        let attempt: String = conn
-            .query_row(
-                "SELECT state FROM automation_attempts WHERE run_id = 'held-lease-run'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(attempt, "failed");
     }
 
     #[test]
@@ -11121,8 +11156,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(state.0, "claimed");
-        assert_eq!(state.1, "running");
+        // Quarantined, so the exhausted run settles instead of being held
+        // for a retry it cannot get (#1793).
+        assert_eq!(state.0, "failed");
+        assert_eq!(state.1, "failed");
         assert_eq!(state.2, 1);
         assert!(state.3.is_some());
         let quarantined_tick =
@@ -11139,20 +11176,13 @@ mod tests {
             now + chrono::Duration::minutes(1)
         )
         .unwrap());
-        let held = run_routine_now(
-            &conn,
-            &UnavailableRuntime,
-            &routine,
-            now + chrono::Duration::minutes(1),
-        )
-        .unwrap();
-        assert_eq!(held.status, "failed");
-        assert!(held.error.unwrap().contains("overlap is forbidden"));
+        // Nothing was held, so nothing is left to settle at the deadline and
+        // the released routine's next occurrence runs.
         assert_eq!(
             settle_finished_runs(&conn, now + chrono::Duration::minutes(30))
                 .unwrap()
                 .failed,
-            1
+            0
         );
         let released =
             super::super::occurrences::tick(&conn, now + chrono::Duration::days(1)).unwrap();
@@ -11175,7 +11205,8 @@ mod tests {
 
         let outcome = run_routine_now(&conn, &UnavailableRuntime, &routine, now).unwrap();
 
-        assert_eq!(outcome.status, "running");
+        // Quarantined, so the run is not held for a retry it cannot get (#1793).
+        assert_eq!(outcome.status, "failed");
         assert!(
             super::super::runs::is_retry_quarantined(&conn, "single-attempt-exhausted").unwrap()
         );

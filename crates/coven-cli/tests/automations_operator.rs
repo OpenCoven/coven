@@ -186,9 +186,7 @@ fn inspection_reads_real_daemon_records_without_mutating_them() -> anyhow::Resul
     assert!(refused.stdout.is_empty());
     assert_eq!(
         String::from_utf8(refused.stderr)?,
-        "Error: the run is not held for a retry: it needs to be running, with a latest attempt \
-         that failed, timed out or was cancelled, an open deadline, an attempt left, and an active \
-         routine that is not quarantined\n"
+        "Error: the run is not held for a retry: it is not running\n"
     );
     let held = |rows: Vec<String>| -> Vec<String> {
         rows.into_iter()
