@@ -2919,7 +2919,45 @@ fn configure_background_server_command(command: &mut Command) {
 }
 
 #[cfg(not(windows))]
-fn configure_background_server_command(_command: &mut Command) {}
+fn configure_background_server_command(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // `Command` gives the daemon null standard streams, but on Unix every
+    // other descriptor the caller of `daemon start` left inheritable would
+    // follow it into `daemon serve` and stay open for the daemon's lifetime.
+    // A caller's pipe or FIFO then never reaches end of file for its reader
+    // (#1806). This is the Unix counterpart of the Windows handle-inherit
+    // clearing above. The daemon keeps only the descriptors it opens itself.
+    //
+    // SAFETY: the hook runs in the forked child before exec and only calls
+    // async-signal-safe functions; it allocates nothing and takes no locks.
+    unsafe {
+        command.pre_exec(|| {
+            mark_inherited_descriptors_close_on_exec(3);
+            Ok(())
+        });
+    }
+}
+
+/// Marks every descriptor at or above `from` close-on-exec, so it closes at
+/// `execve` instead of reaching the new program. Marking rather than closing
+/// leaves std's own close-on-exec exec-status pipe untouched; a descriptor
+/// that is not open makes `F_GETFD` fail and is skipped. Only
+/// async-signal-safe calls, for use from `pre_exec`.
+#[cfg(not(windows))]
+fn mark_inherited_descriptors_close_on_exec(from: libc::c_int) {
+    // SAFETY: getdtablesize and fcntl are async-signal-safe and only touch
+    // this process's descriptor table.
+    unsafe {
+        let limit = libc::getdtablesize();
+        for fd in from..limit {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
 
 #[cfg(windows)]
 fn windows_daemon_creation_flags() -> u32 {
