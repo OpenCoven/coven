@@ -10,6 +10,7 @@ pub(crate) use install::run_install;
 const MARKER: &str = ".transport-restore.required";
 const JOURNAL: &str = "transport-restore.json";
 const MARKER_BYTES: &[u8] = b"coven.mobile.restore.v1\n";
+const INTERRUPTED_IDENTITY_INSTALL_REASON: &str = "mobile restore was interrupted while installing host identity; retry the original restore operation with the same snapshot and signed authority source";
 const MAX_RESTORE_BYTES: u64 = 64 * 1024;
 // Bound registry unions plus retained restore history. Exhaustion fails closed
 // rather than silently discarding already-known generation or epoch floors.
@@ -106,6 +107,10 @@ fn read(home: &Path) -> Result<Option<State>> {
             "restore installation epoch not durably installed"
         );
     }
+    ensure!(
+        !exists(&directory.join("host-key.pem"))? || exists(&directory.join("host-identity.json"))?,
+        "{INTERRUPTED_IDENTITY_INSTALL_REASON}"
+    );
     let identity = crate::mobile_memory::identity::load_existing_host_identity(home)?;
     ensure!(
         identity.public_key_fingerprint == state.installation_fingerprint,
