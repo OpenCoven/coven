@@ -300,6 +300,25 @@ pub fn get_definition_with_tombstone(
     }
 }
 
+/// The current definition `id` that a claimed occurrence dispatches: a
+/// routine's, as [`get_definition`] reads it, or a mission's internal one,
+/// which every routine read treats as absent.
+pub(crate) fn get_dispatch_definition(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<RoutineRecord>> {
+    conn.query_row(
+        "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
+                tombstoned_at, updated_at
+         FROM automation_definitions
+         WHERE id = ?1 AND tombstoned_at IS NULL",
+        params![id],
+        routine_record_from_row,
+    )
+    .optional()
+    .context("failed to get the dispatched definition")
+}
+
 pub(crate) fn routine_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutineRecord> {
     Ok(RoutineRecord {
         id: row.get(0)?,

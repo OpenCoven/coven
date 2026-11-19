@@ -609,7 +609,7 @@ mod tests {
     fn payload() -> Value {
         json!({
             "familiar": { "rootId": format!("familiar:{}", "a".repeat(32)), "revisionId": format!("familiar-revision:{}:3", "a".repeat(32)) },
-            "envelope": { "id": "r0-read.1", "descriptorDigest": { "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": "b".repeat(64) } },
+            "envelope": { "id": "r0-read.2", "descriptorDigest": { "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": "b".repeat(64) } },
             "project": { "cwd": "/work/project" },
             "task": { "statement": "Diagnose the failing build", "prompt": "Read the last CI log." },
             "limits": { "timeoutMinutes": 10 },
@@ -820,18 +820,18 @@ mod tests {
         };
         let advertised = catalog(json!({
             "id": "coven.automations",
-            "missionEnvelopes": [{ "id": "r0-read.1", "descriptorDigest": digest }],
+            "missionEnvelopes": [{ "id": "r0-read.2", "descriptorDigest": digest }],
         }));
         let envelopes = catalog_envelopes(200, &advertised).unwrap();
         assert_eq!(
             envelopes,
-            json!({ "envelopes": [{ "id": "r0-read.1", "descriptorDigest": digest }] })
+            json!({ "envelopes": [{ "id": "r0-read.2", "descriptorDigest": digest }] })
         );
         let mut out = Vec::new();
         print_envelopes(&envelopes, false, &mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            format!("r0-read.1 sha256:{}\n", "3".repeat(64))
+            format!("r0-read.2 sha256:{}\n", "3".repeat(64))
         );
 
         // A daemon from before the advertisement, a refusal, and a malformed
@@ -840,9 +840,9 @@ mod tests {
         assert!(catalog_envelopes(200, &older).is_err());
         assert!(catalog_envelopes(503, &advertised).is_err());
         for bad in [
-            json!({ "id": "r0-read.1", "descriptorDigest": { "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": "3".repeat(63) } }),
-            json!({ "id": "r0-read.1", "descriptorDigest": { "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": "A".repeat(64) } }),
-            json!({ "id": "r0-read.1", "descriptorDigest": { "algorithm": "sha512", "canonicalization": "jcs-rfc8785", "value": "3".repeat(64) } }),
+            json!({ "id": "r0-read.2", "descriptorDigest": { "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": "3".repeat(63) } }),
+            json!({ "id": "r0-read.2", "descriptorDigest": { "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": "A".repeat(64) } }),
+            json!({ "id": "r0-read.2", "descriptorDigest": { "algorithm": "sha512", "canonicalization": "jcs-rfc8785", "value": "3".repeat(64) } }),
             json!({ "id": "", "descriptorDigest": digest }),
         ] {
             let malformed =

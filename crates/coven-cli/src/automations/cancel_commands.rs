@@ -162,6 +162,35 @@ pub fn execute_occurrence_cancel(
     body: Value,
     now: DateTime<Utc>,
 ) -> Result<CancelExecution, String> {
+    // The mission layer derives its own cancellations' keys, and a mission's
+    // view reads its cancellation and its revocation stop from them, so no
+    // request may take one. It is refused before adoption, leaving the key
+    // free for the daemon.
+    if let Some(prefix) = body
+        .get("adoptionKey")
+        .and_then(Value::as_str)
+        .and_then(|key| {
+            super::missions::RESERVED_CANCEL_KEY_PREFIXES
+                .into_iter()
+                .find(|prefix| key.starts_with(prefix))
+        })
+    {
+        return Ok(CancelExecution::Rejected(typed_error(
+            ErrorCode::ValidationFailed,
+            format!("adoption keys beginning `{prefix}` are reserved for mission cancellations"),
+        )));
+    }
+    execute(conn, runtime, Target::Occurrence, body, now, None)
+}
+
+/// `occurrence.cancel.v1` under a key the mission layer derived, which
+/// [`execute_occurrence_cancel`] refuses to anyone else.
+pub(crate) fn execute_mission_occurrence_cancel(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    body: Value,
+    now: DateTime<Utc>,
+) -> Result<CancelExecution, String> {
     execute(conn, runtime, Target::Occurrence, body, now, None)
 }
 

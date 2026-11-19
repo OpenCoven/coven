@@ -443,9 +443,12 @@ unadvertised until slice 6.
    a definition revision that is no longer current and active.
 
    A refusal before launch records its profile code on the occurrence.
-   Manual occurrences, including run-now and claimed manual ones, stay
-   refused until the Runtime Authority grant integration for
-   `occurrence.runNow.v1` lands. Settlement reads the terminal-observer keys
+   Manual occurrences of a routine that declares authority, including
+   run-now and claimed manual ones, stay refused until the Runtime Authority
+   grant integration for `occurrence.runNow.v1` lands. A mission's manual
+   occurrence has its own admitted path (#1313): its submit is the one-run
+   owner grant, and it dispatches under Runtime Authority through the trusted
+   adapter (see `coven-automations-missions.md`). Settlement reads the terminal-observer keys
    only when a Runtime Authority run is waiting, so a bad key record never
    stops ordinary settlement. It verifies terminal evidence with those keys,
    so a clean run settles from its own evidence with a signed receipt.

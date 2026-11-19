@@ -18,10 +18,12 @@
 //! with no native tools at all, whose only MCP server is the daemon's scoped
 //! read service. Its descriptor also binds the exact Claude Code versions it
 //! was proven against, the service's tools and policy, and how the launch is
-//! isolated. It is described here so its stream can be classified, but it is
-//! not launchable until the daemon's admission for it lands; `r0-read.1`
-//! stays launchable until missions move to `r0-read.2`. A descriptor never
-//! changes once signed, so `r0-read.1`'s stays byte for byte what it was.
+//! isolated. It is never launched from its arguments alone: only the trusted
+//! launch, under the store gate, starts it, for a routine that declares
+//! authority and for a mission (#1313), which may name no other envelope.
+//! `r0-read.1` stays in [`LAUNCHABLE`] for the arguments-only path. A
+//! descriptor never changes once signed, so `r0-read.1`'s stays byte for
+//! byte what it was.
 
 use std::time::Duration;
 
@@ -307,8 +309,8 @@ pub(crate) fn for_grant(harness: &str, capabilities: &[&str]) -> Option<&'static
 
 /// The scoped read envelope for a grant of exactly `capabilities` on
 /// `harness`. The trusted adapter (coven#857 slice 6) pins this one, so a
-/// routine's file access is its granted scopes and nothing else. Missions
-/// keep [`for_grant`] until they move to `r0-read.2` in their own change.
+/// routine's or a mission's file access is its granted scopes and nothing
+/// else.
 pub(crate) fn for_scoped_grant(
     harness: &str,
     capabilities: &[&str],
@@ -470,7 +472,7 @@ mod tests {
         assert_eq!(
             for_grant("claude", &["analysis.read"]),
             Some(&CLAUDE_R0_READ),
-            "missions move to r0-read.2 in their own change"
+            "the arguments-only path launches only r0-read.1"
         );
         let pinned = projection(|binding| {
             binding["runtime"]["descriptorDigest"]["value"] = json!(digest);
