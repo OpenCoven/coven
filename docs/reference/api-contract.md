@@ -64,6 +64,7 @@ GET /api/v1/health
   "apiVersion": "coven.daemon.v1",
   "covenVersion": "0.4.2",
   "capabilities": {
+    "hostSync": true,
     "sessions": true,
     "events": true,
     "travel": true,
@@ -97,9 +98,9 @@ GET /api/v1/health
 }
 ```
 
-The health `capabilities` object contains all 18 common fields: `sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `eventCursor`, `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`, `sessionClaudeWriteScope`, `afs`, `afsMount`, `afsCommit`, `afsCommitDryRun`, `executionBindingContracts`, `requestAdoptionContracts`, and `sessionPolicyContracts`.
+The health `capabilities` object contains all 19 common fields: `hostSync`, `sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `eventCursor`, `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`, `sessionClaudeWriteScope`, `afs`, `afsMount`, `afsCommit`, `afsCommitDryRun`, `executionBindingContracts`, `requestAdoptionContracts`, and `sessionPolicyContracts`.
 
-Windows adds the optional 19th capability field, `lifecycleShutdown: "observed-workers-v1"`, alongside these 18 common fields. Older Windows daemons and non-Windows daemons omit it. Unknown values or types fail closed and do not permit legacy termination. See [Windows lifecycle shutdown](../API-CONTRACT.md#windows-lifecycle-shutdown) for owner validation, the required `202` acknowledgement, and the explicit `404`/`405` legacy-only fallback.
+Windows adds the optional 20th capability field, `lifecycleShutdown: "observed-workers-v1"`, alongside these 19 common fields. Older Windows daemons and non-Windows daemons omit it. Unknown values or types fail closed and do not permit legacy termination. See [Windows lifecycle shutdown](../API-CONTRACT.md#windows-lifecycle-shutdown) for owner validation, the required `202` acknowledgement, and the explicit `404`/`405` legacy-only fallback.
 
 `sessionPolicyContracts` is `["coven.session-policy.v1"]` only over owner-local
 IPC and `[]` over TCP. It advertises a refusal-only admission boundary, not an
@@ -176,3 +177,7 @@ See [Error envelope](/daemon/error-envelope) for the full code list.
 - [API reference](/reference/api)
 
 `sessionClaudeWriteScope` is owner-local only and advertises the separate Claude `writeScope` v1 request shape; it is false over TCP and does not prove runtime qualification or grant authority. See the [scoped-write contract](../API-CONTRACT.md#claude-scoped-writes-v1) for schema, native-profile restrictions, refusals, and the local `--write-scope` equivalent.
+
+## Host folder sync
+
+The owner-local daemon advertises `hostSync` for folder initialization, connection, reconciliation, status, watch and conflict resolution. `coven host sync` waits for a daemon-owned run to finish. `coven host serve` runs the peer independently. The full API contract documents request bodies, run tickets and watch lifetime. [Host routes](/API-CONTRACT#host-folder-sync)

@@ -17,6 +17,7 @@
 //! See the crate README for the compatibility policy and a usage example.
 mod discovery;
 mod error;
+pub mod host;
 mod http;
 #[cfg(unix)]
 mod lifecycle;

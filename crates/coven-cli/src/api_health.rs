@@ -47,6 +47,8 @@ fn build_identity(descriptor: &str) -> &str {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthCapabilities {
+    #[serde(default)]
+    pub host_sync: bool,
     pub sessions: bool,
     pub events: bool,
     pub travel: bool,
@@ -166,6 +168,7 @@ pub(crate) fn health_response_for_authority(
         api_version: COVEN_API_NAMED_VERSION.to_string(),
         coven_version: coven_version().to_string(),
         capabilities: HealthCapabilities {
+            host_sync: authority == RequestAuthority::OwnerLocalIpc,
             sessions: true,
             events: true,
             travel: true,
@@ -281,6 +284,9 @@ mod tests {
             json!(true)
         );
         assert_eq!(tcp["capabilities"]["sessionClaudeWriteScope"], json!(false));
+        assert_eq!(owner["capabilities"]["hostSync"], json!(true));
+        assert_eq!(tcp["capabilities"]["hostSync"], json!(false));
+        tcp["capabilities"]["hostSync"] = json!(true);
         tcp["capabilities"]["sessionClaudeWriteScope"] = json!(true);
         tcp["capabilities"]["sessionLaunchPolicy"] = json!(true);
         tcp["capabilities"]["sessionPolicyContracts"] =
@@ -293,6 +299,7 @@ mod tests {
         let owner_local = health_response_for_authority(None, RequestAuthority::OwnerLocalIpc);
         let tcp = health_response_for_authority(None, RequestAuthority::Tcp);
         let mut expected_tcp = owner_local.clone();
+        expected_tcp.capabilities.host_sync = false;
         expected_tcp.capabilities.session_launch_policy = false;
         expected_tcp.capabilities.session_claude_write_scope = false;
         expected_tcp.capabilities.session_policy_contracts.clear();
@@ -316,6 +323,7 @@ mod tests {
         let capabilities = payload["capabilities"]
             .as_object_mut()
             .expect("capabilities object");
+        capabilities.remove("hostSync");
         capabilities.remove("afsCommitDryRun");
         capabilities.remove("sessionLaunchPolicy");
         capabilities.remove("executionBindingContracts");
@@ -323,6 +331,7 @@ mod tests {
         capabilities.remove("sessionPolicyContracts");
 
         let decoded: HealthResponse = serde_json::from_value(payload)?;
+        assert!(!decoded.capabilities.host_sync);
         assert!(!decoded.capabilities.afs_commit_dry_run);
         assert!(!decoded.capabilities.session_launch_policy);
         assert!(decoded.capabilities.execution_binding_contracts.is_empty());

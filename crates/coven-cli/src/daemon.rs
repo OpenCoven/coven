@@ -259,6 +259,7 @@ fn recover_startup_after_launch_error(
 
 #[derive(Default)]
 pub struct LiveSessionRuntime {
+    host_worker: Option<crate::host_sync::Worker>,
     coven_home: Option<PathBuf>,
     event_writer: Option<crate::event_writer::EventWriter>,
     sessions: Arc<Mutex<HashMap<String, LiveSessionHandle>>>,
@@ -684,6 +685,7 @@ impl LiveSessionRuntime {
     pub fn try_with_coven_home(coven_home: PathBuf) -> Result<Self> {
         let event_writer = crate::event_writer::EventWriter::start(coven_home.clone())?;
         Ok(Self {
+            host_worker: Some(crate::host_sync::Worker::new(&coven_home)),
             coven_home: Some(coven_home),
             event_writer: Some(event_writer),
             sessions: Arc::default(),
@@ -1022,6 +1024,9 @@ impl LiveSessionRuntime {
     }
 
     fn shutdown_all_before(&self, outer_deadline: Option<Instant>) -> Result<()> {
+        if let Some(worker) = &self.host_worker {
+            worker.stop();
+        }
         self.shutting_down.store(true, Ordering::Release);
         // No prompt bytes are delivered while an admission remains in this
         // gate. Closing it makes every pre-registration launcher either fail
@@ -1244,6 +1249,10 @@ fn ensure_dir_trusted_in_config(config_path: &std::path::Path, dir: &str) {
 static CLAUDE_JSON_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl SessionRuntime for LiveSessionRuntime {
+    fn host_worker(&self) -> Option<&crate::host_sync::Worker> {
+        self.host_worker.as_ref()
+    }
+
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
         self.launch_session_inner(launch, None, None, false)
     }
