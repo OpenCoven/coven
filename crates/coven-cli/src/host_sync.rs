@@ -20,11 +20,11 @@ const MAX_QUEUED: usize = 32;
 type Outcome = std::result::Result<Value, String>;
 
 pub struct Worker {
-    home: PathBuf,
     shared: Arc<Shared>,
 }
 
 struct Shared {
+    home: PathBuf,
     state_dir: PathBuf,
     jobs: Mutex<Jobs>,
     wake: Condvar,
@@ -135,8 +135,8 @@ impl Worker {
 
     fn with_state(home: &Path, state_dir: PathBuf) -> Self {
         Self {
-            home: home.to_owned(),
             shared: Arc::new(Shared {
+                home: home.to_owned(),
                 state_dir,
                 jobs: Mutex::default(),
                 wake: Condvar::new(),
@@ -156,7 +156,10 @@ impl Worker {
             self.shared.state_dir.is_absolute(),
             "daemon host state must be an absolute path"
         );
-        Ok(coven_host::Client::new(&self.shared.state_dir))
+        Ok(coven_host::Client::for_profile(
+            &self.shared.state_dir,
+            &self.shared.home,
+        ))
     }
 
     fn configure(&self, apply: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -269,10 +272,14 @@ fn reconcile(shared: &Shared) {
         let is_sync = matches!(task, Task::Sync);
         jobs.current = Some(Running { id, sync: is_sync });
         drop(jobs);
-        let outcome =
-            std::panic::catch_unwind(|| task.perform(coven_host::Client::new(&shared.state_dir)))
-                .map_err(|_| "host worker panicked; inspect status before retrying".to_owned())
-                .and_then(|result| result.map_err(|err| format!("{err:#}")));
+        let outcome = std::panic::catch_unwind(|| {
+            task.perform(coven_host::Client::for_profile(
+                &shared.state_dir,
+                &shared.home,
+            ))
+        })
+        .map_err(|_| "host worker panicked; inspect status before retrying".to_owned())
+        .and_then(|result| result.map_err(|err| format!("{err:#}")));
         jobs = shared.jobs.lock().unwrap_or_else(|err| err.into_inner());
         jobs.current = None;
         if is_sync {
@@ -335,7 +342,7 @@ fn dispatch(worker: &Worker, method: &str, route: &str, body: Option<&str>) -> R
         ("POST", "/host/init") => {
             let input: HostInit = decode(body)?;
             let root = physical_path(&input.root)?;
-            let home = physical_path(&worker.home)?;
+            let home = physical_path(&worker.shared.home)?;
             ensure!(
                 !root.starts_with(&home) && !home.starts_with(&root),
                 "keep the daemon home and Castle folder separate"
@@ -423,6 +430,34 @@ pub(crate) fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn castle_ownership_survives_daemon_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let root = base.join("castle");
+        let worker = |name: &str| {
+            let home = base.join(name);
+            Worker::with_state(&home, home.join("host"))
+        };
+        let init = |worker: &Worker| {
+            let body = json!({"root": root}).to_string();
+            dispatch(worker, "POST", "/host/init", Some(&body))
+        };
+        let owner = worker("owner");
+        let competitor = worker("competitor");
+        init(&owner).unwrap();
+        assert!(
+            init(&competitor).is_err(),
+            "second profile claimed live root"
+        );
+        drop(owner);
+        assert!(
+            init(&competitor).is_err(),
+            "second profile claimed stopped root"
+        );
+        init(&worker("owner")).unwrap();
+    }
 
     #[test]
     fn shutdown_stays_available_while_host_configuration_is_blocked() {
