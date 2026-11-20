@@ -3719,9 +3719,10 @@ fn mark_unconfirmed_stop(
 
 /// Whether settlement may apply the deadline rule behind a run's own expired
 /// timeout fence (#1489): only in the shape where holding the run for
-/// recovery would have succeeded, with exactly one active attempt bound to
-/// the fenced session and a live occurrence, and with a deadline settlement
-/// can read. Any other shape keeps the unknown-stop path and its refusals.
+/// recovery would have succeeded, with exactly one active attempt, which is
+/// the run's latest attempt (the one settlement updates) and is bound to the
+/// fenced session, a live occurrence, and a deadline settlement can read. Any
+/// other shape keeps the unknown-stop path and its refusals.
 fn deadline_rule_reaches(
     conn: &Connection,
     run_id: &str,
@@ -3735,8 +3736,15 @@ fn deadline_rule_reaches(
         "SELECT (
              SELECT COUNT(*) FROM automation_attempts
              WHERE run_id = ?1 AND state IN ('dispatching', 'started', 'observing')
-               AND (session_id = ?2 OR (state = 'dispatching' AND session_id IS NULL))
          ) = 1
+         AND EXISTS (
+             SELECT 1 FROM automation_attempts AS a
+             WHERE a.run_id = ?1 AND a.state IN ('dispatching', 'started', 'observing')
+               AND (a.session_id = ?2 OR (a.state = 'dispatching' AND a.session_id IS NULL))
+               AND a.attempt_number = (
+                   SELECT MAX(attempt_number) FROM automation_attempts WHERE run_id = ?1
+               )
+         )
          AND EXISTS (
              SELECT 1 FROM automation_occurrences o
              JOIN automation_runs r ON r.occurrence_id = o.id
@@ -10686,6 +10694,84 @@ mod tests {
                 "{status}: no operator action is signalled"
             );
         }
+    }
+
+    #[test]
+    fn expired_timeout_fence_keeps_the_deadline_rule_off_a_newer_attempt_elsewhere() {
+        // Two live attempts: the older one on the fenced session and a newer
+        // one bound to another session. Settlement updates the newer one, so
+        // the deadline rule must not reach it through the older one's fence.
+        let (_temp, conn) = temp_store();
+        let routine = definition("expired-timeout-two-attempts");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc::now();
+        let outcome =
+            run_routine_now(&conn, &crate::api::NoopSessionRuntime, &routine, now).unwrap();
+        let session = outcome.session_id.as_deref().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TEMP TABLE other_session AS SELECT * FROM sessions WHERE id = '{session}';
+             UPDATE other_session SET id = 'other-session';
+             INSERT INTO sessions SELECT * FROM other_session;
+             CREATE TEMP TABLE newer_attempt AS
+                 SELECT * FROM automation_attempts WHERE run_id = '{run}';
+             UPDATE newer_attempt SET id = 'newer-attempt', attempt_number = 2,
+                 prior_attempt_number = 1, prior_disposition = 'failed',
+                 adoption_key = 'newer-attempt-key', session_id = 'other-session',
+                 state = 'started';
+             INSERT INTO automation_attempts SELECT * FROM newer_attempt;",
+            run = outcome.run_id
+        ))
+        .unwrap();
+        let past_deadline = now + chrono::Duration::minutes(31);
+        assert!(matches!(
+            claim_stop_fence(
+                &conn,
+                &outcome.run_id,
+                session,
+                "timeout",
+                None,
+                None,
+                past_deadline
+            )
+            .unwrap(),
+            StopFenceClaim::Acquired
+        ));
+        crate::store::update_session_terminal_if_active(
+            &conn,
+            session,
+            "killed",
+            None,
+            &past_deadline.to_rfc3339(),
+        )
+        .unwrap();
+        // Whatever the unknown-stop path decides, it must not settle the
+        // newer attempt by the older attempt's deadline.
+        let _ = settle_finished_runs(&conn, past_deadline + chrono::Duration::seconds(31));
+        let newer: String = conn
+            .query_row(
+                "SELECT state FROM automation_attempts WHERE id = 'newer-attempt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(newer, "started");
+        let timed_out: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_attempts
+                 WHERE run_id = ?1 AND state = 'timed_out'",
+                [&outcome.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(timed_out, 0);
+        let run_status: String = conn
+            .query_row(
+                "SELECT status FROM automation_runs WHERE id = ?1",
+                [&outcome.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_status, "running");
     }
 
     #[test]
