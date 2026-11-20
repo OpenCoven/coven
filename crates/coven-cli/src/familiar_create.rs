@@ -817,7 +817,9 @@ mod tests {
         let home = dir.path();
         for broken in [
             "not = [valid".as_bytes(),
-            b"[[familiar]]\nid = \"sage\"\n",
+            // Only `id` is required (#1800); an entry without it is invalid.
+            b"[[familiar]]\ndisplay_name = \"Sage\"\n",
+            b"[[familiar]]\nid = 7\n",
             b"[familiar]\nid = \"sage\"\n",
             &[0xff, 0xfe],
             // Parses, but appending a [[familiar]] table would not.
@@ -830,6 +832,27 @@ mod tests {
             assert_eq!(fs::read(roster(home)).unwrap(), broken);
             assert!(!home.join("workspaces").exists());
         }
+    }
+
+    // #1800: coven-code writes entries with only `id`; creating another
+    // familiar beside one keeps its bytes and appends after it.
+    #[test]
+    fn appends_after_an_id_only_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let existing = "[[familiar]]\nid = \"sage\"\n";
+        fs::write(roster(home), existing).unwrap();
+
+        create(home, &request("Astra")).unwrap();
+
+        let after = fs::read_to_string(roster(home)).unwrap();
+        assert!(after.starts_with(existing), "{after}");
+        let ids: Vec<String> = cockpit_sources::read_familiars(home)
+            .unwrap()
+            .into_iter()
+            .map(|familiar| familiar.id)
+            .collect();
+        assert_eq!(ids, ["sage", "astra"]);
     }
 
     #[test]

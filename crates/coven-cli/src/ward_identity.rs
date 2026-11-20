@@ -245,7 +245,13 @@ fn relevant_roster_source(
         };
     };
     let facts = RosterFacts {
-        name: normalize_inline(entry.name.as_deref().unwrap_or(&entry.display_name)),
+        // `name` wins when present (even if blank, as before); otherwise
+        // the display name; a roster with neither offers no name fact.
+        name: entry
+            .name
+            .as_deref()
+            .or(entry.display_name.as_deref())
+            .and_then(normalize_inline),
         person: entry.person.as_deref().and_then(normalize_inline),
         pronouns: entry.pronouns.as_deref().and_then(normalize_inline),
         coven: entry.coven.as_deref().and_then(normalize_inline),
@@ -466,5 +472,35 @@ mod tests {
     fn empty_declared_name_makes_identity_extraction_ambiguous() {
         let identity = parse_identity("# IDENTITY.md - Sage\n- **Name:**\n");
         assert!(identity.name.is_none());
+    }
+
+    // #1800: display_name is optional in the roster. Without `name` or
+    // `display_name` the roster offers no name fact; `name` still wins.
+    #[test]
+    fn roster_name_fact_follows_name_then_display_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let required = BTreeSet::from([IdentityFact::Name]);
+        let name_fact = |roster: &str| {
+            std::fs::write(temp.path().join("familiars.toml"), roster).unwrap();
+            relevant_roster_source(temp.path(), "sage", &required)
+                .facts
+                .expect("one sage entry yields roster facts")
+                .name
+        };
+        assert_eq!(name_fact("[[familiar]]\nid = \"sage\"\n"), None);
+        assert_eq!(
+            name_fact("[[familiar]]\nid = \"sage\"\ndisplay_name = \" Sage  Elder \"\n"),
+            Some("Sage Elder".to_string())
+        );
+        assert_eq!(
+            name_fact(
+                "[[familiar]]\nid = \"sage\"\nname = \"Sagewort\"\ndisplay_name = \"Sage\"\n"
+            ),
+            Some("Sagewort".to_string())
+        );
+        assert_eq!(
+            name_fact("[[familiar]]\nid = \"sage\"\nname = \"\"\ndisplay_name = \"Sage\"\n"),
+            None
+        );
     }
 }

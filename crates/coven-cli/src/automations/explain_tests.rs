@@ -6839,13 +6839,16 @@ fn each_stop_fenced_run_names_what_reconciliation_does_with_it() {
                 [left, left],
             )
         },
+        // Behind its own expired timeout fence, settlement applies the
+        // deadline rule: the timeout took the fence after the deadline, so
+        // the attempt settles timed_out and the fence is released (#1489).
         TimeoutShape {
             session: "completed",
             extra: &[late_fence!("timeout", "2026-10-22T09:59:00.000Z")],
             ..fenced(
                 "finished-timeout-expired",
                 NextStep::AwaitSettlement,
-                [held, held],
+                [Some("failed/timed_out/none"), Some("failed/timed_out/none")],
             )
         },
         TimeoutShape {

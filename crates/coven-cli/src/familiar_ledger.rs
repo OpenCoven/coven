@@ -281,9 +281,9 @@ pub(crate) fn read_declarations(
 fn roster_fields(roster: &RosterIdentity) -> Value {
     let mut fields = Map::new();
     fields.insert("id".into(), json!(roster.id));
-    fields.insert("displayName".into(), json!(roster.display_name));
-    fields.insert("role".into(), json!(roster.role));
     for (key, value) in [
+        ("displayName", &roster.display_name),
+        ("role", &roster.role),
         ("name", &roster.name),
         ("pronouns", &roster.pronouns),
         ("person", &roster.person),
@@ -1566,6 +1566,32 @@ pub(crate) mod tests {
         let declarations = read_declarations(home.path(), "sage").unwrap().unwrap();
         assert_eq!(declarations.components().len(), 2);
         assert!(!head_is_current(home.path(), &head).unwrap());
+    }
+
+    // #1800: an entry that leaves out display_name and role records them as
+    // absent, not as synthesized values, and adding them later changes the
+    // declaration digest like any other roster edit.
+    #[test]
+    fn a_sparse_roster_entry_records_only_its_declared_fields() {
+        let home = Home::new();
+        std::fs::write(
+            home.path().join("familiars.toml"),
+            "[[familiar]]\nid = \"sage\"\n",
+        )
+        .unwrap();
+        let sparse = read_declarations(home.path(), "sage").unwrap().unwrap();
+        assert_eq!(sparse.identity["roster"], json!({"id": "sage"}));
+
+        home.roster(&[("sage", "Sage", "")]);
+        let full = read_declarations(home.path(), "sage").unwrap().unwrap();
+        assert_eq!(
+            full.identity["roster"],
+            json!({"id": "sage", "displayName": "Sage", "role": "Research", "pronouns": "she/her"})
+        );
+        assert_ne!(
+            familiar_contract::digest_object(&sparse.identity),
+            familiar_contract::digest_object(&full.identity)
+        );
     }
 
     #[test]

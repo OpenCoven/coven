@@ -15,6 +15,13 @@ yanked = "deny"
 # (`turbovec -> faer`, plus fastembed/tokenizers). RUSTSEC-2024-0436 marks it
 # unmaintained, not vulnerable, and reports no safe upgrade. Keep this scoped
 # here until turbovec/faer/tokenizers move off paste or we replace that stack.
+#
+# `chrono` and `chrono-tz` are direct dependencies of coven-cli (and `chrono`
+# of coven-memory). RUSTSEC-2026-0543 and RUSTSEC-2026-0555 mark every version
+# unmaintained, not vulnerable, and report no safe upgrade. Replacing them is a
+# migration of stored timestamps and the scheduler's time-zone rules, tracked
+# in #1798. Remove both entries in the change that replaces the crates. A
+# vulnerability advisory for either crate has its own ID and still fails here.
 ignore = [
     "RUSTSEC-2024-0436",
     "RUSTSEC-2026-0543",

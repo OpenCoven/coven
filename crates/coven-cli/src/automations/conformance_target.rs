@@ -3984,10 +3984,20 @@ struct SchedulerConformanceClock {
     system: super::daemon_tick::SystemAutomationClock,
     waits: AtomicUsize,
     first_reason: Mutex<Option<super::daemon_tick::WakeReason>>,
+    /// Where the scheduler thread got to, for a join that misses its deadline
+    /// (#1067 row 11). `pass_ended` is set at the second wait, which returns
+    /// shutdown once the wake pass is complete. `shutdown_started` is set at
+    /// the scheduler's next clock read, which is the timestamp argument of its
+    /// shutdown reconciliation; only store work follows it.
+    pass_ended: std::sync::OnceLock<StdInstant>,
+    shutdown_started: std::sync::OnceLock<StdInstant>,
 }
 
 impl super::daemon_tick::AutomationClock for SchedulerConformanceClock {
     fn now_utc(&self) -> DateTime<Utc> {
+        if self.pass_ended.get().is_some() {
+            let _ = self.shutdown_started.set(StdInstant::now());
+        }
         self.now
     }
 
@@ -4002,6 +4012,7 @@ impl super::daemon_tick::AutomationClock for SchedulerConformanceClock {
         observed_generation: u64,
     ) -> super::daemon_tick::WakeReason {
         if self.waits.fetch_add(1, Ordering::SeqCst) != 0 {
+            let _ = self.pass_ended.set(StdInstant::now());
             return super::daemon_tick::WakeReason::Shutdown;
         }
         let reason = super::daemon_tick::AutomationClock::sleep_until_or_wake(
@@ -4113,6 +4124,8 @@ fn startup_reconciliation_wake_case_in_home(
         )),
         waits: AtomicUsize::new(0),
         first_reason: Mutex::new(None),
+        pass_ended: std::sync::OnceLock::new(),
+        shutdown_started: std::sync::OnceLock::new(),
     });
     let handle = observed!(
         SchedulerStart,
@@ -4203,14 +4216,25 @@ fn startup_reconciliation_wake_case_in_home(
         );
     }
     // Keep the joined scheduler home alive through the final store assertions.
-    let _scheduler_home = finish_startup_reconciliation_scheduler(
+    let finished = finish_startup_reconciliation_scheduler(
         handle,
         scheduler_home,
         synchronization_deadline,
         trace,
         #[cfg(test)]
         || {},
-    )?;
+    );
+    // Read after the joins: an unjoined thread may still set a marker later,
+    // and only what it had reached by then explains the missed deadline.
+    trace.marker(
+        StartupWakePhase::SchedulerPassEnd,
+        clock.pass_ended.get().copied(),
+    );
+    trace.marker(
+        StartupWakePhase::SchedulerShutdownStart,
+        clock.shutdown_started.get().copied(),
+    );
+    let _scheduler_home = finished?;
 
     let first_wait_reason = *clock
         .first_reason

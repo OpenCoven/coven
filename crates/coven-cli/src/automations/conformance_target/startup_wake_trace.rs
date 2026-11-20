@@ -37,6 +37,8 @@ labels!(StartupWakePhase {
     CleanupDeadline => "cleanup-deadline-created",
     CleanupJoin => "cleanup-join",
     RetainHome => "retain-home",
+    SchedulerPassEnd => "scheduler-pass-end",
+    SchedulerShutdownStart => "scheduler-shutdown-start",
     StoreOpenFinal => "store-open-final",
     OccurrenceQuery => "occurrence-query",
     LastPassQuery => "last-pass-query",
@@ -62,6 +64,8 @@ labels!(StartupWakeOutcome {
     DeadlineExpired => "deadline-expired",
     WorkerPanic => "worker-panic",
     OtherJoinError => "other-join-error",
+    Reached => "reached",
+    NotReached => "not-reached",
 });
 
 struct Record {
@@ -95,15 +99,24 @@ impl StartupWakeTrace {
     }
 
     fn record(&mut self, phase: StartupWakePhase, outcome: StartupWakeOutcome, value: Option<u64>) {
+        self.record_at(phase, outcome, value, Instant::now());
+    }
+
+    fn record_at(
+        &mut self,
+        phase: StartupWakePhase,
+        outcome: StartupWakeOutcome,
+        value: Option<u64>,
+        now: Instant,
+    ) {
         if self.records.len() == MAX_RECORDS {
             self.overflow = true;
             return;
         }
-        let now = Instant::now();
         self.records.push(Record {
             phase,
             outcome,
-            elapsed_us: now.duration_since(self.started).as_micros(),
+            elapsed_us: now.saturating_duration_since(self.started).as_micros(),
             remaining_us: self
                 .deadline
                 .map(|deadline| deadline.saturating_duration_since(now).as_micros()),
@@ -117,6 +130,15 @@ impl StartupWakeTrace {
 
     pub(super) fn value(&mut self, phase: StartupWakePhase, value: u64) {
         self.record(phase, StartupWakeOutcome::Ok, Some(value));
+    }
+
+    /// Records when another thread reached a point, timed at that moment and
+    /// not when it is read, or that it had not reached it.
+    pub(super) fn marker(&mut self, phase: StartupWakePhase, reached_at: Option<Instant>) {
+        match reached_at {
+            Some(at) => self.record_at(phase, StartupWakeOutcome::Reached, None, at),
+            None => self.event(phase, StartupWakeOutcome::NotReached),
+        }
     }
 
     pub(super) fn set_deadline(&mut self, phase: StartupWakePhase, deadline: Instant) {
@@ -413,6 +435,55 @@ mod tests {
         assert!(report.contains("phase=cleanup-join outcome=ok"), "{report}");
         assert!(!report.contains("phase=retain-home"), "{report}");
         assert!(!path.exists(), "joined worker home was not removed");
+    }
+
+    #[test]
+    fn markers_report_when_a_point_was_reached_not_when_it_was_read() {
+        let mut trace = trace();
+        let started = trace.started;
+        trace.event(StartupWakePhase::FirstJoin, StartupWakeOutcome::Begin);
+        trace.marker(StartupWakePhase::SchedulerPassEnd, Some(started));
+        trace.marker(StartupWakePhase::SchedulerShutdownStart, None);
+        let report = trace
+            .failure_report(&Err("conformance suite execution failed"))
+            .unwrap();
+        assert!(
+            report.contains("phase=scheduler-pass-end outcome=reached elapsed_us=0 "),
+            "{report}"
+        );
+        assert!(
+            report.contains("phase=scheduler-shutdown-start outcome=not-reached"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn real_definition_change_case_marks_where_the_scheduler_thread_got_to() {
+        let vectors: super::super::StartupReconciliationWakeVectorSet = serde_json::from_str(
+            include_str!("../../../../../conformance/automations/runner/startup-reconciliation-wake.vectors.json"),
+        )
+        .unwrap();
+        let case = &vectors.cases[1];
+        let mut trace = StartupWakeTrace::new(case.scenario);
+        assert_eq!(trace.scenario, "definition-change");
+        let home = tempfile::tempdir().unwrap();
+        let result = super::super::startup_reconciliation_wake_case_in_home(case, home, &mut trace);
+        assert_eq!(result, Ok(true));
+        let at = |phase: &str, outcome: &str| {
+            trace
+                .records
+                .iter()
+                .find(|record| record.phase.label() == phase && record.outcome.label() == outcome)
+                .map(|record| record.elapsed_us)
+        };
+        let pass_end = at("scheduler-pass-end", "reached").expect("wake pass end not marked");
+        let shutdown =
+            at("scheduler-shutdown-start", "reached").expect("shutdown reconciliation not marked");
+        let joined = at("first-join", "ok").expect("scheduler did not join");
+        // The real scheduler reaches both points, in order, before it can be
+        // joined, so a missed join names which side of them it was stuck on.
+        assert!(pass_end <= shutdown, "{pass_end} > {shutdown}");
+        assert!(shutdown <= joined, "{shutdown} > {joined}");
     }
 
     #[test]

@@ -359,8 +359,8 @@ fn expected_for(scene: Scene, boundary: Boundary) -> Expected {
     // cancellation reserved before the deadline is rejected. A cancellation's
     // unconfirmed stop needs recovery, and the same pass settles the
     // ambiguous run on its ended session and releases the fence. The
-    // timeout's expired fence settles the attempt ambiguous and needs
-    // recovery; the next pass settles the run and releases the fence (#1461).
+    // timeout's expired fence settles the run by the deadline rule, as the
+    // restart would have with no fence, and releases the fence (#1489).
     let (run_after_pass, cancellation_after_pass, resend, run_after_settle) = match (scene, stage) {
         (Scene::Cancellation, Stage::Untouched) => (
             Run::EndedAfterDeadline,
@@ -387,10 +387,10 @@ fn expected_for(scene: Scene, boundary: Boundary) -> Expected {
             Run::Cancelled,
         ),
         (Scene::Timeout, Stage::Fenced | Stage::Stopped) => (
-            Run::Ambiguous,
+            Run::EndedAfterDeadline,
             Cancellation::Refused,
             Answer::Rejected,
-            Run::FailedAfterTimeout,
+            Run::EndedAfterDeadline,
         ),
         // The run was already timed out: nothing is left to reconcile.
         (Scene::Timeout, _) => (
@@ -1769,7 +1769,7 @@ mod tests {
                 Scene::Timeout,
                 Boundary::AfterStop,
                 Some(&[PASS]),
-                Run::Ambiguous,
+                Run::EndedAfterDeadline,
                 "UPDATE automation_occurrences SET failure_reason =
                  'terminal session evidence observed after an ambiguous stop outcome'",
             ),
@@ -1784,8 +1784,8 @@ mod tests {
                 Scene::Timeout,
                 Boundary::AfterStop,
                 Some(&[PASS, SETTLE]),
-                Run::FailedAfterTimeout,
-                "UPDATE automation_occurrences SET state = 'recovery_required'",
+                Run::EndedAfterDeadline,
+                "UPDATE automation_attempts SET failure_class = 'ambiguous_evidence'",
             ),
         ];
         for (scene, boundary, passes, whole, sql) in cases {

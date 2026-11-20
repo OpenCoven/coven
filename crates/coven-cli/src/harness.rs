@@ -21,6 +21,8 @@ pub struct HarnessSummary {
     pub available: bool,
     pub install_hint: String,
     pub capabilities: Capabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_budget: Option<crate::run_budget::Adapter>,
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_path: Option<String>,
@@ -141,6 +143,8 @@ pub struct HarnessLaunchOptions<'a> {
     pub model: Option<&'a str>,
     pub think: bool,
     pub speed: Option<HarnessSpeed>,
+    /// Explicit finite model-round allowance, never a prompt-text hint.
+    pub max_turns: Option<u32>,
     /// Sandbox/permission policy. `None` leaves the harness at its default
     /// (equivalent to `Full`); `Some(_)` forwards the harness's native
     /// sandbox flag when the spec declares one. `Option<Permission>` stays
@@ -399,6 +403,17 @@ impl ContinuityArgs {
 }
 
 impl HarnessCommandSpec {
+    /// The built-in engine adapter declares the additive contract; actual
+    /// executable support is negotiated independently before launch.
+    pub fn run_budget(&self) -> Option<crate::run_budget::Adapter> {
+        (self.id == crate::engine::ENGINE_HARNESS_ID && self.source == "bundled").then_some(
+            crate::run_budget::Adapter {
+                version: 1,
+                flag: "--max-turns",
+            },
+        )
+    }
+
     /// Whether this harness declares any way to take a model selection.
     /// Adapters that declare none make `coven run --model` a warned no-op.
     pub fn supports_model(&self) -> bool {
@@ -560,7 +575,9 @@ pub fn built_in_harnesses() -> Vec<HarnessSummary> {
 
 impl HarnessSummary {
     fn from_spec(spec: HarnessCommandSpec) -> Self {
+        let run_budget = spec.run_budget();
         Self {
+            run_budget,
             available: harness_available(&spec.executable),
             id: spec.id,
             label: spec.label,
@@ -2118,7 +2135,14 @@ fn command_parts_with_specs(
     // that declare no add-dir mechanism yield no args (the run layer warns).
     let add_dir_args: Vec<String> = spec.add_dir_args(options.add_dirs);
     let launch_policy_args = launch_policy_args(harness_id, mode, options)?;
-    let launch_option_args = launch_option_args(harness_id, options);
+    let mut launch_option_args = launch_option_args(harness_id, options);
+    if let Some(limit) = options.max_turns {
+        let declared = spec
+            .run_budget()
+            .context("Adapter does not support explicit model-round budgets")?;
+        anyhow::ensure!(limit > 0, "Model-round budget must be positive and finite");
+        launch_option_args.extend([declared.flag.to_owned(), limit.to_string()]);
+    }
 
     // Resolve effective prompt: inject familiar identity preamble when present.
     // Harnesses with a dedicated --system-prompt flag get identity there instead,

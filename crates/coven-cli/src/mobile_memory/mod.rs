@@ -770,6 +770,10 @@ mod connection_probe_tests {
                         Err(error) => panic!("fixture accept failed: {error}"),
                     }
                 };
+                // On macOS the accepted socket inherits the listener's
+                // non-blocking mode (#1776), which makes the read below return
+                // WouldBlock before the request arrives and ignore its timeout.
+                stream.set_nonblocking(false).unwrap();
                 // Hang guard for a broken request producer, far above the probe budget.
                 stream
                     .set_read_timeout(Some(Duration::from_secs(30)))
