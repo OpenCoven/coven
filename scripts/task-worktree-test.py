@@ -65,6 +65,49 @@ class AllocationTests(GitFixture):
         self.assertEqual(marker.read_text(), 'preserve')
         self.assertNotIn('fix/42', self.git('branch', '--format=%(refname:short)'))
 
+    # A tag that shares a branch's name makes Git abbreviate that branch to
+    # `heads/<name>` and makes the bare name resolve to the tag, so canonical
+    # refs must be matched and resolved by full name.
+
+    def test_main_is_not_a_task_branch_when_a_tag_shares_its_name(self):
+        self.git('tag', 'main')
+        result = self.run_tool('inventory')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['counts']['local branches'], 0)
+
+    def test_main_tag_does_not_consume_the_last_local_slot(self):
+        self.git('tag', 'main')
+        for n in range(32):
+            self.git('branch', f'held/{n}', 'refs/heads/main')
+        result = self.run_tool('check')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.git('branch', 'held/next', 'refs/heads/main')
+        result = self.run_tool('check')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('local branches: 33 > 32', result.stderr)
+
+    def test_symbolic_origin_head_does_not_consume_the_last_remote_slot(self):
+        self.git('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main')
+        for n in range(48):
+            self.git('update-ref', f'refs/remotes/origin/held/{n}', 'HEAD')
+        result = self.run_tool('check')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.git('update-ref', 'refs/remotes/origin/held/next', 'HEAD')
+        result = self.run_tool('check')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('origin branches: 49 > 48', result.stderr)
+
+    def test_create_starts_at_the_origin_main_tracking_ref_not_a_same_named_tag(self):
+        self.git('commit', '--allow-empty', '-m', 'not origin main')
+        self.git('tag', 'origin/main')
+        destination = self.root / 'task'
+        result = self.run_tool('create', '--issue', '42', '--branch', 'fix/42', '--path', str(destination))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git('rev-parse', 'refs/heads/fix/42'),
+                         self.git('rev-parse', 'refs/remotes/origin/main'))
+        self.assertNotEqual(self.git('rev-parse', 'refs/heads/fix/42'),
+                            self.git('rev-parse', 'refs/tags/origin/main'))
+
     def test_origin_cap_refuses_even_with_local_capacity(self):
         for n in range(49):
             self.git('update-ref', f'refs/remotes/origin/held/{n}', 'HEAD')

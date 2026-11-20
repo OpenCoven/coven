@@ -17,7 +17,10 @@ def git(*args):
 
 def inventory():
     worktrees = git('worktree', 'list', '--porcelain').split('\n\n')
-    local = git('for-each-ref', '--format=%(refname:short)', 'refs/heads').splitlines()
+    # Full names throughout: a tag named like a branch makes Git abbreviate
+    # refs/heads/main to `heads/main`, and refs/remotes/origin/HEAD is always
+    # abbreviated to `origin`, so short names miscount the canonical refs.
+    local = git('for-each-ref', '--format=%(refname)', 'refs/heads').splitlines()
     # Remote names may contain slashes, so match whole namespace prefixes. A
     # tracking ref outside origin and every configured remote has no owner
     # that a fetch --prune would ever reconcile.
@@ -29,9 +32,7 @@ def inventory():
     tracking = git('for-each-ref', '--format=%(refname)', 'refs/remotes').splitlines()
     return {
         'task worktrees': max(0, len(worktrees) - 1),
-        'local branches': len([b for b in local if b != 'main']),
-        # Full names: Git abbreviates refs/remotes/origin/HEAD to `origin`, so
-        # short names would count the symbolic HEAD as a branch.
+        'local branches': len([ref for ref in local if ref != 'refs/heads/main']),
         'origin branches': len([ref for ref in tracking if ref.startswith('refs/remotes/origin/')
                                 and ref not in ('refs/remotes/origin/main', 'refs/remotes/origin/HEAD')]),
         'stray remote refs': len([ref for ref in tracking if not ref.startswith(owned)]),
@@ -75,9 +76,12 @@ def create(args):
         if os.path.lexists(destination):
             raise ValueError('destination already exists; preserve it and inspect ownership')
         subprocess.run(['git', 'check-ref-format', '--branch', args.branch], check=True, stdout=subprocess.DEVNULL)
-        subprocess.run(['git', 'rev-parse', '--verify', 'origin/main^{commit}'], check=True, stdout=subprocess.DEVNULL)
+        # The full tracking ref: a bare `origin/main` would resolve to a tag of
+        # that name first.
+        start = 'refs/remotes/origin/main'
+        subprocess.run(['git', 'rev-parse', '--verify', start + '^{commit}'], check=True, stdout=subprocess.DEVNULL)
         check(inventory(), creating=True)
-        subprocess.run(['git', 'worktree', 'add', '--no-track', '-b', args.branch, str(destination), 'origin/main'], check=True)
+        subprocess.run(['git', 'worktree', 'add', '--no-track', '-b', args.branch, str(destination), start], check=True)
         print(f'Created issue-{args.issue} task worktree. Enter it, then run: coven claim acquire issue-{args.issue}')
 
 
