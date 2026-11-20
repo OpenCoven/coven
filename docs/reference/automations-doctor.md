@@ -248,13 +248,20 @@ before any cancellation gap.
 
 Settlement skips a run that holds a fence while its attempt is not `ambiguous`,
 so a run whose session has already ended can still count as running in `queue`.
-One case moves: once a `timeout` or `recovery` fence's lease has expired over a
-session that has ended, the next pass marks the attempt `ambiguous` and the
-occurrence `recovery_required`. That records an unknown stop outcome, not a
-confirmed one. An expired `cancellation` fence is left to the cancellation
-reconciler instead. A fence is released when its owner settles the run, when a
-later settlement finishes the run's `ambiguous` attempt, whoever owns the
-fence, or when `occurrence.recover.v1` records a determination for that run. An
+Two cases move once a fence's lease has expired over a session that has ended.
+An expired `timeout` fence settles by the deadline rule: the timeout takes its
+fence only after the deadline, so the next pass settles the attempt
+`timed_out` and the run and occurrence `failed`, and releases the fence in the
+same transaction, wherever holding the run for recovery would succeed and its
+deadline can be read; otherwise it takes the `recovery` path. An expired
+`recovery` fence makes the next pass mark the
+attempt `ambiguous` and the occurrence `recovery_required`. That records an
+unknown stop outcome, not a confirmed one. An expired `cancellation` fence is
+left to the cancellation reconciler instead. A fence is released when its
+owner settles the run, when an expired `timeout` fence's run settles by the
+deadline rule, when a later settlement finishes the run's `ambiguous` attempt,
+whoever owns the fence, or when `occurrence.recover.v1` records a determination
+for that run. An
 expired fence can therefore still be counted beside an occurrence that already
 needs recovery. A lease the scheduler cannot read fails its settlement step
 when it reaches that run's fence, which leaves later runs unsettled and that
@@ -762,7 +769,7 @@ categories can still help investigate, but cannot fill the missing category.
 | Running runs with ended sessions, or with a failed latest attempt | Compare with a report from after the next scheduler pass. If the count persists, read `last_successful_pass` and `coven automations status --json` for a failing settlement step, and `leases_fences` for a stop fence. Then inspect the known run and its attempts. A run held for retry settles failed at its deadline unless `attempt.retry.v1` (`coven automations retry`) opens a retry first, and the command refuses a run past its deadline, behind a fence or at its last attempt; do not retry on this count alone. |
 | Running runs with an ambiguous latest attempt | Compare with a report from after the next scheduler pass. A plain run clears once its session has ended and no cancellation of that attempt is pending; read `pending_cancellations`. A run that stays counted, or one with an authority profile, needs the supported recovery path: inspect the known occurrence, run and attempts. `occurrence.recover.v1` refuses a run with a pending cancellation, and refuses a Runtime Authority run with `AUTHORITY_REQUIRED`. |
 | Pending owner cancellations, active or expired | Inspect the known run and its attempts, and read `running_runs_with_ambiguous_latest_attempt`: settlement waits for a pending cancellation before it finishes an ambiguous attempt. The reconciler renews and finishes an expired one on its next pass, so an expired count that persists means it is not reaching it; check `last_successful_pass`. Do not replay or reissue the owner's request to learn its outcome: against an expired lease, a replay carries the cancellation out. Do not edit the row. |
-| Held, expired or unreadable stop fences | Inspect the known run and its attempts. A held fence means a cancellation, a timeout or a recovery owns that run's stop. An expired one means its owner did not finish; check whether the occurrence already needs recovery. An unreadable lease isolates its run: settlement, timeout enforcement and abandoned-launch recovery skip that run, while other runs can settle and results can still be delivered in the same pass. The daemon logs the affected run without echoing the lease; preserve that diagnostic and this report. Do not delete a fence or stop the session again; follow the supported cancellation or `occurrence.recover.v1` path. |
+| Held, expired or unreadable stop fences | Inspect the known run and its attempts. A held fence means a cancellation, a timeout or a recovery owns that run's stop. An expired one means its owner did not finish: an expired timeout fence over an ended session is settled by the next pass by the deadline rule and released, while for another owner check whether the occurrence already needs recovery. An unreadable lease isolates its run: settlement, timeout enforcement and abandoned-launch recovery skip that run, while other runs can settle and results can still be delivered in the same pass. The daemon logs the affected run without echoing the lease; preserve that diagnostic and this report. Do not delete a fence or stop the session again; follow the supported cancellation or `occurrence.recover.v1` path. |
 | Failed attempts, quarantine, or retry exhaustion | Inspect the known occurrence, run and attempts. A retained failure total is not a consecutive failure streak; exhaustion counters are not occurrence-failure counters. Preserve that distinction before assessing repetition or a retry policy. |
 | Pending/failed delivery or inconsistent receipt links | Inspect the known run and attempts, preserving their terminal states and correlation. A reciprocal index link is not authenticated receipt content or proof of the external effect. If delivery outcome is ambiguous, require the supported reconciliation path before another dispatch. |
 | Authority refusal, unsupported authority, or absent identity/approval evidence | Retain the refusal codes and compare the approved authority contract. No recorded refusal does not prove approval-service availability. Permission or provider changes require their existing approval gate. |

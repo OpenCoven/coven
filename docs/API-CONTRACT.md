@@ -1043,6 +1043,11 @@ fence:
   deadline has not passed, from a recovery stop. That pass skips the run while
   the fence is live, and holds it for recovery once it has expired: its attempt
   is marked ambiguous and its occurrence is then listed as `recovery_required`.
+  Settlement of a plain run whose finished session sits behind its own expired
+  timeout fence is the exception wherever holding it would succeed and its
+  deadline can be read: the fence is taken only after the deadline, so the pass
+  settles the attempt `timed_out` and the run and occurrence `failed` by the
+  deadline rule, and releases the fence (#1489).
 - `inspect_run`: no pass ends the fence. It is on another session, left by
   another stop than the one that reaches the run, held under another key than
   the run's requested cancellation, or on a run no pass reaches: one with no

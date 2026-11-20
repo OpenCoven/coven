@@ -1159,14 +1159,11 @@ the enforcement got:
   the run and occurrence `failed`.
 - **The fence committed, with or without the stop, or the settlement
   uncommitted:** the restart's containment marks the session `killed` and
-  leaves the run behind the fence. The pass after the lease takes the expired
-  fence as a stop whose outcome is unknown: the attempt settles `ambiguous` and
-  the occurrence `recovery_required`, and the fence stays. The next pass
-  settles the run and occurrence `failed` on the ended session and releases
-  the fence. That exit from `recovery_required` is the scheduler's
-  `terminal_evidence_after_ambiguous_stop` transition, ratified by #1461.
-  #1489 asks whether an expired `timeout` fence should settle by the deadline
-  instead.
+  leaves the run behind the fence. The pass after the lease settles the run
+  by the deadline rule, as if no fence had committed: a timeout fence is only
+  taken after the deadline, so the session ended after it. The attempt settles
+  `timed_out`, the run and occurrence `failed`, and the fence is released, in
+  one transaction (#1489). The occurrence never waits in `recovery_required`.
 - **The settlement committed,** and the control: the restart changes no row,
   and every pass leaves the run timed out.
 
@@ -1928,12 +1925,10 @@ passes and the requests make.
 - **The timeout fenced, stopped, or inside its settlement:** the restart's
   containment marks the session `killed` behind the timeout's fence. The owner's
   request is refused with `ILLEGAL_TRANSITION`, as no longer cancellable, and
-  leaves the fence alone. The pass after the lease settles the attempt
-  `ambiguous` and the occurrence `recovery_required`, and the second pass
-  settles the run and occurrence `failed` and releases the fence. That exit is
-  the scheduler's `terminal_evidence_after_ambiguous_stop` transition (#1461),
-  and #1489 asks whether an expired `timeout` fence should settle by the
-  deadline instead.
+  leaves the fence alone. The pass after the lease settles the run by the
+  deadline rule, as the restart would have with no fence: the attempt
+  `timed_out`, the run and occurrence `failed`, and the fence released
+  (#1489).
 - **The timeout settled:** the run stays timed out, and every request is
   refused.
 

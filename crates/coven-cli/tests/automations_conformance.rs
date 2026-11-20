@@ -2752,9 +2752,9 @@ fn native_target_evaluates_checked_in_timeout_enforcement_process_crash_vectors(
             _ => "timed_out",
         };
         // Behind the fence, the restart contains the session; the pass after
-        // the fence's lease needs recovery, and the next settles the run.
+        // the fence's lease settles the run by the deadline rule (#1489).
         let (run_after_restart, run_after_pass, run_after_settle) = match stage {
-            "fenced" | "stopped" => ("contained", "ambiguous", "failed"),
+            "fenced" | "stopped" => ("contained", "timed_out", "timed_out"),
             _ => ("timed_out", "timed_out", "timed_out"),
         };
         assert_eq!(observation["boundary"], boundary);
@@ -4220,10 +4220,10 @@ fn native_target_evaluates_checked_in_cancellation_timeout_process_crash_vectors
             0,
             "timeout_contained",
             "refused",
-            "ambiguous",
+            "ended_after_deadline",
             "refused",
             "rejected",
-            "failed_after_timeout",
+            "ended_after_deadline",
         ),
         (
             "timeout",
@@ -4234,10 +4234,10 @@ fn native_target_evaluates_checked_in_cancellation_timeout_process_crash_vectors
             1,
             "timeout_contained",
             "refused",
-            "ambiguous",
+            "ended_after_deadline",
             "refused",
             "rejected",
-            "failed_after_timeout",
+            "ended_after_deadline",
         ),
         (
             "timeout",
@@ -4248,10 +4248,10 @@ fn native_target_evaluates_checked_in_cancellation_timeout_process_crash_vectors
             1,
             "timeout_contained",
             "refused",
-            "ambiguous",
+            "ended_after_deadline",
             "refused",
             "rejected",
-            "failed_after_timeout",
+            "ended_after_deadline",
         ),
         (
             "timeout",
