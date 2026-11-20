@@ -487,7 +487,11 @@ mod tests {
         }
 
         // 2. Edits are granted for the writable roots and nothing else.
-        let settings: Value = serde_json::from_str(values_of("--settings")[0]).unwrap();
+        // Exactly one settings payload, so the one parsed below is the one
+        // Claude applies.
+        let settings = values_of("--settings");
+        assert_eq!(settings.len(), 1, "{settings:?}");
+        let settings: Value = serde_json::from_str(settings[0]).unwrap();
         let keys =
             |value: &Value| -> Vec<String> { value.as_object().unwrap().keys().cloned().collect() };
         assert_eq!(keys(&settings), ["permissions", "sandbox"]);
