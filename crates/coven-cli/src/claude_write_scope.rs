@@ -128,9 +128,7 @@ impl ClaudeWriteScope {
     fn audit_denied_objects(&self) -> Result<()> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
-            const MAX_ENTRIES: usize = 200_000;
-            let mut pending: Vec<PathBuf> = self
+            let roots: Vec<PathBuf> = self
                 .protected_roots
                 .iter()
                 .chain(
@@ -140,29 +138,8 @@ impl ClaudeWriteScope {
                 )
                 .map(PathBuf::from)
                 .collect();
-            let mut visited = BTreeSet::new();
-            while let Some(path) = pending.pop() {
-                if !visited.insert(path.clone()) {
-                    continue;
-                }
-                ensure!(
-                    visited.len() <= MAX_ENTRIES,
-                    "writeScope protected-resource audit exceeds 200000 entries"
-                );
-                let metadata =
-                    fs::symlink_metadata(&path).context("writeScope filesystem audit failed")?;
-                if metadata.is_dir() {
-                    for entry in fs::read_dir(&path).context("writeScope directory audit failed")? {
-                        pending.push(entry?.path());
-                    }
-                } else if metadata.is_file() {
-                    ensure!(
-                        metadata.nlink() == 1,
-                        "writeScope protected or read-only files have hardlink aliases; remove the extra links or narrow the grants"
-                    );
-                }
-            }
-            Ok(())
+            crate::claude_write_scope_audit::audit_denied_objects(&roots)
+                .context("writeScope filesystem audit failed")
         }
         #[cfg(not(unix))]
         anyhow::bail!("writeScope filesystem-object qualification is unavailable on this platform")
@@ -474,6 +451,33 @@ mod tests {
             "a protected object must not become writable through a hardlink name"
         );
         assert_eq!(fs::read_to_string(protected).unwrap(), "protected sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_internal_dependency_aliases_preserve_native_sandbox_denials() {
+        let (_temp, mut value) = fixture();
+        let cwd = PathBuf::from(value["primaryRoot"].as_str().unwrap());
+        let denied = cwd.join("read-only-dependencies");
+        fs::create_dir(&denied).unwrap();
+        fs::write(denied.join("esbuild"), "protected binary").unwrap();
+        fs::hard_link(denied.join("esbuild"), denied.join("package-esbuild")).unwrap();
+        value["readOnlyRoots"] = json!([denied]);
+        let scope = ClaudeWriteScope::from_value(value, &cwd).unwrap();
+        let args = scope.native_args().unwrap();
+        let settings: Value = serde_json::from_str(
+            &args[args.iter().position(|arg| arg == "--settings").unwrap() + 1],
+        )
+        .unwrap();
+        assert_eq!(settings["sandbox"]["enabled"], true);
+        assert_eq!(settings["sandbox"]["allowUnsandboxedCommands"], false);
+        assert!(settings["sandbox"]["filesystem"]["denyWrite"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(denied)));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions" || arg == "bypassPermissions"));
     }
 
     #[cfg(unix)]
