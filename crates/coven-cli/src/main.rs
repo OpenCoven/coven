@@ -27,6 +27,7 @@ mod chat_context_admission;
 mod chat_workspace_policy;
 mod claude_policy;
 mod claude_write_scope;
+mod claude_write_scope_audit;
 mod cockpit_sources;
 mod config_paths;
 mod control_plane;
