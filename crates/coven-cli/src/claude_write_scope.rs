@@ -432,6 +432,104 @@ mod tests {
         assert_eq!(args[setting_sources + 1], "");
     }
 
+    /// A read-only root outside every writable root gets no `Edit` deny. A
+    /// file-tool write there is refused only because no rule allows it and
+    /// nobody can approve the prompt. That default rests on three facts,
+    /// pinned here on the complete launch argv: the launch is headless with
+    /// no approval path, nothing but the writable roots is granted for
+    /// edits, and the mode is `acceptEdits`. If scoped launches ever gain an
+    /// approval path, give leaf read-only roots explicit `Edit` denies in the
+    /// same change. A blanket deny is not an option: a read-only ancestor of
+    /// a writable root would deny that root too.
+    #[cfg(unix)]
+    #[test]
+    fn read_only_roots_stay_refused_by_default_without_an_explicit_deny() {
+        use crate::harness::{
+            command_parts_for_harness_with_conversation, HarnessLaunchMode, HarnessLaunchOptions,
+            LaunchPolicy,
+        };
+        let (temp, mut value) = fixture();
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("leaf")).unwrap();
+        value["readOnlyRoots"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(root.join("leaf")));
+        let cwd = PathBuf::from(value["primaryRoot"].as_str().unwrap());
+        let path = |name: &str| root.join(name).to_str().unwrap().to_owned();
+        let policy =
+            LaunchPolicy::ClaudeScopedWrite(ClaudeWriteScope::from_value(value, &cwd).unwrap());
+        let options = HarnessLaunchOptions {
+            launch_policy: Some(&policy),
+            ..HarnessLaunchOptions::default()
+        };
+        let launch = |mode| {
+            command_parts_for_harness_with_conversation("claude", "", mode, None, None, options)
+        };
+        let (_program, args) = launch(HarnessLaunchMode::Stream).unwrap();
+        let values_of = |flag: &str| -> Vec<&str> {
+            args.windows(2)
+                .filter(|pair| pair[0] == flag)
+                .map(|pair| pair[1].as_str())
+                .collect()
+        };
+
+        // 1. Headless, with no way to approve a prompt.
+        assert!(args.iter().any(|arg| arg == "--print"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("--permission-prompt-tool")));
+        for mode in [
+            HarnessLaunchMode::Interactive,
+            HarnessLaunchMode::NonInteractive,
+        ] {
+            assert!(launch(mode).is_err(), "{mode:?}");
+        }
+
+        // 2. Edits are granted for the writable roots and nothing else.
+        // Exactly one settings payload, so the one parsed below is the one
+        // Claude applies.
+        let settings = values_of("--settings");
+        assert_eq!(settings.len(), 1, "{settings:?}");
+        let settings: Value = serde_json::from_str(settings[0]).unwrap();
+        let keys =
+            |value: &Value| -> Vec<String> { value.as_object().unwrap().keys().cloned().collect() };
+        assert_eq!(keys(&settings), ["permissions", "sandbox"]);
+        assert_eq!(keys(&settings["permissions"]), ["allow", "deny"]);
+        for rule in settings["permissions"]["allow"].as_array().unwrap() {
+            let rule = rule.as_str().unwrap();
+            assert!(
+                ["Bash", "WebFetch", "WebSearch"].contains(&rule)
+                    || rule.starts_with("Read(")
+                    || rule.starts_with("mcp__"),
+                "{rule}"
+            );
+        }
+        assert_eq!(values_of("--add-dir"), [path("read/write")]);
+        assert_eq!(
+            settings["sandbox"]["filesystem"]["allowWrite"],
+            json!([path("primary"), path("read/write")])
+        );
+
+        // 3. The mode that grants only cwd and the additional roots.
+        assert_eq!(values_of("--permission-mode"), ["acceptEdits"]);
+        assert!(!args
+            .iter()
+            .any(|arg| arg.contains("bypassPermissions") || arg.contains("skip-permissions")));
+
+        // The decision itself: only the protected root is denied. Neither the
+        // leaf read-only root nor the read-only ancestor of a writable root is.
+        let skills = path("primary/skills");
+        assert_eq!(
+            settings["permissions"]["deny"],
+            json!([format!("Edit(/{skills})"), format!("Edit(/{skills}/**)")])
+        );
+        assert_eq!(
+            settings["sandbox"]["filesystem"]["denyWrite"],
+            json!([skills])
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn only_listed_mcp_servers_are_loaded_and_allowed() {
