@@ -320,6 +320,106 @@ fn daemon_status_recovers_corrupt_metadata_from_live_daemon_health() -> anyhow::
     Ok(())
 }
 
+/// A caller's pipes must close when the caller closes them, whether or not it
+/// started the daemon in between (#1806). The caller here holds pipe write
+/// ends without close-on-exec, like a shell after `exec 3> fifo`: one at fd 3
+/// and one well above the low range a fixed-range close would cover.
+#[test]
+fn daemon_start_does_not_hand_the_callers_descriptors_to_the_daemon() -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    const HIGH_FD: libc::c_int = 100;
+
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+    let _daemon_guard = DaemonGuard {
+        coven: coven.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+
+    let mut readers = Vec::new();
+    let mut writers = Vec::new();
+    for _ in 0..2 {
+        let (reader, writer) = std::io::pipe()?;
+        readers.push(reader);
+        writers.push(writer);
+    }
+    let low_source = writers[0].as_raw_fd();
+    let high_source = writers[1].as_raw_fd();
+    // The first dup2 must not overwrite the second source.
+    assert_ne!(high_source, 3, "pipe landed on the fixture's target fd");
+    let mut command = Command::new(&coven);
+    command
+        .args(["daemon", "start"])
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .stdin(Stdio::null());
+    // SAFETY: dup2 and fcntl are async-signal-safe. The explicit F_SETFD also
+    // clears close-on-exec when a source already is the target number, which
+    // dup2 alone would leave set.
+    unsafe {
+        command.pre_exec(move || {
+            for (source, target) in [(low_source, 3), (high_source, HIGH_FD)] {
+                if libc::dup2(source, target) == -1 || libc::fcntl(target, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let start = command.output()?;
+    assert_success("daemon start while holding pipes on fd 3 and 100", &start);
+    wait_for_daemon_health(&coven_home)?;
+
+    // The launcher has exited and the daemon has already exec'd, so once this
+    // process drops its own copies the daemon is the only lasting writer. A
+    // child that another test thread forks in the meantime also copies the
+    // write ends, but only until its own exec closes them (they are
+    // close-on-exec here), so wait for end of file instead of sampling once.
+    drop(writers);
+    // Hang guard only: a sibling's fork-to-exec window is milliseconds, while
+    // the unfixed daemon holds the pipe until it is stopped.
+    const EOF_GUARD: Duration = Duration::from_secs(30);
+    for (reader, fd) in readers.iter_mut().zip([3, HIGH_FD]) {
+        let started = Instant::now();
+        loop {
+            let remaining = EOF_GUARD.saturating_sub(started.elapsed());
+            let mut poll_fd = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd for a descriptor this test owns.
+            let ready =
+                unsafe { libc::poll(&mut poll_fd, 1, remaining.as_millis() as libc::c_int) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("poll the fd {fd} pipe: {error}");
+            }
+            assert!(
+                ready > 0,
+                "the daemon kept the caller's pipe open on fd {fd}; its reader saw no end of file within {:?}",
+                started.elapsed()
+            );
+            let mut byte = [0_u8; 1];
+            match reader.read(&mut byte) {
+                Ok(0) => break,
+                Ok(read) => panic!("unexpected {read} byte(s) on the fd {fd} pipe"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("read the fd {fd} pipe: {error}"),
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn daemon_start_is_idempotent_when_daemon_is_already_running() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;

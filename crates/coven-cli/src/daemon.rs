@@ -2919,7 +2919,106 @@ fn configure_background_server_command(command: &mut Command) {
 }
 
 #[cfg(not(windows))]
-fn configure_background_server_command(_command: &mut Command) {}
+fn configure_background_server_command(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // `Command` gives the daemon null standard streams, but on Unix every
+    // other descriptor the caller of `daemon start` left inheritable would
+    // follow it into `daemon serve` and stay open for the daemon's lifetime.
+    // A caller's pipe or FIFO then never reaches end of file for its reader
+    // (#1806). This is the Unix counterpart of the Windows handle-inherit
+    // clearing above. The daemon keeps only the descriptors it opens itself.
+    //
+    // SAFETY: the hook runs in the forked child before exec and only calls
+    // async-signal-safe functions; it allocates nothing and takes no locks.
+    unsafe {
+        command.pre_exec(|| mark_inherited_descriptors_close_on_exec(3));
+    }
+}
+
+/// Marks every descriptor at or above `from` close-on-exec, so it closes at
+/// `execve` instead of reaching the new program. Marking rather than closing
+/// leaves std's own close-on-exec exec-status pipe untouched. An error on a
+/// descriptor that is open is returned, so `pre_exec` fails the spawn rather
+/// than exec with that descriptor still inheritable. Only async-signal-safe
+/// calls and no allocation, for use from `pre_exec`.
+#[cfg(not(windows))]
+fn mark_inherited_descriptors_close_on_exec(from: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: getdtablesize only reads this process's descriptor limit.
+    let limit = unsafe { libc::getdtablesize() };
+    for fd in from..limit {
+        mark_close_on_exec(fd)?;
+    }
+    Ok(())
+}
+
+/// Marks one descriptor close-on-exec, retrying an interrupted call. A
+/// descriptor that is not open (`EBADF`) has nothing to inherit and is left
+/// alone; any other failure is returned.
+#[cfg(not(windows))]
+fn mark_close_on_exec(fd: libc::c_int) -> std::io::Result<()> {
+    let flags = loop {
+        // SAFETY: F_GETFD only reads this process's descriptor table.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 {
+            break flags;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EBADF) => return Ok(()),
+            _ => return Err(error),
+        }
+    };
+    if flags & libc::FD_CLOEXEC != 0 {
+        return Ok(());
+    }
+    loop {
+        // SAFETY: F_SETFD only changes this descriptor's flags.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod close_on_exec_tests {
+    use super::mark_close_on_exec;
+
+    fn descriptor_flags(fd: libc::c_int) -> libc::c_int {
+        // SAFETY: F_GETFD only reads this process's descriptor table.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) }
+    }
+
+    #[test]
+    fn marks_an_inheritable_descriptor_close_on_exec() {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe writes.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            assert_eq!(descriptor_flags(fd) & libc::FD_CLOEXEC, 0, "fd {fd}");
+            mark_close_on_exec(fd).unwrap();
+            assert_ne!(descriptor_flags(fd) & libc::FD_CLOEXEC, 0, "fd {fd}");
+            // Already marked: unchanged and still Ok.
+            mark_close_on_exec(fd).unwrap();
+            // SAFETY: this test owns the descriptor and closes it once.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    #[test]
+    fn skips_a_descriptor_that_is_not_open() {
+        // Far past any descriptor this process can hold, so F_GETFD fails
+        // with EBADF. A just-closed number is not used: a concurrent test
+        // could reuse it, and this call would then mark that test's
+        // descriptor.
+        mark_close_on_exec(1 << 20).unwrap();
+    }
+}
 
 #[cfg(windows)]
 fn windows_daemon_creation_flags() -> u32 {
