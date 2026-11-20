@@ -131,7 +131,7 @@ These power `coven status`, `coven familiars`, `coven skills`, `coven memory`, `
 | Method | Path | Purpose | Success |
 |---|---|---|---|
 | GET | `/api/v1/overview` | Dashboard aggregate: open sessions, roster/skill/research counts. | overview object |
-| GET | `/api/v1/familiars` | Familiar roster from `familiars.toml`. | `FamiliarDto[]` |
+| GET | `/api/v1/familiars` | Familiar roster from `familiars.toml`. Only `id` is required per entry: an absent `display_name` falls back to `name`, then `id`; absent `role` and `description` are `""`. An entry without `id`, a field of the wrong type, or a file that is not valid TOML fails the whole read. | `FamiliarDto[]` |
 | GET | `/api/v1/familiars/:id/ward` | One familiar's declared Ward surface (tiers, protected paths, principal binding) — the read twin of `/familiars/:id/edits`. | `{ ok, familiarId, workspace, ward }` · `400 invalid_request` / `404 familiar_not_found` / `404 ward_not_configured` / `500 ward_config_invalid` |
 | GET | `/api/v1/familiars/:id/audit` | The append-only `ward_audit` ledger for one familiar, newest first — where direct and proposal-approved writes persist Gate 4 apply records. `?limit=N` (default 100, max 1000), `?event=TYPE` (e.g. `apply_audit`). | `{ ok, familiarId, records }` · `400 invalid_request` / `404 familiar_not_found` |
 | GET | `/api/v1/skills` | Installed skills from `~/.coven/skills/`. | `SkillDto[]` |

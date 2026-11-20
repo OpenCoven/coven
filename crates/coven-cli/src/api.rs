@@ -30008,6 +30008,35 @@ description = "digs deep"
         Ok(())
     }
 
+    // #1800: one entry without `description` used to answer 500 for the
+    // whole roster.
+    #[test]
+    fn familiars_route_serves_an_entry_without_description() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        std::fs::write(
+            home.join("familiars.toml"),
+            r#"[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research"
+
+[[familiar]]
+id = "cody"
+display_name = "Cody"
+role = "Code"
+description = "Builds and debugs."
+"#,
+        )?;
+        let response = handle_request("GET", "/api/v1/familiars", home, None)?;
+        assert_eq!(response.status, 200, "{}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body[0]["id"], "sage");
+        assert_eq!(body[0]["description"], "");
+        assert_eq!(body[1]["description"], "Builds and debugs.");
+        Ok(())
+    }
+
     #[test]
     fn memory_overview_route_reports_capabilities_and_opaque_list_ids() -> Result<()> {
         let temp = tempfile::tempdir()?;

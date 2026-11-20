@@ -15,7 +15,8 @@ Authority binds an execution to. The ledger keeps a stable root per familiar
 and a revision for every identity it has had. Each revision retains the
 familiar's roster identity fields (`id`, `name`, `display_name`, `role`,
 `pronouns`, `person`, `coven`) and the exact text of its `IDENTITY.md`,
-`SOUL.md` and, when present, `ward.toml`.
+`SOUL.md` and, when present, `ward.toml`. A field the roster entry leaves out
+is left out of the revision too, so adding one later is an identity change.
 
 Nothing changes the ledger except these commands. Editing a familiar's roster
 entry or declaration files does not record a new identity on its own: a

@@ -59,18 +59,26 @@ struct FamiliarsFile {
     familiar: Vec<FamiliarEntry>,
 }
 
+/// One `[[familiar]]` table. Only `id` is required, matching coven-code's
+/// roster parser, which writes entries without the other fields (#1800).
+/// An optional field serializes as its string when present, exactly as the
+/// former required `String` fields did, so Ward's serialized roster
+/// commitment is unchanged for complete entries.
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct FamiliarEntry {
     pub(crate) id: String,
     pub(crate) name: Option<String>,
-    pub(crate) display_name: String,
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
     emoji: Option<String>,
     /// See [`FamiliarDto::icon`]. Free-form string at this layer — the
     /// renderer decides whether to treat a `ph:` prefix as an icon vs.
     /// treat anything else as an emoji literal.
     icon: Option<String>,
-    role: String,
-    description: String,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
     pub(crate) pronouns: Option<String>,
     pub(crate) person: Option<String>,
     pub(crate) coven: Option<String>,
@@ -118,9 +126,15 @@ pub fn read_familiars(coven_home: &Path) -> Result<Vec<FamiliarDto>> {
         let memory_freshness = latest_mtime(&memory_dir)
             .map(relative_time)
             .unwrap_or_else(|| "—".to_string());
+        // An absent display_name falls back the way `name` does (name, then
+        // id), as coven-code's own roster rendering does.
+        let display_name = entry
+            .display_name
+            .or_else(|| entry.name.clone())
+            .unwrap_or_else(|| entry.id.clone());
         out.push(FamiliarDto {
             name: entry.name.unwrap_or_else(|| entry.id.clone()),
-            display_name: entry.display_name,
+            display_name,
             emoji: entry.emoji.unwrap_or_default(),
             icon: entry.icon.and_then(|s| {
                 let trimmed = s.trim().to_string();
@@ -130,8 +144,8 @@ pub fn read_familiars(coven_home: &Path) -> Result<Vec<FamiliarDto>> {
                     Some(trimmed)
                 }
             }),
-            role: entry.role,
-            description: entry.description,
+            role: entry.role.unwrap_or_default(),
+            description: entry.description.unwrap_or_default(),
             pronouns: entry.pronouns,
             status: "offline".to_string(),
             active_channel: entry.active_channel,
@@ -147,13 +161,14 @@ pub fn read_familiars(coven_home: &Path) -> Result<Vec<FamiliarDto>> {
 
 /// A roster entry's identity fields and resolved workspace, as the familiar
 /// ledger records them. Display-only fields (emoji, icon, description,
-/// channel) are not identity.
+/// channel) are not identity. Fields the roster leaves out stay `None`
+/// rather than being synthesized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RosterIdentity {
     pub id: String,
     pub name: Option<String>,
-    pub display_name: String,
-    pub role: String,
+    pub display_name: Option<String>,
+    pub role: Option<String>,
     pub pronouns: Option<String>,
     pub person: Option<String>,
     pub coven: Option<String>,
@@ -1170,6 +1185,137 @@ description = "Builds and debugs."
         // No `icon` field set in this fixture — must round-trip as None.
         assert!(out[0].icon.is_none());
         assert!(out[1].icon.is_none());
+        Ok(())
+    }
+
+    // #1800: coven-code treats everything but `id` as optional and writes
+    // rosters without them, so one sparse entry must not fail the roster.
+    #[test]
+    fn read_familiars_defaults_a_missing_description() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            r#"
+[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research familiar"
+"#,
+        )?;
+        let out = read_familiars(temp.path())?;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].display_name, "Sage");
+        assert_eq!(out[0].role, "Research familiar");
+        assert_eq!(out[0].description, "");
+        Ok(())
+    }
+
+    #[test]
+    fn read_familiars_accepts_an_id_only_entry_beside_a_full_one() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            r#"
+[[familiar]]
+id = "cody"
+display_name = "Cody"
+role = "Code"
+description = "Builds and debugs."
+
+[[familiar]]
+id = "wren"
+
+[[familiar]]
+id = "moss"
+name = "Moss"
+"#,
+        )?;
+        let out = read_familiars(temp.path())?;
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].display_name, "Cody");
+        assert_eq!(out[0].description, "Builds and debugs.");
+        // Absent display_name falls back like `name` does: name, then id.
+        assert_eq!(out[1].display_name, "wren");
+        assert_eq!(out[1].role, "");
+        assert_eq!(out[1].description, "");
+        assert_eq!(out[2].display_name, "Moss");
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_workspace_survives_a_sparse_sibling_entry() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let explicit = temp.path().join("elsewhere").join("cody");
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            format!(
+                r#"
+[[familiar]]
+id = "cody"
+display_name = "Cody"
+role = "Code"
+description = "Builds and debugs."
+workspace = {}
+
+[[familiar]]
+id = "sage"
+display_name = "Sage"
+"#,
+                toml::Value::String(explicit.display().to_string())
+            ),
+        )?;
+        // Before #1800 the parse failed and this silently fell back to
+        // `<home>/familiars/cody`.
+        assert_eq!(familiar_workspace(temp.path(), "cody"), explicit);
+        assert_eq!(familiar_workspaces(temp.path())?[0], explicit);
+        Ok(())
+    }
+
+    // Ward commits to `serde_json::to_vec(entry)`; a complete entry must
+    // serialize exactly as it did when these fields were plain strings.
+    #[test]
+    fn complete_entry_serialization_is_unchanged() -> Result<()> {
+        let entries = parse_familiar_entries(
+            r#"
+[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research"
+description = "Reads."
+"#,
+        )?;
+        assert_eq!(
+            serde_json::to_string(&entries[0])?,
+            r#"{"id":"sage","name":null,"display_name":"Sage","emoji":null,"icon":null,"role":"Research","description":"Reads.","pronouns":null,"person":null,"coven":null,"active_channel":null,"workspace":null}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_entry_without_id_still_fails_the_roster_with_its_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            "[[familiar]]\nid = \"sage\"\n\n[[familiar]]\ndisplay_name = \"Nobody\"\n",
+        )?;
+        let error = format!("{:#}", read_familiars(temp.path()).unwrap_err());
+        assert!(error.contains(FAMILIARS_CONFIG_FILE), "{error}");
+        assert!(error.contains("missing field `id`"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn roster_identity_keeps_absent_display_name_and_role_absent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(
+            temp.path().join(FAMILIARS_CONFIG_FILE),
+            "[[familiar]]\nid = \"wren\"\n",
+        )?;
+        let RosterLookup::Found(identity) = roster_identity(temp.path(), "wren")? else {
+            panic!("wren should be found");
+        };
+        assert_eq!(identity.display_name, None);
+        assert_eq!(identity.role, None);
         Ok(())
     }
 
