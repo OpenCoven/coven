@@ -153,7 +153,9 @@ fn request(
 }
 
 /// A typed refusal an operator can act on, recognized by status, code and
-/// action together. Its message is still never shown.
+/// action together. Its message is still never shown: an illegal transition
+/// is matched against the daemon's known reasons only to pick which fixed
+/// sentence names the condition that refused it (coven#1793).
 fn known_refusal(status: u16, body: &[u8]) -> Option<&'static str> {
     let body: Value = serde_json::from_slice(body).ok()?;
     if body["action"] != RETRY_ACTION {
@@ -174,12 +176,53 @@ fn known_refusal(status: u16, body: &[u8]) -> Option<&'static str> {
             Some("the run has an unresolved stop, so it cannot be retried")
         }
         (504, "DEADLINE_EXCEEDED") => Some("the run's deadline has passed; it cannot be retried"),
-        (422, "ILLEGAL_TRANSITION") => Some(
-            "the run is not held for a retry: it needs to be running, with a latest attempt that \
-             failed, timed out or was cancelled, an open deadline, an attempt left, and an active \
-             routine that is not quarantined",
-        ),
+        (422, "ILLEGAL_TRANSITION") => Some(illegal_transition(
+            body["error"]["message"].as_str().unwrap_or_default(),
+        )),
         _ => None,
+    }
+}
+
+/// Said when an illegal transition's reason is not one this command knows.
+const NOT_HELD: &str = "the run is not held for a retry: it needs to be running, with a latest \
+    attempt that failed, timed out or was cancelled, an open deadline, an attempt left, and an \
+    active routine that is not quarantined";
+
+/// The fixed sentence for each reason `attempt.retry.v1` refuses an illegal
+/// transition with. Ids, states and counts in the daemon's reason are matched
+/// by shape and never copied.
+fn illegal_transition(reason: &str) -> &'static str {
+    let shaped = |prefix: &str, suffix: &str| {
+        reason.len() > prefix.len() + suffix.len()
+            && reason.starts_with(prefix)
+            && reason.ends_with(suffix)
+    };
+    if shaped(
+        "the run is `",
+        "`; only a run held after a failure can be retried before its deadline",
+    ) {
+        "the run is not held for a retry: it is not running"
+    } else if reason == "the run has no occurrence to plan" {
+        "the run is not held for a retry: it has no occurrence to plan"
+    } else if reason == "the run has no attempt" {
+        "the run is not held for a retry: it has no attempt"
+    } else if shaped("attempt #", "`") && reason.contains(" is still `") {
+        "the run is not held for a retry: its latest attempt has not failed, timed out or been \
+         cancelled"
+    } else if shaped("the run has used all ", " attempts") {
+        "the run is not held for a retry: it has used all its attempts"
+    } else if reason
+        == "the run has no original deadline, so it cannot be held for an operator retry"
+    {
+        "the run is not held for a retry: it has no original deadline"
+    } else if shaped("routine `", "` is not active, so it cannot be retried") {
+        "the run's routine is not active, so the run cannot be retried"
+    } else if reason == "the routine is quarantined; explicitly unquarantine it before retrying" {
+        "the run's routine is quarantined; explicitly unquarantine it before retrying"
+    } else if reason == "the run's occurrence is not held for a retry" {
+        "the run's occurrence is not held for a retry"
+    } else {
+        NOT_HELD
     }
 }
 
@@ -264,10 +307,6 @@ mod tests {
         (temp, conn)
     }
 
-    const NOT_HELD: &str = "the run is not held for a retry: it needs to be running, with a \
-        latest attempt that failed, timed out or was cancelled, an open deadline, an attempt \
-        left, and an active routine that is not quarantined";
-
     /// Routes the command's own request through the daemon's control plane.
     fn route(
         conn: &rusqlite::Connection,
@@ -336,7 +375,10 @@ mod tests {
         let (status, response) = route(&conn, "r-hold", 1, PriorDisposition::Failed, None);
         assert_eq!(
             known_refusal(status, &serde_json::to_vec(&response).unwrap()),
-            Some(NOT_HELD)
+            Some(
+                "the run is not held for a retry: its latest attempt has not failed, timed out or \
+                 been cancelled"
+            )
         );
         let attempts: i64 = conn
             .query_row(
@@ -350,7 +392,7 @@ mod tests {
 
     #[test]
     fn each_typed_refusal_from_the_real_handler_gets_a_fixed_message() {
-        let cases: [(&str, &str, &str, PriorDisposition, &str); 7] = [
+        let cases: [(&str, &str, &str, PriorDisposition, &str); 9] = [
             (
                 "r-missing",
                 "failed",
@@ -412,7 +454,25 @@ mod tests {
                 "failed",
                 "UPDATE automation_definitions SET lifecycle_state = 'paused';",
                 PriorDisposition::Failed,
-                NOT_HELD,
+                "the run's routine is not active, so the run cannot be retried",
+            ),
+            (
+                "r-hold",
+                "failed",
+                "INSERT INTO automation_retry_state
+                    (automation_id, consecutive_exhaustions, quarantined_at, failure_class,
+                     reason, updated_at)
+                 VALUES ('daily', 1, '2026-10-17T09:10:00.000Z', 'runtime_unavailable',
+                         'retry exhausted', '2026-10-17T09:10:00.000Z');",
+                PriorDisposition::Failed,
+                "the run's routine is quarantined; explicitly unquarantine it before retrying",
+            ),
+            (
+                "r-hold",
+                "failed",
+                "UPDATE automation_runs SET status = 'failed';",
+                PriorDisposition::Failed,
+                "the run is not held for a retry: it is not running",
             ),
         ];
         for (run_id, attempt_state, change, prior_disposition, message) in cases {
@@ -425,6 +485,74 @@ mod tests {
                 "{change}: {response}"
             );
         }
+    }
+
+    #[test]
+    fn each_illegal_transition_reason_gets_its_own_fixed_sentence() {
+        let max = super::super::runner::MAX_ATTEMPT_NUMBER;
+        for (reason, sentence) in [
+            (
+                "the run is `succeeded`; only a run held after a failure can be retried before \
+                 its deadline"
+                    .to_owned(),
+                "the run is not held for a retry: it is not running",
+            ),
+            (
+                "the run has no occurrence to plan".to_owned(),
+                "the run is not held for a retry: it has no occurrence to plan",
+            ),
+            (
+                "the run has no attempt".to_owned(),
+                "the run is not held for a retry: it has no attempt",
+            ),
+            (
+                "attempt #2 is still `dispatching`".to_owned(),
+                "the run is not held for a retry: its latest attempt has not failed, timed out \
+                 or been cancelled",
+            ),
+            (
+                format!("the run has used all {max} attempts"),
+                "the run is not held for a retry: it has used all its attempts",
+            ),
+            (
+                "the run has no original deadline, so it cannot be held for an operator retry"
+                    .to_owned(),
+                "the run is not held for a retry: it has no original deadline",
+            ),
+            (
+                "routine `private sentinel` is not active, so it cannot be retried".to_owned(),
+                "the run's routine is not active, so the run cannot be retried",
+            ),
+            (
+                "the routine is quarantined; explicitly unquarantine it before retrying".to_owned(),
+                "the run's routine is quarantined; explicitly unquarantine it before retrying",
+            ),
+            (
+                "the run's occurrence is not held for a retry".to_owned(),
+                "the run's occurrence is not held for a retry",
+            ),
+            // Unknown or malformed reasons keep the general sentence.
+            ("private sentinel".to_owned(), NOT_HELD),
+            (
+                "routine `` is not active, so it cannot be retried".to_owned(),
+                NOT_HELD,
+            ),
+            ("".to_owned(), NOT_HELD),
+        ] {
+            let body = serde_json::to_vec(&json!({
+                "action": RETRY_ACTION,
+                "error": {"code": "ILLEGAL_TRANSITION", "message": reason}
+            }))
+            .unwrap();
+            let refusal = known_refusal(422, &body);
+            assert_eq!(refusal, Some(sentence), "{reason}");
+            assert!(!refusal.unwrap().contains("private sentinel"));
+        }
+        let no_message = serde_json::to_vec(&json!({
+            "action": RETRY_ACTION, "error": {"code": "ILLEGAL_TRANSITION"}
+        }))
+        .unwrap();
+        assert_eq!(known_refusal(422, &no_message), Some(NOT_HELD));
     }
 
     #[test]
