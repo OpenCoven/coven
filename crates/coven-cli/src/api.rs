@@ -615,6 +615,9 @@ pub(crate) const RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED: &str =
     "runtime does not accept automation authority projections; no process started";
 
 pub trait SessionRuntime {
+    fn host_worker(&self) -> Option<&crate::host_sync::Worker> {
+        None
+    }
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()>;
     fn launch_session_with_writer(
         &self,
@@ -944,6 +947,20 @@ fn handle_request_with_runtime_authority_and_automation_time(
             200,
             &health_response_with_hub(coven_home, daemon, runtime.event_writer_health(), authority),
         ),
+        (_, route) if route.starts_with("/host/") => {
+            if authority != RequestAuthority::OwnerLocalIpc {
+                return api_error(
+                    403,
+                    "owner_local_required",
+                    "Host sync requires owner-local IPC.",
+                    None,
+                );
+            }
+            let Some(worker) = runtime.host_worker() else {
+                return api_error(503, "unavailable", "Host sync worker is unavailable.", None);
+            };
+            crate::host_sync::route(worker, method, route, body)
+        }
         ("GET", "/capabilities") => json_response(200, &control_plane::capabilities()),
         ("GET", "/session-policy") => crate::session_policy::discovery_response(),
         ("POST", "/sessions/restricted") => crate::session_policy::restricted_response(

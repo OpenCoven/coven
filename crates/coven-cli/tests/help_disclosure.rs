@@ -17,6 +17,7 @@ const PUBLIC_COMMANDS: &[&str] = &[
     "sessions",
     "attach",
     "daemon",
+    "host",
     "status",
     "chat",
     "tui",
@@ -448,6 +449,8 @@ fn full_help_json_has_stable_schema_routes_and_no_ansi() -> anyhow::Result<()> {
                     || url.starts_with("https://docs.opencoven.ai/docs/daemon/")
                     || url.starts_with("https://docs.opencoven.ai/docs/memory-models")
                     || url == "https://docs.opencoven.ai/docs/reference/cli-setup"
+                    || url
+                        == "https://docs.opencoven.ai/docs/reference/api-contract#host-folder-sync"
                     || url == "https://docs.opencoven.ai/docs/reference/api#skills-eval-loop"
                     || url == "https://docs.opencoven.ai/docs/reference/troubleshooting"
                     || url == "https://docs.opencoven.ai/docs/reference/support"

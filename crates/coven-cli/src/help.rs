@@ -85,6 +85,7 @@ const HELP_GROUPS: &[HelpGroupSpec] = &[
             HelpCommandSpec::new("sessions", "/cli/sessions"),
             HelpCommandSpec::new("attach", "/cli/sessions#attach"),
             HelpCommandSpec::new("daemon", "/cli/daemon"),
+            HelpCommandSpec::new("host", "/reference/api-contract#host-folder-sync"),
             HelpCommandSpec::new("status", "/cli/observe"),
             HelpCommandSpec::new("chat", "/cli/interactive"),
             HelpCommandSpec::new("tui", "/cli/interactive"),
