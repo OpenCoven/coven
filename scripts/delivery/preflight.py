@@ -55,6 +55,18 @@ def load_checkpoint():
     return module
 
 
+def load_allocation_limits() -> dict | None:
+    """The guarded allocator's budget, or None when this checkout has no allocator."""
+    path = Path(__file__).resolve().parent.parent / "task-worktree.py"
+    if not path.is_file():
+        return None
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location("task_worktree", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return dict(module.LIMITS)
+
+
 def run(argv: list[str]) -> "subprocess.CompletedProcess[str]":
     try:
         return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=60)
@@ -72,9 +84,10 @@ def classify(text: str) -> str:
 
 
 class Preflight:
-    def __init__(self, repo: str, base: str, runner: Runner = run, integration: str = "", base_ref: str = ""):
+    def __init__(self, repo: str, base: str, runner: Runner = run, integration: str = "", base_ref: str = "",
+                 issue: str = ""):
         self.repo, self.base, self.runner, self.integration = repo, base, runner, integration
-        self.base_ref = base_ref
+        self.base_ref, self.issue = base_ref, issue
         self.facts: dict = {"repo": repo, "base": base}
         self.states: list[dict] = []
 
@@ -103,6 +116,8 @@ class Preflight:
             self.state("detached-head", "HEAD is detached; a pull request needs a branch")
         elif facts["branch"] == self.base:
             self.state("on-default-branch", f"on {self.base}; work is published from a task branch, never {self.base}")
+        if facts["branch"] in (None, self.base):
+            self.allocation()
         remote = self.ok("git", "remote", "get-url", "origin")
         facts["remote"] = bool(remote)
         if remote is None:
@@ -118,6 +133,24 @@ class Preflight:
             name = classify(text)
             self.state(name, f"observed while publishing: {name}")
         return self.report()
+
+    def allocation(self) -> None:
+        """A task branch comes only from the guarded allocator, so check its budget
+        the way `task-worktree.py create` would: one more worktree and branch."""
+        limits = load_allocation_limits()
+        if limits is None:
+            return
+        worktrees = self.ok("git", "worktree", "list", "--porcelain")
+        branches = self.ok("git", "for-each-ref", "--format=%(refname:short)", "refs/heads")
+        if worktrees is None or branches is None:
+            return
+        counts = {"task worktrees": max(0, len([b for b in worktrees.split("\n\n") if b.strip()]) - 1),
+                  "local branches": len([b for b in branches.splitlines() if b and b != self.base])}
+        self.facts["allocation"] = {"counts": counts, "limits": {k: limits[k] for k in counts}}
+        over = [f"{key} {count + 1} > {limits[key]}" for key, count in counts.items() if count + 1 > limits[key]]
+        if over:
+            self.state("allocation-capacity", "the task allocator would refuse a new task branch (" + "; ".join(over)
+                       + "); free a slot by verified-safe cleanup, never by a raw branch")
 
     def github(self) -> None:
         facts = self.facts
@@ -183,20 +216,30 @@ class Preflight:
         levels = {s["level"] for s in self.states}
         delivery = "handoff" if "block" in levels else "pr-degraded" if "degraded" in levels else "pr"
         return {"facts": self.facts, "states": self.states, "delivery": delivery,
-                "next": next_commands(self.facts, self.states, self.repo, self.base)}
+                "next": next_commands(self.facts, self.states, self.repo, self.base, self.issue)}
 
 
-def next_commands(facts: dict, states: list[dict], repo: str, base: str) -> list[str]:
+def next_commands(facts: dict, states: list[dict], repo: str, base: str, issue: str = "") -> list[str]:
     """Exact commands for whoever finishes the delivery. Never a push to the base,
-    never a REST merge, never a branch delete chained to a merge."""
+    never a REST merge, never a branch delete chained to a merge, never a task
+    branch outside the guarded allocator, and queue advice only for a real PR."""
     branch = facts.get("branch") or "<task-branch>"
     sha = facts.get("full_sha") or "<full-sha>"
     open_prs = [p for p in facts.get("pulls", []) if p["state"] == "open"]
-    pr = f"{open_prs[0]['number']}" if open_prs else "<pr-number>"
+    # The queue takes a ready PR at exactly this HEAD; any other PR would be
+    # queued at a commit nobody verified, or refused.
+    candidates = [p for p in open_prs if not p.get("draft") and facts.get("full_sha")
+                  and p.get("head_sha") == facts["full_sha"]]
     names = [s["state"] for s in states if s["level"] != "info"]
     commands = []
-    if "detached-head" in names or "on-default-branch" in names:
-        commands.append(f"git switch -c <task-branch> {sha}")
+    if "allocation-capacity" in names:
+        commands.append("python3 scripts/task-worktree.py inventory   # the allocator is full: free a slot as "
+                        "docs/development/worktree-lifecycle.md describes, then rerun this preflight")
+    elif "detached-head" in names or "on-default-branch" in names:
+        number = issue.lstrip("#") if issue.lstrip("#").isdigit() else "<issue>"
+        path = f".worktrees/issue-{number}-<slug>"
+        commands.append(f"python3 scripts/task-worktree.py create --issue {number} --branch <task-branch> --path {path}")
+        commands.append(f"git -C {path} merge --ff-only {sha}   # carry this HEAD onto the allocated branch")
     if "missing-remote" in names:
         commands.append(f"git remote add origin https://github.com/{repo}.git   # maintainer: or apply the handoff patch/bundle")
     if "missing-auth" in names or "missing-push-permission" in names:
@@ -220,12 +263,16 @@ def next_commands(facts: dict, states: list[dict], repo: str, base: str) -> list
         commands.append(f"git fetch origin {branch} && git log --oneline HEAD..origin/{branch}   # reconcile, never force over it")
     if "network" in names:
         commands.append("# network: retry once the host resolves; publication is unchanged")
+    if "unknown-failure" in names:
+        commands.append("# unrecognized publication failure: read the failed command's own output, fix the cause, "
+                        "then rerun this preflight with --observed <file>")
     if not names or names == ["merge-queue-405"]:
         commands.append(f"git push -u origin {branch}" if not open_prs else f"git push origin {branch}")
         if not open_prs:
             commands.append(f"gh pr create --base {base} --head {branch} --body-file pr-body.md")
-    if "merge-queue-405" in names or facts.get("merge_queue"):
-        commands.append(f"gh pr merge {pr} --match-head-commit {sha}   # enters the merge queue once CI is green")
+    if candidates and ("merge-queue-405" in names or facts.get("merge_queue")):
+        commands.append(f"gh pr merge {candidates[0]['number']} --match-head-commit {sha}   "
+                        "# enters the merge queue once CI is green")
         commands.append("# never PUT pulls/<n>/merge (405 under the queue); delete the branch only after the merge lands")
     return commands
 
@@ -330,7 +377,7 @@ def main(argv: list[str] | None = None, runner: Runner = run, env=None) -> int:
     args = parser.parse_args(argv)
     integration = env.get("COVEN_PUBLICATION_INTEGRATION", "")
     observed = [Path(path).read_text(encoding="utf-8", errors="replace") for path in args.observed]
-    preflight = Preflight(args.repo, args.base, runner, integration, args.base_ref)
+    preflight = Preflight(args.repo, args.base, runner, integration, args.base_ref, args.issue or "")
     report = preflight.probe(observed)
     root = report["facts"].get("root")
     if args.handoff_dir is not None and root:

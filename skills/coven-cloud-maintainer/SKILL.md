@@ -171,11 +171,13 @@ The verdict is one of:
 | `rest-rate-limit` | block | wait for the printed reset, then rerun |
 | `merge-queue-405` | degraded | `gh pr merge <n> --match-head-commit <sha>`, never a REST merge |
 | `missing-workflow-scope` | block | `gh auth refresh -h github.com -s workflow`, or push over SSH |
-| `detached-head`, `on-default-branch` | block | `git switch -c <task-branch> <sha>`; never publish from `main` |
+| `detached-head`, `on-default-branch` | block | `scripts/task-worktree.py create`, then `merge --ff-only <sha>` in the new worktree; never a raw branch, never publish from `main` |
+| `allocation-capacity` | block | the allocator is full: free a slot as `docs/development/worktree-lifecycle.md` describes, then rerun |
 | `non-fast-forward`, `network`, `unknown-failure` | block | reconcile, retry, or hand off as printed |
 
 `merge-queue-required` and `existing-pr` are informational: queue through
-`--match-head-commit`, and push to the PR that already exists.
+`--match-head-commit`, and push to the PR that already exists. Queue advice is
+printed only for an open, ready pull request whose head is exactly this commit.
 
 When a publish fails, save its output and rerun with `--observed <file>`: the
 failure is classified, not echoed. For any verdict other than `pr`, add

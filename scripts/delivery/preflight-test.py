@@ -22,7 +22,8 @@ TOKEN = "".join(["gh", "o_", "R" * 36])
 READ_ONLY = (
     ("git", "--version"), ("git", "rev-parse"), ("git", "symbolic-ref"), ("git", "remote", "get-url"),
     ("git", "merge-base"), ("git", "diff", "--stat"), ("git", "format-patch", "--stdout"),
-    ("git", "bundle", "create"), ("gh", "--version"), ("gh", "auth", "status"), ("gh", "api"),
+    ("git", "bundle", "create"), ("git", "worktree", "list", "--porcelain"),
+    ("git", "for-each-ref", "--format=%(refname:short)", "refs/heads"), ("gh", "--version"), ("gh", "auth", "status"), ("gh", "api"),
 )
 
 
@@ -114,6 +115,21 @@ class StateTests(unittest.TestCase):
                 for item in report["states"]:
                     if item["level"] != "info":
                         self.assertIn(item["state"], bundle["checkpoint"])
+
+    def test_queue_advice_needs_an_open_ready_pr_at_exactly_this_head(self):
+        # Queue advice names a PR and a SHA; it is only true when that PR is
+        # open, ready, and already carries this exact HEAD (#1452).
+        local, other = "a" * 40, "b" * 40
+        def commands(**pull):
+            facts = {"branch": "fix/x", "full_sha": local, "merge_queue": True,
+                     "pulls": [{"number": 123, "state": "open", "merged": False, "draft": False, **pull}]}
+            return "\n".join(preflight.next_commands(facts, [], "OpenCoven/coven", "main"))
+        self.assertIn(f"gh pr merge 123 --match-head-commit {local}", commands(head_sha=local))
+        for name, pull in {"other head": {"head_sha": other}, "unknown head": {"head_sha": None},
+                           "draft": {"head_sha": local, "draft": True},
+                           "closed": {"head_sha": local, "state": "closed"}}.items():
+            with self.subTest(pull=name):
+                self.assertNotIn("gh pr merge", commands(**pull))
 
     def test_a_clean_delivery_emits_no_handoff(self):
         _, report, _ = execute(FIXTURE["scenarios"][0])
@@ -278,7 +294,12 @@ class RealGitTests(unittest.TestCase):
         self.git("checkout", "-q", "--detach")
         report = preflight.Preflight("OpenCoven/coven", "main", self.runner).probe([])
         self.assertIn("detached-head", {s["state"] for s in report["states"]})
-        self.assertIn(f"git switch -c <task-branch> {self.head}", report["next"])
+        # The way back to a branch is the guarded allocator, never a raw
+        # branch that bypasses its budget and lock (#1452).
+        commands = "\n".join(report["next"])
+        self.assertIn("python3 scripts/task-worktree.py create --issue <issue> --branch <task-branch>", commands)
+        self.assertIn(f"merge --ff-only {self.head}", commands)
+        self.assertNotIn("git switch", commands)
 
 
 if __name__ == "__main__":
