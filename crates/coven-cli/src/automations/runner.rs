@@ -4432,10 +4432,18 @@ pub(crate) fn settle_finished_runs_with(
                     }
                     _ => false,
                 });
-        let succeeded = !ambiguous
+        let exited_cleanly = !ambiguous
             && session_status.as_deref() == Some("completed")
             && exit_code == Some(0)
             && !timed_out;
+        // Exit code 0 is success only once the run's pinned postcondition,
+        // if it declares one, is met (coven#1818).
+        let postcondition_unmet = if exited_cleanly {
+            super::postcondition::check_run(&transaction, &run_id, session_id.as_deref())?
+        } else {
+            None
+        };
+        let succeeded = exited_cleanly && postcondition_unmet.is_none();
         let cancelled = !ambiguous && session_status.as_deref() == Some("cancelled") && !timed_out;
         let status = if succeeded {
             "succeeded"
@@ -4460,6 +4468,8 @@ pub(crate) fn settle_finished_runs_with(
             Some("terminal session evidence observed after an ambiguous stop outcome".to_string())
         } else if succeeded {
             None
+        } else if let Some(reason) = postcondition_unmet {
+            Some(reason)
         } else if timed_out {
             Some(match session_status.as_deref() {
                 Some("completed") => "session completed after automation timeout".to_string(),
@@ -8620,6 +8630,26 @@ mod tests {
         assert_eq!(report.succeeded, 1);
         let runs = super::super::runs::list_runs(&conn, "journal", 10).unwrap();
         assert_eq!(runs[0].status, "succeeded");
+    }
+
+    #[test]
+    fn an_unreadable_run_start_fails_the_postcondition_not_the_pass() {
+        let (temp, conn) = temp_store();
+        let definition = postcondition_definition("journal", temp.path());
+        let (launched_at, finished_at) = run_to_exit_zero(&conn, &definition, "wrote it\n", |_| {});
+        conn.execute(
+            "UPDATE automation_runs SET started_at = 7 WHERE automation_id = 'journal'",
+            [],
+        )
+        .unwrap();
+
+        let (status, reasons) = settle_through_deadline(&conn, "journal", launched_at, finished_at);
+        assert_eq!(status, "failed");
+        assert!(
+            reasons.iter().any(|reason| reason
+                .starts_with("postcondition_unmet: the run's start time could not be read")),
+            "{reasons:?}"
+        );
     }
 
     #[test]

@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::definition::RoutineTimezone;
+use super::delivery::strip_escape_sequences;
+use super::terminal_observer::session_output;
 
 /// Reason prefix for a run whose declared output is missing or wrong.
 pub const POSTCONDITION_UNMET: &str = "postcondition_unmet";
@@ -81,16 +83,209 @@ pub(crate) struct RunContext<'a> {
 impl RoutinePostcondition {
     /// Checks the declaration itself; `cwd` is the routine's.
     pub(crate) fn validate(&self, cwd: Option<&str>) -> Result<(), String> {
-        let _ = cwd;
+        let path_chars = self.path.chars().count();
+        if path_chars == 0 || path_chars > POSTCONDITION_PATH_MAX_CHARS {
+            return Err(format!(
+                "postcondition.path must be 1..={POSTCONDITION_PATH_MAX_CHARS} characters"
+            ));
+        }
+        if self.path.contains(CWD) && cwd.is_none() {
+            return Err("postcondition.path uses {cwd} but the routine has no cwd".to_string());
+        }
+        if let Some(placeholder) = unknown_placeholder(&self.path) {
+            return Err(format!(
+                "postcondition.path uses unknown placeholder {placeholder}; use {CWD}, {LOCAL_TODAY} or {LOCAL_YESTERDAY}"
+            ));
+        }
+        // Sample values stand in for the run's: validation needs only shape.
+        let sample = Placeholders::new(cwd.or(Some("/")), sample_date(), sample_date());
+        let path = sample.path(&self.path).ok_or_else(|| {
+            "postcondition.path uses {cwd} but the routine has no cwd".to_string()
+        })?;
+        if has_parent_component(&path) {
+            return Err("postcondition.path must not contain `..`".to_string());
+        }
+        if !Path::new(&path).has_root() {
+            return Err("postcondition.path must be absolute".to_string());
+        }
+        if self.must_match_lines.len() > MUST_MATCH_LINES_MAX {
+            return Err(format!(
+                "postcondition.mustMatchLines must list at most {MUST_MATCH_LINES_MAX} patterns"
+            ));
+        }
+        for (index, pattern) in self.must_match_lines.iter().enumerate() {
+            let chars = pattern.chars().count();
+            if chars == 0 || chars > MUST_MATCH_LINE_MAX_CHARS {
+                return Err(format!(
+                    "postcondition.mustMatchLines[{index}] must be 1..={MUST_MATCH_LINE_MAX_CHARS} characters"
+                ));
+            }
+            sample.pattern(pattern).map_err(|_| {
+                format!("postcondition.mustMatchLines[{index}] is not a valid pattern")
+            })?;
+        }
+        if self.accept_left_as_written && !self.modified_during_run {
+            return Err("postcondition.acceptLeftAsWritten requires modifiedDuringRun".to_string());
+        }
         Ok(())
     }
 
     /// Why a run that exited 0 must not be recorded `succeeded`, or `None`
-    /// when it met the postcondition.
+    /// when it met the postcondition. Reasons never echo file contents or the
+    /// resolved path, which may be private.
     pub(crate) fn unmet_reason(&self, run: &RunContext<'_>) -> Option<String> {
-        let _ = run;
+        let unmet = |detail: &str| Some(format!("{POSTCONDITION_UNMET}: {detail}"));
+        let output = strip_escape_sequences(run.output);
+        let lines: Vec<&str> = output.lines().map(str::trim).collect();
+        if lines.iter().any(|line| line.starts_with(NOT_LOGGED_IN)) {
+            return Some(format!("{BLOCKED}: the runtime is not logged in"));
+        }
+        let final_line = lines
+            .iter()
+            .rev()
+            .find(|line| !line.is_empty())
+            .copied()
+            .unwrap_or_default();
+        if final_line.starts_with(FAILED_PREFIX) {
+            return unmet("the final output line reports failure");
+        }
+        let (today, yesterday) = match local_dates(run.timezone, run.started_at) {
+            Ok(dates) => dates,
+            Err(_) => return unmet("the run's local date could not be resolved"),
+        };
+        let placeholders = Placeholders::new(run.cwd, today, yesterday);
+        let Some(path) = placeholders.path(&self.path) else {
+            return unmet("the declared path uses {cwd} but the routine has no cwd");
+        };
+        if has_parent_component(&path) || !Path::new(&path).has_root() {
+            return unmet("the declared path is not absolute");
+        }
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return unmet("the declared file does not exist");
+            }
+            Err(_) => return unmet("the declared file could not be inspected"),
+        };
+        if !metadata.is_file() {
+            return unmet("the declared file is not a regular file");
+        }
+        if metadata.len() > POSTCONDITION_FILE_MAX_BYTES {
+            return unmet("the declared file is larger than 4 MiB");
+        }
+        let contents = match std::fs::read(&path) {
+            Ok(contents) => contents,
+            Err(_) => return unmet("the declared file could not be read"),
+        };
+        let contents = String::from_utf8_lossy(&contents);
+        for (index, pattern) in self.must_match_lines.iter().enumerate() {
+            let Ok(pattern) = placeholders.pattern(pattern) else {
+                return unmet(&format!("mustMatchLines[{index}] is not a valid pattern"));
+            };
+            if !contents
+                .lines()
+                .any(|line| pattern.is_match(line.trim_end_matches('\r')))
+            {
+                return unmet(&format!(
+                    "the declared file has no line matching mustMatchLines[{index}]"
+                ));
+            }
+        }
+        if self.modified_during_run {
+            let waived = self.accept_left_as_written
+                && final_line
+                    .strip_prefix(LEFT_AS_WRITTEN_PREFIX)
+                    .is_some_and(|named| named == path);
+            if !waived {
+                let Ok(modified) = metadata.modified() else {
+                    return unmet("the declared file's modification time could not be read");
+                };
+                if DateTime::<Utc>::from(modified) + MTIME_SLACK < run.started_at {
+                    return unmet("the declared file was not modified during this run");
+                }
+            }
+        }
         None
     }
+}
+
+/// Filesystems stamp writes from a coarse clock that can trail the system
+/// clock; a run's own write must never look older than its start.
+const MTIME_SLACK: chrono::Duration = chrono::Duration::seconds(2);
+
+fn sample_date() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2000, 1, 1).expect("a valid sample date")
+}
+
+/// The values a run substitutes for each placeholder.
+struct Placeholders {
+    cwd: Option<String>,
+    today: String,
+    yesterday: String,
+}
+
+impl Placeholders {
+    fn new(cwd: Option<&str>, today: NaiveDate, yesterday: NaiveDate) -> Self {
+        Self {
+            // `{cwd}/x` must not become `//x` for a cwd with a trailing slash.
+            cwd: cwd.map(|cwd| cwd.trim_end_matches(['/', '\\']).to_owned()),
+            today: today.format("%Y-%m-%d").to_string(),
+            yesterday: yesterday.format("%Y-%m-%d").to_string(),
+        }
+    }
+
+    /// `template` with every placeholder replaced, or `None` when it needs a
+    /// cwd the routine lacks.
+    fn substitute(&self, template: &str, escape: fn(&str) -> String) -> Option<String> {
+        let mut text = template
+            .replace(LOCAL_YESTERDAY, &escape(&self.yesterday))
+            .replace(LOCAL_TODAY, &escape(&self.today));
+        if text.contains(CWD) {
+            text = text.replace(CWD, &escape(self.cwd.as_deref()?));
+        }
+        Some(text)
+    }
+
+    fn path(&self, template: &str) -> Option<String> {
+        self.substitute(template, str::to_owned)
+    }
+
+    fn pattern(&self, template: &str) -> Result<Regex, String> {
+        let pattern = self
+            .substitute(template, regex::escape)
+            .ok_or_else(|| "the pattern uses {cwd} but the routine has no cwd".to_string())?;
+        RegexBuilder::new(&pattern)
+            .size_limit(PATTERN_SIZE_LIMIT)
+            .build()
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The first braced `{name}`, with a name of ASCII letters, that is not a
+/// placeholder. Paths have no other use for braces around a word.
+fn unknown_placeholder(text: &str) -> Option<&str> {
+    let mut offset = 0;
+    while let Some(start) = text[offset..].find('{').map(|start| offset + start) {
+        let rest = &text[start + 1..];
+        if let Some(end) = rest.find('}') {
+            let name = &rest[..end];
+            let braced = &text[start..start + end + 2];
+            if !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphabetic())
+                && ![CWD, LOCAL_TODAY, LOCAL_YESTERDAY].contains(&braced)
+            {
+                return Some(braced);
+            }
+        }
+        offset = start + 1;
+    }
+    None
+}
+
+fn has_parent_component(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .any(|component| component == Component::ParentDir)
 }
 
 /// The run's start date and the day before it, in `timezone`.
@@ -98,19 +293,82 @@ fn local_dates(
     timezone: RoutineTimezone,
     started_at: DateTime<Utc>,
 ) -> Result<(NaiveDate, NaiveDate), String> {
-    let _ = (timezone, started_at);
-    Err("unimplemented".to_owned())
+    let today = match timezone.resolve_for_persistence()? {
+        RoutineTimezone::Utc => started_at.date_naive(),
+        RoutineTimezone::Iana(timezone) => started_at.with_timezone(&timezone).date_naive(),
+        RoutineTimezone::Local => return Err("timezone did not resolve".to_string()),
+    };
+    let yesterday = today
+        .checked_sub_days(Days::new(1))
+        .ok_or_else(|| "the run's start date has no previous day".to_string())?;
+    Ok((today, yesterday))
 }
 
 /// Judges a run that exited 0 against the postcondition its pinned definition
-/// declares. `Ok(None)` means the run may be recorded `succeeded`.
+/// declares. `Ok(None)` means the run may be recorded `succeeded`; a run whose
+/// pinned definition is unreadable JSON declares nothing that can be read and
+/// keeps exit-code success, as it does for delivery. A declared postcondition
+/// that cannot be evaluated fails closed.
 pub(crate) fn check_run(
     conn: &Connection,
     run_id: &str,
     session_id: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let _ = (conn, run_id, session_id);
-    Ok(None)
+    let unmet = |detail: &str| Ok(Some(format!("{POSTCONDITION_UNMET}: {detail}")));
+    // `definition_json` is decoded as recording the run's finish decodes it.
+    // `started_at` is read as bytes, so a value of another type fails this
+    // run's postcondition rather than the whole settlement pass, which
+    // `explain` models without it.
+    let row: Option<(Option<String>, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT definition_json, CAST(started_at AS BLOB)
+             FROM automation_runs WHERE id = ?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("failed to read the run's pinned postcondition: {error}"))?;
+    let Some((Some(definition_json), started_at)) = row else {
+        return Ok(None);
+    };
+    let Ok(definition) = serde_json::from_str::<Value>(&definition_json) else {
+        return Ok(None);
+    };
+    let Some(declared) = definition
+        .get("postcondition")
+        .filter(|postcondition| !postcondition.is_null())
+    else {
+        return Ok(None);
+    };
+    let Ok(postcondition) = serde_json::from_value::<RoutinePostcondition>(declared.clone()) else {
+        return unmet("the pinned postcondition could not be read");
+    };
+    let Some(Ok(timezone)) = definition
+        .get("timezone")
+        .map(|timezone| serde_json::from_value::<RoutineTimezone>(timezone.clone()))
+    else {
+        return unmet("the pinned timezone could not be read");
+    };
+    let Some(Ok(started_at)) = started_at
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(DateTime::parse_from_rfc3339)
+    else {
+        return unmet("the run's start time could not be read");
+    };
+    let output = match session_id {
+        Some(session_id) => match session_output(conn, session_id) {
+            Ok((output, _altered)) => output,
+            Err(_) => return unmet("the session output could not be read"),
+        },
+        None => String::new(),
+    };
+    Ok(postcondition.unmet_reason(&RunContext {
+        cwd: definition.get("cwd").and_then(Value::as_str),
+        timezone,
+        started_at: started_at.with_timezone(&Utc),
+        output: &output,
+    }))
 }
 
 #[cfg(test)]
@@ -416,7 +674,10 @@ mod tests {
             "path": "{cwd}/memory/dreaming/days/2026-11-21.md",
             "mustMatchLines": ["^root={cwd}$"],
         }));
-        workspace.write_dream(&format!("root={}\n", workspace.cwd.replace('/', "x")));
+        // Temp dirs are named `.tmp…`, so the cwd holds a `.` that an
+        // unescaped pattern would let match any character.
+        assert!(workspace.cwd.contains('.'), "{}", workspace.cwd);
+        workspace.write_dream(&format!("root={}\n", workspace.cwd.replace('.', "x")));
         let run = workspace.run("", after_start());
         assert!(dotted.unmet_reason(&run).is_some());
         workspace.write_dream(&format!("root={}\n", workspace.cwd));

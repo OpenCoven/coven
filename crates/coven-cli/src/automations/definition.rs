@@ -489,6 +489,17 @@ impl RoutineDefinition {
                 "authority can only be declared through the versioned definition API".to_string(),
             );
         }
+        // The same holds for a postcondition: dropping it would record a run
+        // that wrote nothing as succeeded (coven#1818).
+        if value
+            .get("postcondition")
+            .is_some_and(|postcondition| !postcondition.is_null())
+        {
+            return Err(
+                "postcondition can only be declared through the versioned definition API"
+                    .to_string(),
+            );
+        }
         Self::from_json(&Self::legacy_wire_projection(value))
     }
 
@@ -603,6 +614,18 @@ impl RoutineDefinition {
         }
         if let Some(authority) = &self.authority {
             authority.validate()?;
+        }
+        if let Some(postcondition) = &self.postcondition {
+            // Runtime Authority runs settle from verified terminal evidence,
+            // which does not judge a postcondition yet. Refuse rather than
+            // accept one that would never be checked.
+            if self.authority.is_some() {
+                return Err(
+                    "postcondition is not supported on a routine that declares authority"
+                        .to_string(),
+                );
+            }
+            postcondition.validate(self.cwd.as_deref())?;
         }
         Ok(())
     }
