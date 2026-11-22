@@ -913,7 +913,7 @@ dependencies = [
 [[package]]
 name = "coven-host"
 version = "0.1.0"
-source = "git+https://github.com/OpenCoven/coven-host?rev=65927dd5e64d732cb99926bed66492994acdcec5#65927dd5e64d732cb99926bed66492994acdcec5"
+source = "git+https://github.com/OpenCoven/coven-host?rev=61eca6b524f691eb1c57ed671a0ac88130ec76b2#61eca6b524f691eb1c57ed671a0ac88130ec76b2"
 dependencies = [
  "anyhow",
  "axum",
