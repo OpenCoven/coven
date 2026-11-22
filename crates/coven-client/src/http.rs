@@ -180,6 +180,43 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Dispatch one typed host operation after authenticating the local daemon and
+    /// negotiating hostSync. A run ticket keeps peer transfer latency off the IPC deadline.
+    pub fn host(&mut self, operation: crate::host::HostOperation) -> Result<Value, ClientError> {
+        use crate::host::HostOperation::*;
+        self.ensure_health()?;
+        let missing = (!self.capabilities()?.host_sync).then_some("hostSync");
+        self.reject_missing_capability(missing)?;
+        let (method, path, body) = match operation {
+            Init(input) => (
+                "POST",
+                "/api/v1/host/init",
+                Some(serde_json::to_vec(&input)),
+            ),
+            Connect(input) => (
+                "POST",
+                "/api/v1/host/connect",
+                Some(serde_json::to_vec(&input)),
+            ),
+            Sync => ("POST", "/api/v1/host/sync", None),
+            Result(run) => (
+                "POST",
+                "/api/v1/host/result",
+                Some(serde_json::to_vec(&run)),
+            ),
+            Status => ("GET", "/api/v1/host/status", None),
+            Watch => ("POST", "/api/v1/host/watch", None),
+            Resolve(input) => (
+                "POST",
+                "/api/v1/host/resolve",
+                Some(serde_json::to_vec(&input)),
+            ),
+        };
+        let body = body.transpose().map_err(ClientError::InvalidJson)?;
+        let response = self.send_bound(method, path, body.as_deref())?;
+        self.decode(response)
+    }
+
     fn ensure_health(&mut self) -> Result<(), ClientError> {
         if self.negotiated.is_some() {
             Ok(())

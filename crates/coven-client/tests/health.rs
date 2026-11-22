@@ -615,6 +615,27 @@ fn raw_json_request_binds_peer_and_renegotiates_only_on_next_call() {
 
 #[cfg(unix)]
 #[test]
+fn old_daemon_refuses_host_operation_before_transmission() {
+    let home = TestHome::new();
+    let server = serve_responses(
+        &home.path,
+        vec![
+            ("/api/v1/health".to_owned(), 200, HEALTH.to_owned()),
+            ("<peer-check>".to_owned(), 0, String::new()),
+        ],
+    );
+    let mut client = DaemonClient::new(DaemonEndpoint::discover(&home.path).unwrap());
+    assert!(matches!(
+        client.host(coven_client::host::HostOperation::Sync),
+        Err(ClientError::CapabilityUnavailable {
+            capability: "hostSync"
+        })
+    ));
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn missing_sessions_capability_blocks_sessions_but_not_events() {
     let home = TestHome::new();
     let health = health_with_capabilities(serde_json::json!({

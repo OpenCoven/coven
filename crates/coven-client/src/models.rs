@@ -24,6 +24,8 @@ pub struct HealthCapabilities {
     pub event_cursor: Option<String>,
     #[serde(default)]
     pub structured_errors: bool,
+    #[serde(default)]
+    pub host_sync: bool,
 }
 
 #[derive(Clone, Debug)]

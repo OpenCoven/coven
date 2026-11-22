@@ -320,6 +320,106 @@ fn daemon_status_recovers_corrupt_metadata_from_live_daemon_health() -> anyhow::
     Ok(())
 }
 
+/// A caller's pipes must close when the caller closes them, whether or not it
+/// started the daemon in between (#1806). The caller here holds pipe write
+/// ends without close-on-exec, like a shell after `exec 3> fifo`: one at fd 3
+/// and one well above the low range a fixed-range close would cover.
+#[test]
+fn daemon_start_does_not_hand_the_callers_descriptors_to_the_daemon() -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    const HIGH_FD: libc::c_int = 100;
+
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+    let _daemon_guard = DaemonGuard {
+        coven: coven.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+
+    let mut readers = Vec::new();
+    let mut writers = Vec::new();
+    for _ in 0..2 {
+        let (reader, writer) = std::io::pipe()?;
+        readers.push(reader);
+        writers.push(writer);
+    }
+    let low_source = writers[0].as_raw_fd();
+    let high_source = writers[1].as_raw_fd();
+    // The first dup2 must not overwrite the second source.
+    assert_ne!(high_source, 3, "pipe landed on the fixture's target fd");
+    let mut command = Command::new(&coven);
+    command
+        .args(["daemon", "start"])
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .stdin(Stdio::null());
+    // SAFETY: dup2 and fcntl are async-signal-safe. The explicit F_SETFD also
+    // clears close-on-exec when a source already is the target number, which
+    // dup2 alone would leave set.
+    unsafe {
+        command.pre_exec(move || {
+            for (source, target) in [(low_source, 3), (high_source, HIGH_FD)] {
+                if libc::dup2(source, target) == -1 || libc::fcntl(target, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let start = command.output()?;
+    assert_success("daemon start while holding pipes on fd 3 and 100", &start);
+    wait_for_daemon_health(&coven_home)?;
+
+    // The launcher has exited and the daemon has already exec'd, so once this
+    // process drops its own copies the daemon is the only lasting writer. A
+    // child that another test thread forks in the meantime also copies the
+    // write ends, but only until its own exec closes them (they are
+    // close-on-exec here), so wait for end of file instead of sampling once.
+    drop(writers);
+    // Hang guard only: a sibling's fork-to-exec window is milliseconds, while
+    // the unfixed daemon holds the pipe until it is stopped.
+    const EOF_GUARD: Duration = Duration::from_secs(30);
+    for (reader, fd) in readers.iter_mut().zip([3, HIGH_FD]) {
+        let started = Instant::now();
+        loop {
+            let remaining = EOF_GUARD.saturating_sub(started.elapsed());
+            let mut poll_fd = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd for a descriptor this test owns.
+            let ready =
+                unsafe { libc::poll(&mut poll_fd, 1, remaining.as_millis() as libc::c_int) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("poll the fd {fd} pipe: {error}");
+            }
+            assert!(
+                ready > 0,
+                "the daemon kept the caller's pipe open on fd {fd}; its reader saw no end of file within {:?}",
+                started.elapsed()
+            );
+            let mut byte = [0_u8; 1];
+            match reader.read(&mut byte) {
+                Ok(0) => break,
+                Ok(read) => panic!("unexpected {read} byte(s) on the fd {fd} pipe"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("read the fd {fd} pipe: {error}"),
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn daemon_start_is_idempotent_when_daemon_is_already_running() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
@@ -463,6 +563,157 @@ fn daemon_start_names_a_coven_home_too_long_for_its_socket() -> anyhow::Result<(
     assert!(!stderr.contains("timed out waiting"), "{stderr}");
     // The pre-flight refusal, not the startup-health timeout: no daemon ran.
     assert!(!coven_home.join("daemon.json").exists());
+    Ok(())
+}
+
+#[test]
+fn host_resolve_waits_for_a_peer_beyond_one_daemon_response_deadline() -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let temporary = tempfile::tempdir()?;
+    let base = temporary.path().canonicalize()?;
+    let home = base.join("home");
+    let root = base.join("folder");
+    let token = base.join("access");
+    fs::write(
+        &token,
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ),
+    )?;
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600))?;
+    let binary = coven_bin();
+    let _cleanup = DaemonGuard {
+        coven: binary.clone(),
+        coven_home: home.clone(),
+        path: std::env::var_os("PATH").unwrap_or_default(),
+    };
+    let host = |args: &[&str]| {
+        Command::new(&binary)
+            .arg("host")
+            .args(args)
+            .env("COVEN_HOME", &home)
+            .env_remove("COVEN_HOST_STATE")
+            .output()
+    };
+    assert_success(
+        "initialize folder",
+        &host(&["init", "--root", root.to_str().unwrap()])?,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let slow = Arc::new(AtomicBool::new(false));
+    let delay_peer = slow.clone();
+    let peer = thread::spawn(move || -> anyhow::Result<()> {
+        let remote = b"remote";
+        let inventory = serde_json::to_vec(&json!({
+            "host": "a".repeat(32),
+            "files": [{"path":"files/note","revision":1,"sha256":coven_host::digest(remote),"size":remote.len()}]
+        }))?;
+        loop {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let mut request = String::new();
+            let mut reader = BufReader::new(&stream);
+            reader.read_line(&mut request)?;
+            let mut header = String::new();
+            loop {
+                header.clear();
+                anyhow::ensure!(
+                    reader.read_line(&mut header)? > 0,
+                    "incomplete test request"
+                );
+                if header == "\r\n" {
+                    break;
+                }
+            }
+            let transfer = match request.split_whitespace().nth(1) {
+                Some("/v1/castles/demo/files") => false,
+                Some("/v1/castles/demo/files/files/note") => true,
+                _ => anyhow::bail!("unexpected test peer request"),
+            };
+            let slow = delay_peer.load(Ordering::Acquire);
+            // Each GET fits the peer's five seconds. Together the inventory and
+            // body require longer than the local daemon's five-second IPC budget.
+            if slow {
+                thread::sleep(Duration::from_secs(3));
+            }
+            let bytes: &[u8] = if transfer { remote } else { &inventory };
+            write!(stream,"HTTP/1.1 200 OK\r\nConnection: close\r\nX-Revision: 1\r\nContent-Length: {}\r\n\r\n",bytes.len())?;
+            stream.write_all(bytes)?;
+            if transfer && slow {
+                return Ok(());
+            }
+        }
+    });
+    assert_success(
+        "configure peer",
+        &host(&["connect", &url, "--token-file", token.to_str().unwrap()])?,
+    );
+    let file = root.join("Castles/demo/files/note");
+    fs::write(&file, b"local")?;
+    let conflict = host(&["sync"])?;
+    assert_failure("create conflict", &conflict);
+    assert!(String::from_utf8_lossy(&conflict.stdout).contains("unresolved conflicts"));
+    slow.store(true, Ordering::Release);
+    let resolved = host(&["resolve", "files/note", "--remote"])?;
+    assert_success("await delayed resolution", &resolved);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&resolved.stdout)?,
+        json!({"ok":true})
+    );
+    assert_eq!(fs::read(&file)?, b"remote");
+    peer.join().expect("peer thread")?;
+    Ok(())
+}
+
+#[test]
+fn host_status_recovers_a_stale_socket_after_daemon_crash() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let base = temporary.path().canonicalize()?;
+    let coven_home = base.join("home");
+    let root = base.join("folder");
+    let binary = coven_bin();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let _cleanup = DaemonGuard {
+        coven: binary.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+    let mut daemon = ChildGuard::spawn(
+        Command::new(&binary)
+            .args(["daemon", "serve"])
+            .env("COVEN_HOME", &coven_home)
+            .env_remove("COVEN_HOST_STATE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
+    wait_for_daemon_health(&coven_home)?;
+    let host = |args: &[&str]| {
+        Command::new(&binary)
+            .arg("host")
+            .args(args)
+            .env("COVEN_HOME", &coven_home)
+            .env_remove("COVEN_HOST_STATE")
+            .output()
+    };
+    assert_success(
+        "initial host init",
+        &host(&["init", "--root", root.to_str().unwrap()])?,
+    );
+    daemon.terminate()?;
+    assert!(coven_home.join("coven.sock").exists());
+    let status = host(&["status"])?;
+    assert_success("status after daemon crash", &status);
+    let body: Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(body["root"].as_str(), root.to_str());
+    assert_ne!(daemon_status_pid(&coven_home)?, u64::from(daemon.id()));
     Ok(())
 }
 
