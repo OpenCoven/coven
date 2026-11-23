@@ -279,6 +279,43 @@ accepted -> running -> succeeded | failed | cancelled | timed_out | ambiguous
 
 `accepted` commits before any consequential side effect. A run spans its attempts: retry/recover increments `attemptCount` and swaps `currentAttemptId`; terminal `terminalDisposition` is written exactly once.
 
+#### Postconditions (coven#1818)
+
+Exit code 0 means only that the runtime stopped cleanly. A flat `RoutineDefinition` can declare what a successful run leaves behind:
+
+```json
+"postcondition": {
+  "kind": "file",
+  "path": "{cwd}/memory/dreaming/days/{localYesterday}.md",
+  "mustMatchLines": [
+    "^<!-- coven:dream:v1 date={localYesterday} status=(dreamed|no-input) -->$",
+    "^generatedAt: *\\S"
+  ],
+  "modifiedDuringRun": true,
+  "acceptLeftAsWritten": true
+}
+```
+
+- `kind` is `file`, the only kind so far. Unknown members are refused.
+- `path` is required and at most 1024 characters. After substitution it must be rooted and must not contain a `..` component.
+- `mustMatchLines` lists at most 16 regular expressions of at most 512 characters each. Each must match at least one line of the file.
+- `modifiedDuringRun` requires the file's modification time to be no earlier than the run's `started_at`, less 2 seconds for coarse filesystem clocks.
+- `acceptLeftAsWritten` requires `modifiedDuringRun`. It waives the time check when the session's final output line is exactly `left as written <resolved path>`.
+- `path` and the patterns can use these placeholders:
+  - `{cwd}`: the routine's `cwd`, which must then be set.
+  - `{localToday}` and `{localYesterday}`: the run's start date and the day before it, in the routine's timezone, as `YYYY-MM-DD`.
+- Inside a pattern, a substituted value matches literally. `path` refuses any other `{name}` placeholder.
+
+Plain settlement checks the postcondition from the run's pinned definition revision, so revising the routine mid-run neither adds nor removes it. The check runs only when the session completed with exit code 0 before its deadline. In order:
+
+1. If any line of the clean session output starts with `Not logged in`, the run is `blocked: the runtime is not logged in`.
+2. If the final non-empty output line starts with `failed:`, the run is `postcondition_unmet: the final output line reports failure`.
+3. If the file is missing, unreadable, larger than 4 MiB, lacks a required line, or wasn't modified during the run (and wasn't waived), the run is `postcondition_unmet: <what is wrong>`.
+
+Terminal escape sequences are removed and lines are trimmed before matching. An unmet postcondition settles the attempt `failed` with that reason, exactly like a non-zero exit. Before the deadline it is held for an operator retry. After the deadline the run and occurrence settle `failed`, and the reason remains on the attempt. `blocked` is a reason prefix, not a run status.
+
+Routines without a postcondition keep exit-code success, whatever their output says. A routine that declares `authority` cannot declare a postcondition yet, because Runtime Authority runs settle from their verified terminal evidence. The unversioned `coven.automations.create` and `coven.automations.update` refuse a non-null `postcondition` rather than drop it, as they do `authority`. Declare it with `definition.create.v1` or `definition.revise.v1`.
+
 ### Definition
 
 ```text

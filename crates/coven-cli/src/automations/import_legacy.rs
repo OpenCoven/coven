@@ -187,6 +187,7 @@ fn plan_codex_import(root: &Path) -> Result<ImportPlan> {
             model: None,
             tags: Vec::new(),
             authority: None,
+            postcondition: None,
         };
 
         if let Err(error) = definition.validate() {

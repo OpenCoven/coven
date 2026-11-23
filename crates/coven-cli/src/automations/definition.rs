@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use super::contract::types::{BackoffPolicy, RetryableClass};
+use super::postcondition::RoutinePostcondition;
 use super::rrule::{parse_rrule, ParsedRrule};
 
 pub const AUTOMATION_SCHEMA_VERSION: u32 = 1;
@@ -462,6 +463,11 @@ pub struct RoutineDefinition {
     /// an ordinary run.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub authority: Option<RoutineAuthority>,
+    /// What a successful run leaves behind (coven#1818). A run that exits 0
+    /// without meeting it settles `failed`. Only the versioned definition API
+    /// sets it; the legacy projection refuses it rather than drop it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub postcondition: Option<RoutinePostcondition>,
 }
 
 impl RoutineDefinition {
@@ -481,6 +487,17 @@ impl RoutineDefinition {
         if value.get("authority").is_some() {
             return Err(
                 "authority can only be declared through the versioned definition API".to_string(),
+            );
+        }
+        // The same holds for a postcondition: dropping it would record a run
+        // that wrote nothing as succeeded (coven#1818).
+        if value
+            .get("postcondition")
+            .is_some_and(|postcondition| !postcondition.is_null())
+        {
+            return Err(
+                "postcondition can only be declared through the versioned definition API"
+                    .to_string(),
             );
         }
         Self::from_json(&Self::legacy_wire_projection(value))
@@ -597,6 +614,18 @@ impl RoutineDefinition {
         }
         if let Some(authority) = &self.authority {
             authority.validate()?;
+        }
+        if let Some(postcondition) = &self.postcondition {
+            // Runtime Authority runs settle from verified terminal evidence,
+            // which does not judge a postcondition yet. Refuse rather than
+            // accept one that would never be checked.
+            if self.authority.is_some() {
+                return Err(
+                    "postcondition is not supported on a routine that declares authority"
+                        .to_string(),
+                );
+            }
+            postcondition.validate(self.cwd.as_deref())?;
         }
         Ok(())
     }
@@ -962,6 +991,71 @@ mod tests {
         ] {
             assert!(error.contains(expected), "{expected}: {error}");
         }
+    }
+
+    fn with_postcondition(mut value: Value) -> Value {
+        value["cwd"] = json!("/work/echo");
+        value["postcondition"] = json!({
+            "kind": "file",
+            "path": "{cwd}/memory/dreaming/days/{localYesterday}.md",
+            "mustMatchLines": ["^generatedAt: *\\S"],
+            "modifiedDuringRun": true,
+            "acceptLeftAsWritten": true
+        });
+        value
+    }
+
+    #[test]
+    fn a_declared_postcondition_is_kept_through_validation_and_serialization() {
+        let definition = RoutineDefinition::from_json(&with_postcondition(valid_definition()))
+            .expect("a valid postcondition");
+        let postcondition = definition.postcondition.as_ref().unwrap();
+        assert!(postcondition.modified_during_run);
+        let serialized = serde_json::to_value(&definition).unwrap();
+        assert_eq!(
+            serialized["postcondition"],
+            with_postcondition(valid_definition())["postcondition"]
+        );
+        // A routine without one serializes exactly as before.
+        let plain = RoutineDefinition::from_json(&valid_definition()).unwrap();
+        assert!(serde_json::to_value(plain)
+            .unwrap()
+            .get("postcondition")
+            .is_none());
+    }
+
+    #[test]
+    fn a_postcondition_is_validated_against_the_routine() {
+        let mut no_cwd = with_postcondition(valid_definition());
+        no_cwd.as_object_mut().unwrap().remove("cwd");
+        let error = RoutineDefinition::from_json(&no_cwd).unwrap_err();
+        assert!(
+            error.contains("uses {cwd} but the routine has no cwd"),
+            "{error}"
+        );
+
+        let mut under_authority = with_postcondition(valid_definition());
+        under_authority["authority"] = r0_authority();
+        let error = RoutineDefinition::from_json(&under_authority).unwrap_err();
+        assert!(
+            error.contains("postcondition is not supported on a routine that declares authority"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_legacy_api_refuses_rather_than_drops_a_postcondition() {
+        let error = RoutineDefinition::from_legacy_json(&with_postcondition(valid_definition()))
+            .unwrap_err();
+        assert!(
+            error.contains(
+                "postcondition can only be declared through the versioned definition API"
+            ),
+            "{error}"
+        );
+        let mut null = valid_definition();
+        null["postcondition"] = Value::Null;
+        assert!(RoutineDefinition::from_legacy_json(&null).is_ok());
     }
 
     #[test]
