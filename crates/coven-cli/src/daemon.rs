@@ -3075,7 +3075,9 @@ fn report_unreachable_duplicate_daemons(coven_home: PathBuf, active_pid: u32, de
             let _ = finished_tx.send(());
             return;
         }
-        let mut sys = System::new_all();
+        let Ok(mut sys) = System::new_all() else {
+            return;
+        };
         sys.refresh_all();
         for (pid, process) in sys.processes() {
             if Instant::now() >= deadline {
