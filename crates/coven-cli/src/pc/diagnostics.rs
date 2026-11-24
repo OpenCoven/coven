@@ -32,7 +32,7 @@ pub struct DiskInfo {
 }
 
 pub fn snapshot(verbose: bool) -> Result<SystemSnapshot> {
-    let mut sys = System::new_all();
+    let mut sys = System::new_all()?;
     // Sleep the minimum interval so CPU usage is meaningful
     std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
     sys.refresh_all();
@@ -42,7 +42,7 @@ pub fn snapshot(verbose: bool) -> Result<SystemSnapshot> {
     let memory_total_mb = sys.total_memory() / 1024 / 1024;
     let swap_used_mb = sys.used_swap() / 1024 / 1024;
     let swap_total_mb = sys.total_swap() / 1024 / 1024;
-    let uptime_secs = System::uptime();
+    let uptime_secs = System::uptime()?;
 
     let mut processes: Vec<ProcessInfo> = sys
         .processes()
@@ -72,7 +72,7 @@ pub fn snapshot(verbose: bool) -> Result<SystemSnapshot> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let disk_list = Disks::new_with_refreshed_list();
+    let disk_list = Disks::new_with_refreshed_list()?;
     let disks: Vec<DiskInfo> = disk_list
         .iter()
         .map(|d| {
