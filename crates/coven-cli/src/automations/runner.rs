@@ -4432,10 +4432,18 @@ pub(crate) fn settle_finished_runs_with(
                     }
                     _ => false,
                 });
-        let succeeded = !ambiguous
+        let exited_cleanly = !ambiguous
             && session_status.as_deref() == Some("completed")
             && exit_code == Some(0)
             && !timed_out;
+        // Exit code 0 is success only once the run's pinned postcondition,
+        // if it declares one, is met (coven#1818).
+        let postcondition_unmet = if exited_cleanly {
+            super::postcondition::check_run(&transaction, &run_id, session_id.as_deref())?
+        } else {
+            None
+        };
+        let succeeded = exited_cleanly && postcondition_unmet.is_none();
         let cancelled = !ambiguous && session_status.as_deref() == Some("cancelled") && !timed_out;
         let status = if succeeded {
             "succeeded"
@@ -4460,6 +4468,8 @@ pub(crate) fn settle_finished_runs_with(
             Some("terminal session evidence observed after an ambiguous stop outcome".to_string())
         } else if succeeded {
             None
+        } else if let Some(reason) = postcondition_unmet {
+            Some(reason)
         } else if timed_out {
             Some(match session_status.as_deref() {
                 Some("completed") => "session completed after automation timeout".to_string(),
@@ -8446,6 +8456,237 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "running");
+    }
+
+    /// A routine whose run must leave `{cwd}/{localToday}.md` with a
+    /// `generatedAt:` line, written during the run (coven#1818).
+    fn postcondition_definition(id: &str, cwd: &std::path::Path) -> RoutineDefinition {
+        RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": id,
+            "name": id,
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": cwd.to_str().unwrap(),
+            "familiarId": "charm",
+            "prompt": "Write today's entry.",
+            "postcondition": {
+                "kind": "file",
+                "path": "{cwd}/{localToday}.md",
+                "mustMatchLines": ["^generatedAt: *\\S"],
+                "modifiedDuringRun": true,
+                "acceptLeftAsWritten": true
+            }
+        }))
+        .unwrap()
+    }
+
+    /// Launches `definition`, lets `work` act while the session runs, records
+    /// `output`, and completes the session with exit code 0. Returns the
+    /// launch instant and the session's end.
+    fn run_to_exit_zero(
+        conn: &Connection,
+        definition: &RoutineDefinition,
+        output: &str,
+        work: impl FnOnce(DateTime<Utc>),
+    ) -> (DateTime<Utc>, DateTime<Utc>) {
+        insert_definition(conn, definition).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            conn,
+            &crate::api::NoopSessionRuntime,
+            definition,
+            launched_at,
+        )
+        .unwrap();
+        let session_id = outcome.session_id.unwrap();
+        work(launched_at);
+        crate::store::insert_event(
+            conn,
+            &crate::store::EventRecord {
+                seq: 0,
+                id: format!("event-{session_id}"),
+                session_id: session_id.clone(),
+                kind: "output".to_owned(),
+                payload_json: json!({ "data": output }).to_string(),
+                created_at: launched_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            },
+        )
+        .unwrap();
+        let finished_at = launched_at + chrono::Duration::seconds(5);
+        crate::store::update_session_terminal_if_active(
+            conn,
+            &session_id,
+            "completed",
+            Some(0),
+            &finished_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap();
+        (launched_at, finished_at)
+    }
+
+    /// The run's status once settlement has run at the session's end and
+    /// again past the run's deadline, with every recorded reason.
+    fn settle_through_deadline(
+        conn: &Connection,
+        automation_id: &str,
+        launched_at: DateTime<Utc>,
+        finished_at: DateTime<Utc>,
+    ) -> (String, Vec<String>) {
+        settle_finished_runs(conn, finished_at).unwrap();
+        settle_finished_runs(conn, launched_at + chrono::Duration::minutes(31)).unwrap();
+        let runs = super::super::runs::list_runs(conn, automation_id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        let mut reasons: Vec<String> = conn
+            .prepare(
+                "SELECT state_reason FROM automation_attempts
+                 WHERE run_id = ?1 AND state_reason IS NOT NULL
+                 UNION ALL
+                 SELECT failure_reason FROM automation_occurrences
+                 WHERE automation_id = ?2 AND failure_reason IS NOT NULL",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![runs[0].id, automation_id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        reasons.sort();
+        (runs[0].status.clone(), reasons)
+    }
+
+    fn today_file(cwd: &std::path::Path, launched_at: DateTime<Utc>) -> std::path::PathBuf {
+        cwd.join(format!("{}.md", launched_at.format("%Y-%m-%d")))
+    }
+
+    #[test]
+    fn exit_zero_without_the_declared_output_settles_postcondition_unmet() {
+        let (temp, conn) = temp_store();
+        let definition = postcondition_definition("journal", temp.path());
+        let (launched_at, finished_at) =
+            run_to_exit_zero(&conn, &definition, "wrote today's entry\n", |_| {});
+
+        let report = settle_finished_runs(&conn, finished_at).unwrap();
+        assert_eq!(report.succeeded, 0, "exit 0 alone is not success");
+
+        let (status, reasons) = settle_through_deadline(&conn, "journal", launched_at, finished_at);
+        assert_eq!(status, "failed");
+        assert!(
+            reasons.iter().any(|reason| reason
+                .starts_with("postcondition_unmet: the declared file does not exist")),
+            "{reasons:?}"
+        );
+        let occurrence: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE automation_id = 'journal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(occurrence, "failed");
+    }
+
+    #[test]
+    fn exit_zero_with_a_signed_out_runtime_settles_blocked() {
+        let (temp, conn) = temp_store();
+        let definition = postcondition_definition("journal", temp.path());
+        let (launched_at, finished_at) = run_to_exit_zero(
+            &conn,
+            &definition,
+            "Not logged in · Please run /login\n",
+            |_| {},
+        );
+
+        let (status, reasons) = settle_through_deadline(&conn, "journal", launched_at, finished_at);
+        assert_eq!(status, "failed");
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.starts_with("blocked: the runtime is not logged in")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn exit_zero_after_writing_the_declared_output_succeeds() {
+        let (temp, conn) = temp_store();
+        let definition = postcondition_definition("journal", temp.path());
+        let cwd = temp.path().to_path_buf();
+        let (_, finished_at) = run_to_exit_zero(&conn, &definition, "wrote it\n", |launched_at| {
+            std::fs::write(
+                today_file(&cwd, launched_at),
+                "---\ngeneratedAt: 2026-11-22T18:00:00Z\n---\nentry\n",
+            )
+            .unwrap();
+        });
+
+        let report = settle_finished_runs(&conn, finished_at).unwrap();
+        assert_eq!(report.succeeded, 1);
+        let runs = super::super::runs::list_runs(&conn, "journal", 10).unwrap();
+        assert_eq!(runs[0].status, "succeeded");
+    }
+
+    #[test]
+    fn an_unreadable_run_start_fails_the_postcondition_not_the_pass() {
+        let (temp, conn) = temp_store();
+        let definition = postcondition_definition("journal", temp.path());
+        let (launched_at, finished_at) = run_to_exit_zero(&conn, &definition, "wrote it\n", |_| {});
+        conn.execute(
+            "UPDATE automation_runs SET started_at = 7 WHERE automation_id = 'journal'",
+            [],
+        )
+        .unwrap();
+
+        let (status, reasons) = settle_through_deadline(&conn, "journal", launched_at, finished_at);
+        assert_eq!(status, "failed");
+        assert!(
+            reasons.iter().any(|reason| reason
+                .starts_with("postcondition_unmet: the run's start time could not be read")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn a_routine_without_a_postcondition_keeps_exit_code_success() {
+        let (_temp, conn) = temp_store();
+        let (_, finished_at) = run_to_exit_zero(
+            &conn,
+            &definition("daily"),
+            "Not logged in · Please run /login\nfailed: nothing written\n",
+            |_| {},
+        );
+
+        let report = settle_finished_runs(&conn, finished_at).unwrap();
+        assert_eq!(report.succeeded, 1);
+        let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
+        assert_eq!(runs[0].status, "succeeded");
+    }
+
+    #[test]
+    fn a_postcondition_pinned_at_launch_judges_the_run_after_a_revision() {
+        let (temp, conn) = temp_store();
+        let definition = postcondition_definition("journal", temp.path());
+        let (launched_at, finished_at) = run_to_exit_zero(&conn, &definition, "done\n", |_| {
+            // Dropping the postcondition mid-run does not excuse this run.
+            let mut revised = postcondition_definition("journal", temp.path());
+            revised.postcondition = None;
+            crate::automations::store::update_definition(&conn, &revised).unwrap();
+        });
+
+        let (status, reasons) = settle_through_deadline(&conn, "journal", launched_at, finished_at);
+        assert_eq!(status, "failed");
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.starts_with("postcondition_unmet:")),
+            "{reasons:?}"
+        );
     }
 
     #[test]
