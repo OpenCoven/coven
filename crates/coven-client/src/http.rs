@@ -214,7 +214,12 @@ impl DaemonClient {
             Resolve(input) => ("POST", "resolve", Some(serde_json::to_vec(&input))),
         };
         let body = body.transpose().map_err(ClientError::InvalidJson)?;
-        let response = self.send_bound(method, action, body.as_deref())?;
+        let path = if castle == "demo" {
+            format!("/api/v1/host/{action}")
+        } else {
+            format!("/api/v1/host/castles/{castle}/{action}")
+        };
+        let response = self.send_bound(method, &path, body.as_deref())?;
         self.decode(response)
     }
 
