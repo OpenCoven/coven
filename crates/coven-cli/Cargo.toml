@@ -53,7 +53,7 @@ required-features = ["threads-test-clock"]
 
 [dependencies]
 # Rust Castle reconciliation and the independently runnable authenticated peer.
-coven-host = { git = "https://github.com/OpenCoven/coven-host", rev = "c39e4474be545ae64fdb6bc88bcfa7e3443286be", version = "0.1.0" }
+coven-host = { git = "https://github.com/OpenCoven/coven-host", rev = "3bbc5cd5b0212e8e036c07eacad58aafcbc66185", version = "0.1.0" }
 coven-afs = { path = "../coven-afs", version = "0.1.0" }
 coven-client = { package = "opencoven-coven-client", path = "../coven-client", version = "0.1.0" }
 anyhow = "1"

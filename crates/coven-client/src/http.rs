@@ -183,37 +183,38 @@ impl DaemonClient {
     /// Dispatch one typed host operation after authenticating the local daemon and
     /// negotiating hostSync. A run ticket keeps peer transfer latency off the IPC deadline.
     pub fn host(&mut self, operation: crate::host::HostOperation) -> Result<Value, ClientError> {
+        self.host_for_castle("demo", operation)
+    }
+
+    /// Run an operation or poll its ticket in the selected Castle.
+    pub fn host_for_castle(
+        &mut self,
+        castle: &str,
+        operation: crate::host::HostOperation,
+    ) -> Result<Value, ClientError> {
+        if castle.is_empty()
+            || castle.len() > 63
+            || !castle
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        {
+            return Err(ClientError::InvalidRouteParameter("castle"));
+        }
         use crate::host::HostOperation::*;
         self.ensure_health()?;
         let missing = (!self.capabilities()?.host_sync).then_some("hostSync");
         self.reject_missing_capability(missing)?;
-        let (method, path, body) = match operation {
-            Init(input) => (
-                "POST",
-                "/api/v1/host/init",
-                Some(serde_json::to_vec(&input)),
-            ),
-            Connect(input) => (
-                "POST",
-                "/api/v1/host/connect",
-                Some(serde_json::to_vec(&input)),
-            ),
-            Sync => ("POST", "/api/v1/host/sync", None),
-            Result(run) => (
-                "POST",
-                "/api/v1/host/result",
-                Some(serde_json::to_vec(&run)),
-            ),
-            Status => ("GET", "/api/v1/host/status", None),
-            Watch => ("POST", "/api/v1/host/watch", None),
-            Resolve(input) => (
-                "POST",
-                "/api/v1/host/resolve",
-                Some(serde_json::to_vec(&input)),
-            ),
+        let (method, action, body) = match operation {
+            Init(input) => ("POST", "init", Some(serde_json::to_vec(&input))),
+            Connect(input) => ("POST", "connect", Some(serde_json::to_vec(&input))),
+            Sync => ("POST", "sync", None),
+            Result(run) => ("POST", "result", Some(serde_json::to_vec(&run))),
+            Status => ("GET", "status", None),
+            Watch => ("POST", "watch", None),
+            Resolve(input) => ("POST", "resolve", Some(serde_json::to_vec(&input))),
         };
         let body = body.transpose().map_err(ClientError::InvalidJson)?;
-        let response = self.send_bound(method, path, body.as_deref())?;
+        let response = self.send_bound(method, action, body.as_deref())?;
         self.decode(response)
     }
 

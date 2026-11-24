@@ -259,7 +259,7 @@ fn recover_startup_after_launch_error(
 
 #[derive(Default)]
 pub struct LiveSessionRuntime {
-    host_worker: Option<crate::host_sync::Worker>,
+    host_worker: Option<crate::host_sync::Workers>,
     coven_home: Option<PathBuf>,
     event_writer: Option<crate::event_writer::EventWriter>,
     sessions: Arc<Mutex<HashMap<String, LiveSessionHandle>>>,
@@ -685,7 +685,7 @@ impl LiveSessionRuntime {
     pub fn try_with_coven_home(coven_home: PathBuf) -> Result<Self> {
         let event_writer = crate::event_writer::EventWriter::start(coven_home.clone())?;
         Ok(Self {
-            host_worker: Some(crate::host_sync::Worker::new(&coven_home)),
+            host_worker: Some(crate::host_sync::Workers::new(&coven_home)),
             coven_home: Some(coven_home),
             event_writer: Some(event_writer),
             sessions: Arc::default(),
@@ -1249,7 +1249,7 @@ fn ensure_dir_trusted_in_config(config_path: &std::path::Path, dir: &str) {
 static CLAUDE_JSON_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl SessionRuntime for LiveSessionRuntime {
-    fn host_worker(&self) -> Option<&crate::host_sync::Worker> {
+    fn host_worker(&self) -> Option<&crate::host_sync::Workers> {
         self.host_worker.as_ref()
     }
 
