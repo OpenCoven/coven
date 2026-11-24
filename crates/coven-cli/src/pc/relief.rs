@@ -40,7 +40,7 @@ pub fn kill_by_pid(pid: u32, confirm: bool) -> Result<()> {
         bail!("Refusing to kill process {pid} without --confirm. Add --confirm to proceed.");
     }
 
-    let mut sys = System::new_all();
+    let mut sys = System::new_all()?;
     sys.refresh_all();
 
     let pid_key = Pid::from_u32(pid);

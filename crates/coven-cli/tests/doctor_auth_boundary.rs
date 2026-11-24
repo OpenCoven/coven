@@ -496,7 +496,7 @@ fn assert_success(label: &str, output: &Output) {
 
 fn process_is_running(pid: u32) -> bool {
     let pid = Pid::from_u32(pid);
-    let mut system = System::new();
+    let mut system = System::new().expect("initialize process inspection");
     system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
     system.process(pid).is_some()
 }
