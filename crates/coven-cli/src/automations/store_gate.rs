@@ -141,7 +141,8 @@ pub(crate) struct Withdrawal {
 /// 5. The familiar revision is neither retired nor revoked
 ///    (`FamiliarStatusInvalid`).
 /// 6. The definition revision is still current and active, as
-///    `owner_grants::authorize_scheduled_dispatch` requires
+///    `owner_grants::authorize_scheduled_dispatch` requires, or for a
+///    mission, still the internal definition its submit recorded
 ///    (`DefinitionMismatch`).
 /// 7. The run's `timeout_at` has not passed (`Stale`).
 ///
@@ -267,10 +268,23 @@ pub(crate) fn authorized(
         );
     }
 
-    // 6. The definition revision.
-    if super::owner_grants::current_and_active(conn, &held.automation_id, held.automation_revision)?
-        .is_err()
-    {
+    // 6. The definition revision. A mission's internal definition is stored
+    // disabled and never revised: its one-run grant holds while that
+    // definition is the one its submit recorded.
+    let current = match super::missions::grant_stands_if_mission(
+        conn,
+        &held.automation_id,
+        held.automation_revision,
+    )? {
+        Some(stands) => stands,
+        None => super::owner_grants::current_and_active(
+            conn,
+            &held.automation_id,
+            held.automation_revision,
+        )?
+        .is_ok(),
+    };
+    if !current {
         return withdrawn(
             AuthorityProfileErrorCode::DefinitionMismatch,
             "the definition revision is no longer current and active",

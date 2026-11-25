@@ -346,13 +346,26 @@ Rust reducer both canonically and with an exact duplicate delivery, requiring
 the same normalized final state and expected digest.
 `mission-commands` sends `mission.submit.v1`, `mission.get.v1` and
 `mission.cancel.v1` to a store holding one familiar whose first revision has
-been superseded, on a clock that advances a minute per step. It covers the
-vectors M0 can reach (M-01 to M-06, M-09, M-11, M-15, M-17 and M-18 in
-`docs/architecture/coven-automations-missions.md`): a replayed submit, a reused
-key, a stale revision, an unenforced envelope, the no-launch settlement, a
-cancel after it, another caller, every bound, and a submit's project read
-`scopes`, accepted or refused. It checks what each refusal leaves behind, as
-`command-envelope-outcomes` does, and an expected `scopes` must equal the
+been superseded, on a clock that advances a minute per step. It covers M-01
+to M-07, M-09 to M-15, M-17 and M-18 in
+`docs/architecture/coven-automations-missions.md`: a replayed submit, a reused
+key, a stale revision, an unenforced envelope (`r0-read.1` among them), the
+preflight's no-launch settlement, a cancel after it, another caller, every
+bound, and a submit's project read `scopes`, accepted or refused. A case on
+the `launching` runtime launches its mission through the trusted adapter
+under `r0-read.2`; its `session.end`, `daemon.tick` and `familiar.revoke`
+steps end the session (with a seeded clean or errored stream, or none), run
+the daemon's mission stop, run timeouts and settlement, and revoke the
+familiar revision,
+so it covers a cancel losing to conclusive completion, a harness result
+reporting an error that reads `failed` / `harness_failed`, an unobserved ending
+or timeout, a revocation while running, expiry before dispatch and a
+repeated read. A stop on that runtime reads the mission's state while it is
+in flight, which `whileStopping` names; `attempts` and `sessions` count what
+a step left, and `artifacts` the reports its view lists. That runtime skips
+the trusted launch, so the store gate is held by the live-runtime tests
+instead. It checks what each refusal leaves behind,
+as `command-envelope-outcomes` does, and an expected `scopes` must equal the
 view's whole. Values that exist only at
 run time, such as the familiar's ids and `validUntil`, are whole-string tokens
 such as `{{revisionId}}` and `{{start:10m}}`.

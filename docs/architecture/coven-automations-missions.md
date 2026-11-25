@@ -1,6 +1,6 @@
 ---
 title: "Automations missions"
-summary: "Approved contract (not implemented) for submitting, observing and cancelling one bounded familiar mission over coven.automations.v1."
+summary: "Approved contract for submitting, observing and cancelling one bounded familiar mission over coven.automations.v1; missions launch under r0-read.2 (#857)."
 read_when:
   - Designing or reviewing the mission commands for issue 1313
   - Building a client (SDK, CLI, Chat) that submits or observes a mission
@@ -10,9 +10,12 @@ source_adjacent_reason: "Defines the producer contract that OpenCoven/chat#155 a
 # Automations missions
 
 Status: **contract shape approved by Val on 2026-10-18. `mission.submit.v1`,
-`mission.get.v1` and `mission.cancel.v1` are implemented; under M0 no mission
-launches yet (see *Implementation notes*). The `mission-commands` conformance
-suite covers the vectors M0 can reach.** Written for #1313,
+`mission.get.v1` and `mission.cancel.v1` are implemented, and a mission
+launches under the scoped read envelope `r0-read.2` through Runtime Authority
+(#857; see *Implementation notes*). Containment is not certified, and
+Runtime Authority stays unadvertised. The `mission-commands` conformance
+suite covers every vector but M-08, M-11 (b) and M-16, which unit, client
+and transport tests hold.** Written for #1313,
 which replaces OpenCoven/coven-agents#261. Consumers: OpenCoven/chat#155 (native
 submit/observe/cancel) and the SDK client. Builds on
 [coven-automations-v1.md](coven-automations-v1.md) and
@@ -39,11 +42,12 @@ All decided by Val on 2026-10-18.
 
 | # | Question | Proposal |
 | --- | --- | --- |
-| 1 | What can the first mission do? | **M0 is a read-only diagnosis report** on the `r0-read.1` envelope, the only one that launches. Running tests waits for an exec envelope with enforced confinement (M1, under #857). This narrows chat#155's "diagnosis/test" to diagnosis until M1. |
+| 1 | What can the first mission do? | **M0 is a read-only diagnosis report** on the scoped read envelope `r0-read.2`, the only one a mission may name (it replaced `r0-read.1` for missions under #857). Running tests waits for an exec envelope with enforced confinement (M1, under #857). This narrows chat#155's "diagnosis/test" to diagnosis until M1. |
 | 2 | Is a mission a new resource? | **No.** `mission.submit` atomically records an internal one-shot definition, adopts the owner grant for it, and claims its single manual occurrence. The mission id and the occurrence id are derived from the same adoption key. The definition is never listed, scheduled or revised (see *Implementation notes*). |
 | 3 | Who authorizes a mission? | The **owner-local principal** (Decision 1 of the runtime-authority doc), over the owner-only socket or pipe. Submitting is the one-run owner grant, as `occurrence.runNow.v1` on an authority routine already is (decided 2026-10-05). TCP callers are refused before the store opens. |
 | 4 | Approvals? | **Reserved, not produced.** M0 launches only R0. An approval would unlock nothing until a writable envelope exists, the same reasoning slice 7 used. `needs_approval` is in the state set so clients render it once it exists. |
 | 5 | Where does usage come from? | The session's stream-json **result event**, recorded on the attempt when it settles and summed on the mission. Usage is reported, never estimated. A harness that reports none yields `usage: null`. |
+| 6 | Is an errored harness result a completion? | **No.** A run whose process exits cleanly but whose single result event reports `is_error: true`, or whose evidence records its result as not produced, settles the mission `failed` with reason `harness_failed`. It keeps the usage that event reports and lists no report. `completed` is reserved for a result that is not an error, with complete evidence. This is a mission projection only: routine and occurrence settlement are unchanged (decided 2026-11-06). |
 
 ## What a submit binds
 
@@ -54,7 +58,7 @@ Changing any field under the same adoption key is `ADOPTION_REPLAY_MISMATCH`.
 | --- | --- | --- |
 | `principal` | The owner-local principal, `principal:coven-local-owner:<hex>` | At submit, from the transport. Never from the body. |
 | `familiar.rootId`, `familiar.revisionId` | The exact revision the client showed the user | At submit **and** at dispatch: the revision must be the ledger's current active revision of that root |
-| `envelope` | `{ id: "r0-read.1", descriptorDigest }` | At submit: the daemon must advertise and enforce it. It advertises the list as `missionEnvelopes` on the `coven.automations` entry of `GET /api/v1/capabilities` (`coven missions envelopes --json`). |
+| `envelope` | `{ id: "r0-read.2", descriptorDigest }` | At submit: the daemon must advertise and enforce it. It advertises the list as `missionEnvelopes` on the `coven.automations` entry of `GET /api/v1/capabilities` (`coven missions envelopes --json`). |
 | `project.cwd` | An absolute, canonical directory | At submit: it exists, is a directory, and is not inside `COVEN_HOME` |
 | `task.statement` | A short title for the mission | 1–200 characters |
 | `task.prompt` | What the familiar is asked to do | 1 byte to 32 KiB |
@@ -137,9 +141,13 @@ interface MissionCancelResult {
 
 Decided by Val on 2026-10-20 (coven#857, decision 1): a mission says what the
 familiar may read with an optional `scopes` list of profile filesystem scopes
-on the project root. Implemented for #1597 as contract and storage only.
-Nothing reads the scopes yet, and a mission with scopes still settles
-`unavailable` / `authority_unavailable` without a launch.
+on the project root. Implemented for #1597 as contract and storage, and
+enforced since #857: the trusted adapter reads them from the mission row,
+which the request digest binds, and the scoped read service serves exactly
+them. A mission without scopes is recorded but never launches: the
+automation-authority profile grants reads only through scopes, so its decision
+is refused, the refusal rolls back with the launch, and the mission settles
+`unavailable` with reason `authority_unavailable` and no decision.
 
 - **One rule set.** The daemon validates each scope with the scoped read
   service's `Grants::from_scopes` under the R0 read policy, the rules the
@@ -209,17 +217,17 @@ keeps. The first matching row wins:
 
 | Mission state | When |
 | --- | --- |
-| `revoked` | The owner grant or the familiar revision was revoked, or the revision was superseded before dispatch. The run is stopped behind a stop fence; anything already done stays recorded. |
+| `revoked` | The owner grant or the familiar revision was revoked, or the revision was superseded before dispatch, and the occurrence has settled. A run stopped for a revocation is stopped behind a stop fence; anything already done stays recorded. While that stopped run awaits recovery it is `reconciling` instead, and a conclusive outcome it reached first stands. |
 | `rejected` | Refused before any launch: validation, envelope, expiry, stale revision at submit, or a no-launch receipt. |
 | `unavailable` | The daemon cannot construct the authority or runtime the mission needs (`AUTHORITY_ADAPTER_MISSING`, `AUTHORITY_TRUSTED_STATE_UNAVAILABLE`, `runtime_unavailable`). Not terminal while recovery is possible; terminal once the occurrence settles failed. |
 | `cancelling` | A cancellation is `requested` or `stopping`, or `CANCEL_PENDING`. |
-| `reconciling` | The occurrence is `recovering` or `recovery_required`, an attempt or run is `ambiguous`, or a cancellation is `recovery_required`. |
+| `reconciling` | The occurrence is `recovering` or `recovery_required`, an attempt or run is `ambiguous`, or a cancellation is `recovery_required`. The reason is `familiar_revision_revoked` when the daemon stopped the run for a revocation, and `ambiguous_execution` otherwise. |
 | `needs_approval` | Reserved (Decision 4). |
 | `running` | The occurrence is `dispatching` or `running`. |
 | `queued` | The occurrence is `planned`, `eligible` or `claimed`. |
-| `completed` | The run is `succeeded`. |
+| `completed` | The run is `succeeded` and its harness produced a result that is not an error. |
 | `cancelled` | The occurrence or run is `cancelled`. |
-| `failed` | The run is `failed` or `timed_out` (reason `timeout`). |
+| `failed` | The run is `failed` or `timed_out` (reason `timeout`), or it is `succeeded` but its harness's result event reports an error or no result was produced (reason `harness_failed`, Decision 6). |
 
 Terminal states never change, and `revision` stops increasing at the terminal
 state. A mission enters `reconciling` instead of reporting "nothing happened"
@@ -251,8 +259,10 @@ interface MissionResult {
 ```
 
 The report is the final assistant message of the session, bounded and stored as
-an owner-only artifact. M0 produces no patch: `outputTarget` stays refused until a
-writable envelope exists.
+an owner-only artifact. Only a `completed` mission lists it: a `harness_failed`
+mission reports the usage its result event carries and no artifact. M0
+produces no patch: `outputTarget` stays refused until a writable envelope
+exists.
 
 ## Fail-closed rules
 
@@ -291,12 +301,20 @@ in `inventory.json` like every other suite, in the existing format: given a stor
 a clock and a transport, a command sequence produces exact responses and
 `MissionView` states. In the table, "the key" means the mission's adoption key.
 
-The `mission-commands` suite holds the vectors M0 can reach: M-01 to M-06,
-M-09, M-11 (a), M-15, M-17 and M-18. M-03 (c) commits a second mission, because M0's first
-has already settled. M-07, M-08, M-10, M-12, M-13 and M-14 need a mission that
-launches, or one still queued, and wait for Runtime Authority (#857); unit
-tests hold M-08 with a mission kept queued. M-11 (b) is a client vector, and
-M-16 is held by the transport authority tests.
+The `mission-commands` suite holds M-01 to M-07, M-09, M-10, M-11 (a) and
+M-12 to M-18 but M-16. A case runs on a daemon whose runtime either takes no
+authority projections (M-06, and M-03 (c), whose first mission has already
+settled) or launches the scoped read envelope without starting a process
+(M-07, M-10, M-12 to M-14, and Decision 6's errored result, which reads
+`failed` / `harness_failed` with no report). That stand-in establishes
+ownership without the trusted launch, so the store gate never runs in the suite: the live-runtime
+tests, which launch a stand-in harness end to end, hold it. A stop it is asked
+for reads the mission's state while in flight (`cancelling` in M-12). Unit
+tests hold M-08 with a mission kept queued, and M-13's expiry during the
+preflight or the launch. M-11 (b) is a client vector, and M-16 is held by the
+transport authority tests. Not held yet: M-10's daemon restart, and M-14's
+event cursor, because missions have no event read of their own; a client
+resumes from `mission.get`.
 
 | # | chat#155 case | Given / when | Then |
 | --- | --- | --- | --- |
@@ -304,15 +322,15 @@ M-16 is held by the transport authority tests.
 | M-02 | disconnect after submit, before acknowledgement | Commit succeeds, the response is lost, and the client replays the same key and body | `replayed`, the same `missionId` and occurrence, exactly one launch |
 | M-03 | duplicate submission | (a) same key, same body; (b) same key, changed body; (c) a new key with the same body | (a) `replayed`. (b) `ADOPTION_REPLAY_MISMATCH` (409), `conflictOutcome: committed`. (c) a second mission; under M0's limit, `CONCURRENCY_LIMIT` while the first is active. |
 | M-04 | stale familiar revision | (a) the submitted revision is not the current active one; (b) it is superseded between submit and dispatch | (a) `REVISION_CONFLICT` with the current revision in `details`, nothing created. (b) `revoked` / `familiar_revision_stale`, no launch. |
-| M-05 | rejected capability/runtime | The envelope id is unknown, or its descriptor digest differs from the advertised one | `CAPABILITY_UNSUPPORTED` naming the envelope, nothing created |
-| M-06 | authority unavailable | Runtime Authority is not constructed, or the trusted state is unreadable at dispatch | `unavailable` with `authority_unavailable`, and no launch. A refusal at dispatch also writes a no-launch receipt; M0 refuses before dispatch, so it has none (see *Implementation notes*). |
+| M-05 | rejected capability/runtime | The envelope id is unknown, or its descriptor digest differs from the advertised one, or it is `r0-read.1` | `CAPABILITY_UNSUPPORTED` naming the envelope, with the supported envelopes in `details`, nothing created |
+| M-06 | authority unavailable | Runtime Authority is not constructed, or the trusted state is unreadable at dispatch | `unavailable` with `authority_unavailable`, and no launch. The preflight refuses before dispatch decides anything, so no decision, adoption or consumption is recorded and there is no receipt (see *Implementation notes*). |
 | M-07 | cancellation racing completion | A cancel arrives after the harness's conclusive success but before settlement | `completed`; the cancellation outcome is `lost_to_completion` |
 | M-08 | cancel before launch | A cancel arrives while `queued` | `cancelled`, no session, and a cancellation receipt |
 | M-09 | idempotent cancel | The same cancel key twice, then a new key after the mission is terminal | The same receipt twice; the new key gets `ILLEGAL_TRANSITION` with the terminal view |
 | M-10 | ambiguous timeout | The harness times out with its last write unobserved, or the daemon restarts mid-run | `reconciling` / `ambiguous_execution` until recovery settles it. Never `queued`, and never terminal without evidence. |
 | M-11 | late response from another context | (a) `mission.get` from a different principal; (b) a response for mission A arriving after the client moved to familiar B | (a) `NOT_FOUND`. (b) The view carries `missionId`, the familiar `rootId`/`revisionId` and the principal; the client drops anything that doesn't match (client vector, run in the SDK and in Chat). |
-| M-12 | revoked during observation | The familiar revision is revoked, or the owner grant lapses, while `running` | `cancelling`, then `revoked` / `familiar_revision_revoked` or `grant_revoked`; the session is stopped behind a fence |
-| M-13 | expiry | `validUntil` passes while `queued` (for example, the dispatcher is busy) | `rejected` / `expired_before_dispatch`, no launch |
+| M-12 | revoked during observation | The familiar revision is revoked, or the owner grant lapses, while `running` | `cancelling`, then the session is stopped behind a fence: `reconciling` / `familiar_revision_revoked` until recovery settles the stopped run, `revoked` once it does |
+| M-13 | expiry | `validUntil` passes while `queued` (for example, the dispatcher is busy), or before the harness starts | `rejected` / `expired_before_dispatch`, no attempt, no session, no launch |
 | M-14 | restart recovery | The client restarts during `running` and calls `mission.get` with the stored id | The same view and `revision`; the event cursor resumes or returns `CURSOR_EXPIRED` with a fresh view |
 | M-15 | bounds | The prompt is over 32 KiB, the timeout over 60, or `validUntil` more than 15 minutes out | `PAYLOAD_TOO_LARGE` or `VALIDATION_FAILED`, nothing created |
 | M-16 | transport | Any mission command over TCP | Refused before the store opens |
@@ -396,21 +414,72 @@ what.
   digest and `submittedAt`. Triggers refuse any update or delete of it. Its
   nullable `scopes_json` column is added by an idempotent migration, never by
   the `CREATE TABLE`, so fresh and upgraded stores share one table form.
-- **No launch until Runtime Authority exists.** Production dispatch is still the
-  base v1 path, which launches with ambient authority. M0 refuses to launch any
-  mission until the R0 envelope is enforced (#857). Once the submit has
-  committed, the mission's occurrence settles failed with a reason the view
-  projects to `unavailable` / `authority_unavailable` (vector M-06). The submit
-  answers with the state at commit (`queued`); `mission.get` reports the
-  settlement.
-- **No receipt in M0.** A receipt binds a run and an attempt: the receipts
-  table, `automation-receipt.schema.json` and the commit checks all require
-  both. An M0 mission is refused before either exists, so it has no receipt.
-  The settled occurrence, its transition event and the mission row are the
-  record that nothing launched. Once missions dispatch, a refusal at dispatch
-  writes the runner's existing no-launch receipt.
+- **The launch (#857).** Once a fresh submit has committed, the daemon
+  launches the mission's one attempt on the same request; a replay finds it
+  decided and launches nothing. Routines that declare authority still refuse
+  manual occurrences; a mission's has its own admitted path. In order:
+  1. `validUntil` has not passed (else `rejected` / `expired_before_dispatch`);
+  2. the named revision is still the root's active head (else `revoked`, with
+     `familiar_revision_revoked` for a revoked or retired revision or root and
+     `familiar_revision_stale` for a superseded one);
+  3. the decision-free preflight: the runtime takes authority projections, the
+     harness version is admitted, the owner's Anthropic key is present, and
+     the channel's socket path fits (else `unavailable` /
+     `authority_unavailable`, vector M-06);
+  4. `validUntil` again, since the preflight runs the harness and takes time.
+  None of these decides or consumes anything. The launch reads the wall
+  clock, so a refusal is recorded when it happened. The runner then dispatches the
+  occurrence under Runtime Authority. The trusted adapter takes the mission
+  row as the one-run owner grant (operation `automation.dispatch.mission`,
+  valid until the earlier of its window and `validUntil`, `max_uses` 1), an
+  R0 `analysis.read` of the row's scopes, and only the revision the submit
+  named. The daemon launches it with Claude Code `--bare` under the store
+  gate, whose definition check accepts the internal definition the submit
+  recorded, and which reads that definition only under Runtime Authority. A
+  refusal there rolls back, leaving no decision; a refusal after consumption
+  is recorded under its profile code and projected the same way. Any refusal
+  before the harness starts launched nothing: it projects `revoked` for a
+  withdrawn or superseded revision, `rejected` / `expired_before_dispatch` if
+  it was recorded once `validUntil` had passed, and `unavailable` /
+  `authority_unavailable` otherwise, including unreadable trusted state.
+- **Settlement.** The run settles only from its signed terminal evidence, as
+  every Runtime Authority run does. Evidence that is partial, unknown or
+  missing holds the occurrence `recovery_required`: `reconciling` /
+  `ambiguous_execution` (M-10). A cancel after launch stops the session behind
+  the run's stop fence, which also leaves the evidence incomplete, so it ends
+  `reconciling` with the cancellation `recovery_required`. A cancel that
+  finds the harness's conclusive success settles it first and loses
+  (`completed`, `lost_to_completion`, M-07).
+- **Revocation while running.** Each daemon tick stops a running mission
+  whose revision has been revoked or retired, through `occurrence.cancel.v1`
+  under a key derived from the mission, so it is asked once. Until the stop
+  lands the view is `cancelling`. The stop lands behind the run's stop fence,
+  which leaves the run `recovery_required`, so the view is then `reconciling`
+  / `familiar_revision_revoked`, not terminal (M-12). The mission still holds
+  its project's one active slot, because the stopped run may not be over;
+  only Runtime Authority recovery, which is not built yet, settles it. The
+  stop counts as a revocation only while the revision is withdrawn, and it
+  never overrides an outcome the run reached first. The store gate already
+  withholds every read from the moment of revocation.
+- **Reserved cancellation keys.** A mission's cancellation and its revocation
+  stop are `occurrence.cancel.v1` adoptions under keys the daemon derives,
+  beginning `mc:` and `mr:`. Any other `occurrence.cancel.v1` naming such a key
+  is `VALIDATION_FAILED` and is not adopted, so no request can forge either one
+  or take the daemon's key.
+- **The terminal result.** `observation` is the terminal observer's
+  classification of the launched attempt (`unknown` with none recorded;
+  `complete` when nothing launched). `usage` is what the session's single
+  result event reports, or `null`. The report artifact is that event's result
+  text, listed only for a `completed` mission whose signed evidence names the
+  same digest and only within 256 KiB; its `ref` names the session whose
+  log holds it, so it lasts as long as that log.
+- **Receipts.** A refusal before dispatch has no run or attempt, so no
+  receipt: the settled occurrence, its transition event and the mission row
+  are the record that nothing launched. A launched mission's run commits the
+  runner's launched receipt when it settles.
 - **Validation order.** `validUntil` (in the future, at most 15 minutes ahead),
-  then the envelope (`r0-read.1` and its descriptor digest), then `scopes`
+  then the envelope (`r0-read.2` and its descriptor digest; `r0-read.1` is
+  `CAPABILITY_UNSUPPORTED`), then `scopes`
   (see *Mission scopes*), then the project
   directory (exists, canonical, not inside `COVEN_HOME`), then the familiar
   (unknown root `NOT_FOUND`; a revision that is not the root's active head
