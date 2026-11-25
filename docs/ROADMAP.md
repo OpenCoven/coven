@@ -9,7 +9,11 @@ description: "The OpenCoven public roadmap for CastCodes as the primary public w
 
 # OpenCoven public roadmap
 
-_Last updated: 2026-10-01. Product snapshot: 2026-05-26. Threads checkpoint: 2026-10-01._
+_Last updated: 2026-11-25 (Coven shipped and active work). Product snapshot: 2026-05-26. Threads checkpoint: 2026-10-01._
+
+The [open-work ledger](plans/open-work.md) maps every open plan and epic to
+its open issues, what is already on `main`, the next unblocked step, and who
+decides. Use it, not this page, for issue-level status.
 
 Native Automations readiness was reviewed separately on 2026-09-14. Its
 [source readiness map](roadmaps/coven-automations-readiness.md) supersedes this
@@ -125,6 +129,29 @@ Shipped:
   - `@opencoven/cli-windows`
 - External OpenClaw bridge package kept outside OpenClaw core as an advanced compatibility path.
 - Architecture, operational model, product spec, brand docs, and MVP plan.
+- Cast launcher Phase 1 with verification (#99), released in v0.0.13.
+
+Shipped in the v0.4.5–v0.5.0 releases (v0.5.0 published 2026-11-10):
+
+- Claude Code scoped writes with a separate policy, enforced by the OS sandbox (#1651, #1670).
+- Trusted-device recovery and assurance: an optional passkey recovery factor, owner-root access recovery and rotation, N-of-M threshold introductions, and optional device and Apple App Attest attestation as assurance attributes (#1556, #1552, #1639, #1549, #1558, #1650).
+- Accepted v2 rendezvous routing for mobile reconnection, with connection observations kept separate from authority (#1677, #1694).
+- Automations: scoped-read launch admission and preparation, scoped reads served to the harness over a private MCP channel, and a trusted Runtime Authority adapter with launch-time scope enforcement (#1471, #1460, #1604).
+- Durable Ward evidence and Threads decision reservations before acknowledgment (#1622, #1643).
+- Bounded durable invocation admission for agents (#1666).
+- A repository cloud-maintainer skill with a checkpoint validator, and a read-only publication preflight with a blocked handoff (#1573, #1575).
+- Coven Code pinned through a verified engine lock (#1713).
+
+On `main` since v0.5.0, not yet in a release:
+
+- One permission policy for headless Claude Code launches (#1742).
+- Pinned identity preserved across mobile transport migration, and relay messages queued before a disconnect delivered ahead of its close (#1718, #1787).
+- Chat workspace policy verified before a turn streams (#1721).
+- Finite run budgets with saved continuation (#1797).
+- Automation routine postconditions, so an exit of 0 without the expected output is not success (#1820).
+- Castle folder sync owned by the daemon profile, with recoverable offline deletions and named Castles in the Host CLI (#1809, #1815, #1830).
+- Atomic Ward direct-evidence persistence (#1652).
+- Coven Code engine pin 0.9.3 (#1816).
 
 Now:
 
@@ -132,13 +159,28 @@ Now:
   production authority, launched-run receipts, and full certification remain
   gated. See the [source readiness map](roadmaps/coven-automations-readiness.md)
   for executable audit evidence and dependency-ordered work under #854.
-- **Cast launcher redesign** (Phases 1–6 on `cast/*` branches): collapses the Coven launcher chrome into a single-prompt surface with a two-lane Commands + Snapshot body, plan/outcome cards for every spell, and a sequential quest flow that hands off between phases with deterministic sub-prompts. The repo-local design notes live under `docs/design/`. PR #99 is the current review slice (Phase 6 verification + readiness).
+- **Trusted-device reconnection and recovery** (#787, #788): private LAN
+  discovery with relay fallback, multi-Coven unlinkability, and
+  push-assisted approval are the open steps.
+- **Castle folder sync** (#1805): the daemon-owned sync and named Castles
+  are on `main`; the remaining acceptance stays open on the issue.
+- **Psyche** (#1238): a Coven-native Rust agent with Telegram support. The
+  Coven side owes the real-daemon authority conformance in #1230; the
+  Telegram work belongs to OpenCoven/psyche.
+- **Autonomous issue-to-PR delivery** (#1442, #1444): the maintainer skill
+  and publication preflight are on `main`; managed-environment pilots wait
+  on a Codex Cloud environment.
 - Keep the versioned daemon API contract and CastCodes integration work aligned. See [`docs/API-CONTRACT.md`](/API-CONTRACT).
 - Keep the public docs aligned with the actual CLI/API surface.
 
 Next:
 
-- Turn the MVP checklist into linked GitHub issues/milestones.
+- Work the next unblocked step of each plan in the
+  [open-work ledger](plans/open-work.md), which replaces the earlier goal of
+  turning the MVP checklist into issues.
+- **Delivery preflight:** review the [allocator-aware handoff PR](https://github.com/OpenCoven/coven/pull/1819). Track live managed Cloud publication and blocked-handoff acceptance in [#1452](https://github.com/OpenCoven/coven/issues/1452).
+- **Runtime reliability:** investigate the [macOS capability-probe fixture flake](https://github.com/OpenCoven/coven/issues/1814) and the [familiar-edit audit synchronization flake](https://github.com/OpenCoven/coven/issues/1811). Preserve the production probe deadline and capture the worker stage before changing test synchronization.
+- **Claude scope admission:** the [denied-hardlink repair](https://github.com/OpenCoven/coven/pull/1813) has landed in source. The original installed Cave and Claude journey still needs separately authorized qualification under [#1792](https://github.com/OpenCoven/coven/issues/1792).
 
 Later:
 

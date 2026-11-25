@@ -1474,7 +1474,7 @@ The implementation spike proved the bridge is technically viable, but the OpenCl
 
 ## 17. Progress tracking
 
-Use a simple milestone board until the repo exists. Once created, mirror this into GitHub issues.
+This board records the original MVP milestones and is kept for history. Open work is tracked in GitHub issues, and the [open-work ledger](plans/open-work.md) maps each open plan to its issues and next step.
 
 ### Milestone 0: Plan locked
 
@@ -1535,7 +1535,7 @@ Use a simple milestone board until the repo exists. Once created, mirror this in
 - [x] External plugin package added under `packages/openclaw-coven`
 - [x] ClawHub package `OpenClaw bridge@2026.4.27` published from `OpenCoven/coven`
 - [x] OpenClaw core remains free of OpenCoven/Coven code
-- [ ] Add API version compatibility tests for the external plugin
+- [x] Add API version compatibility tests for the external plugin (`packages/openclaw-coven/src/compat.test.ts`)
 - [x] Do not block the Coven MVP on OpenClaw approval
 
 ### Milestone 8: Future harness proof
@@ -1576,7 +1576,7 @@ MVP is public-facing now; the next readiness bar is at least one non-maintainer 
 
 ## 21. Immediate next action
 
-Keep the public repo `OpenCoven/coven` as the canonical home, keep this plan in `docs/MVP-PLAN.md`, and continue implementation with no extra scope.
+This section is historical. For current next steps, see the [open-work ledger](plans/open-work.md) and the [public roadmap](ROADMAP.md).
 
 
 ## 21. Progress update — 2026-04-27
