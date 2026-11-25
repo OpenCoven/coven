@@ -613,6 +613,51 @@ fn raw_json_request_binds_peer_and_renegotiates_only_on_next_call() {
     replacement.join().expect("replacement daemon");
 }
 
+#[test]
+fn host_operations_send_the_selected_castle_and_poll_on_the_same_route() {
+    use coven_client::host::{HostOperation, HostRun};
+    let home = TestHome::new();
+    let mut health: serde_json::Value = serde_json::from_str(HEALTH).unwrap();
+    health["capabilities"]["hostSync"] = true.into();
+    let server = serve_responses(
+        &home.path,
+        vec![
+            ("/api/v1/health".into(), 200, health.to_string()),
+            (
+                "/api/v1/host/status".into(),
+                200,
+                r#"{"castle":"demo"}"#.into(),
+            ),
+            (
+                "/api/v1/host/castles/research/sync".into(),
+                202,
+                r#"{"id":"ticket"}"#.into(),
+            ),
+            (
+                "/api/v1/host/castles/research/result".into(),
+                200,
+                r#"{"phase":"synced"}"#.into(),
+            ),
+        ],
+    );
+    let mut client = DaemonClient::new(DaemonEndpoint::discover(&home.path).unwrap());
+    assert_eq!(
+        client.host(HostOperation::Status).unwrap()["castle"],
+        "demo"
+    );
+    let ticket: HostRun = serde_json::from_value(
+        client
+            .host_for_castle("research", HostOperation::Sync)
+            .unwrap(),
+    )
+    .unwrap();
+    let result = client
+        .host_for_castle("research", HostOperation::Result(ticket))
+        .unwrap();
+    assert_eq!(result["phase"], "synced");
+    server.join().unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn old_daemon_refuses_host_operation_before_transmission() {

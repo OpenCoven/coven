@@ -615,7 +615,7 @@ pub(crate) const RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED: &str =
     "runtime does not accept automation authority projections; no process started";
 
 pub trait SessionRuntime {
-    fn host_worker(&self) -> Option<&crate::host_sync::Worker> {
+    fn host_worker(&self) -> Option<&crate::host_sync::Workers> {
         None
     }
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()>;
@@ -959,7 +959,7 @@ fn handle_request_with_runtime_authority_and_automation_time(
             let Some(worker) = runtime.host_worker() else {
                 return api_error(503, "unavailable", "Host sync worker is unavailable.", None);
             };
-            crate::host_sync::route(worker, method, route, body)
+            worker.route(method, route, body)
         }
         ("GET", "/capabilities") => json_response(200, &control_plane::capabilities()),
         ("GET", "/session-policy") => crate::session_policy::discovery_response(),

@@ -1,12 +1,13 @@
-//! The daemon owns one reconciler for its profile. Local IPC operations never
+//! The daemon owns a reconciler per configured Castle. Local IPC operations never
 //! transport peer bytes, and waiting for a remote transfer never holds the IPC socket.
 use crate::api_response::{api_error, json_response, ApiResponse};
 use anyhow::{ensure, Context, Result};
 use coven_client::host::{HostConnect, HostInit, HostResolution, HostResolve, HostRun};
+use coven_host::CastleId;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     path::{Component, Path, PathBuf},
     sync::{Arc, Condvar, Mutex, MutexGuard},
     time::{Duration, Instant},
@@ -19,11 +20,92 @@ const MAX_COMPLETED: usize = 32;
 const MAX_QUEUED: usize = 32;
 type Outcome = std::result::Result<Value, String>;
 
+pub struct Workers {
+    demo: Worker,
+    named: Mutex<BTreeMap<CastleId, Arc<Worker>>>,
+}
+
+impl Workers {
+    pub fn new(home: &Path) -> Self {
+        Self {
+            demo: Worker::new(home),
+            named: Mutex::default(),
+        }
+    }
+
+    pub(crate) fn stop(&self) {
+        let named = self.named.lock().unwrap_or_else(|err| err.into_inner());
+        self.demo.stop();
+        for worker in named.values() {
+            worker.stop();
+        }
+    }
+
+    pub(crate) fn route(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<ApiResponse> {
+        let Some(rest) = path.strip_prefix("/host/castles/") else {
+            return route(&self.demo, method, path, body);
+        };
+        let Some((id, action)) = rest.split_once('/') else {
+            return api_error(
+                404,
+                "not_found",
+                "Expected a Castle and an operation.",
+                None,
+            );
+        };
+        let Ok(id) = id.parse::<CastleId>() else {
+            return api_error(400, "invalid_request", "Invalid Castle ID.", None);
+        };
+        let route_path = format!("/host/{action}");
+        if id.as_str() == "demo" {
+            return route(&self.demo, method, &route_path, body);
+        }
+        let shared = &self.demo.shared;
+        let initializing = method == "POST" && action == "init";
+        let database = id.state_dir(&shared.state_dir).join("client.sqlite");
+        if !initializing && !database.is_file() {
+            return api_error(
+                404,
+                "not_found",
+                "Castle is not initialized. Run coven host --castle NAME init.",
+                None,
+            );
+        }
+        let worker = {
+            let mut named = self.named.lock().unwrap_or_else(|err| err.into_inner());
+            if self.demo.jobs().stopping {
+                return api_error(503, "unavailable", "The daemon is stopping.", None);
+            }
+            Arc::clone(named.entry(id.clone()).or_insert_with(|| {
+                Arc::new(Worker::for_castle(
+                    &shared.home,
+                    shared.state_dir.clone(),
+                    id.clone(),
+                ))
+            }))
+        };
+        let response = route(&worker, method, &route_path, body);
+        if initializing && !response.as_ref().is_ok_and(|r| r.status == 200) && !database.exists() {
+            let mut named = self.named.lock().unwrap_or_else(|err| err.into_inner());
+            if Arc::strong_count(&worker) == 2 {
+                named.remove(&id);
+            }
+        }
+        response
+    }
+}
+
 pub struct Worker {
     shared: Arc<Shared>,
 }
 
 struct Shared {
+    castle: CastleId,
     home: PathBuf,
     state_dir: PathBuf,
     jobs: Mutex<Jobs>,
@@ -134,8 +216,13 @@ impl Worker {
     }
 
     fn with_state(home: &Path, state_dir: PathBuf) -> Self {
+        Self::for_castle(home, state_dir, CastleId::default())
+    }
+
+    fn for_castle(home: &Path, state_dir: PathBuf, castle: CastleId) -> Self {
         Self {
             shared: Arc::new(Shared {
+                castle,
                 home: home.to_owned(),
                 state_dir,
                 jobs: Mutex::default(),
@@ -156,10 +243,10 @@ impl Worker {
             self.shared.state_dir.is_absolute(),
             "daemon host state must be an absolute path"
         );
-        Ok(coven_host::Client::for_profile(
-            &self.shared.state_dir,
-            &self.shared.home,
-        ))
+        Ok(
+            coven_host::Client::for_profile(&self.shared.state_dir, &self.shared.home)
+                .for_castle(&self.shared.castle),
+        )
     }
 
     fn configure(&self, apply: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -273,10 +360,10 @@ fn reconcile(shared: &Shared) {
         jobs.current = Some(Running { id, sync: is_sync });
         drop(jobs);
         let outcome = std::panic::catch_unwind(|| {
-            task.perform(coven_host::Client::for_profile(
-                &shared.state_dir,
-                &shared.home,
-            ))
+            task.perform(
+                coven_host::Client::for_profile(&shared.state_dir, &shared.home)
+                    .for_castle(&shared.castle),
+            )
         })
         .map_err(|_| "host worker panicked; inspect status before retrying".to_owned())
         .and_then(|result| result.map_err(|err| format!("{err:#}")));
@@ -432,6 +519,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn named_routes_isolate_tickets_and_reopen_the_same_profile_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let home = base.join("daemon");
+        let workers = || Workers {
+            demo: Worker::with_state(&home, home.join("host")),
+            named: Mutex::default(),
+        };
+        let first = workers();
+        let root = json!({"root": base.join("Coven")}).to_string();
+        assert_eq!(
+            first
+                .route("GET", "/host/castles/research/status", None)
+                .unwrap()
+                .status,
+            404
+        );
+        assert!(!home.exists());
+        for path in ["/host/init", "/host/castles/research/init"] {
+            let response = first.route("POST", path, Some(&root)).unwrap();
+            assert_eq!(response.status, 200, "{}", response.body);
+        }
+        let ticket = first
+            .route("POST", "/host/castles/research/sync", None)
+            .unwrap();
+        assert_eq!(ticket.status, 202);
+        assert_eq!(
+            first
+                .route("POST", "/host/result", Some(&ticket.body))
+                .unwrap()
+                .status,
+            404
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let result = first
+                .route("POST", "/host/castles/research/result", Some(&ticket.body))
+                .unwrap();
+            if result.status != 202 {
+                assert_ne!(result.status, 404, "named ticket disappeared");
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(first);
+        let restarted = workers();
+        for (name, path) in [
+            ("demo", "/host/status"),
+            ("research", "/host/castles/research/status"),
+        ] {
+            let status = restarted.route("GET", path, None).unwrap();
+            assert_eq!(status.status, 200, "{}", status.body);
+            assert_eq!(
+                serde_json::from_str::<Value>(&status.body).unwrap()["castle"],
+                name
+            );
+        }
+    }
+
+    #[test]
     fn castle_ownership_survives_daemon_restart() {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
@@ -536,6 +684,7 @@ mod tests {
             ("POST", "/api/v1/host/sync"),
             ("POST", "/api/v1/host/result"),
             ("GET", "/api/v1/host/status"),
+            ("GET", "/api/v1/host/castles/research/status"),
             ("POST", "/api/v1/host/watch"),
             ("POST", "/api/v1/host/resolve"),
         ] {

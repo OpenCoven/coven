@@ -428,6 +428,9 @@ enum Command {
     },
     /// Reconcile a local Castle folder or run an independent peer.
     Host {
+        /// Select the Castle for this operation.
+        #[arg(long, global = true, default_value = "demo")]
+        castle: coven_host::CastleId,
         #[command(subcommand)]
         command: host_cli::Command,
     },
@@ -2348,7 +2351,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
         Some(Command::Adapter { command }) => run_adapter_command(command),
         Some(Command::Engine { command }) => run_engine_command(command),
-        Some(Command::Host { command }) => host_cli::run(command),
+        Some(Command::Host { castle, command }) => host_cli::run(castle, command),
         Some(Command::Daemon { command }) => run_daemon_command(command),
         Some(Command::ProcessSupervisor { .. }) => {
             unreachable!("process supervisor runs before state initialization")

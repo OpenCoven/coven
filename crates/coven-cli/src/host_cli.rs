@@ -5,6 +5,7 @@ use coven_client::{
     host::{HostConnect, HostInit, HostOperation, HostResolution, HostResolve, HostRun},
     DaemonClient, DaemonEndpoint,
 };
+use coven_host::CastleId;
 use serde_json::Value;
 use std::{
     io::Write,
@@ -47,6 +48,9 @@ pub(crate) enum Command {
     },
     /// Run a loopback peer without a Coven daemon or desktop session.
     Serve {
+        /// Register an additional Castle and its distinct protected token file (repeatable).
+        #[arg(long, value_name = "ID=TOKEN_FILE")]
+        castle_token: Vec<String>,
         #[arg(long)]
         storage: Option<PathBuf>,
         #[arg(long, default_value_t = 8765)]
@@ -92,12 +96,14 @@ fn defaults(relative: &str) -> Result<PathBuf> {
 }
 
 fn peer_command(
+    castle: &CastleId,
     command: &str,
     peer: Peer,
     path: Option<&str>,
     source: Option<&Path>,
 ) -> Result<()> {
-    let bytes = coven_host::peer_command(command, &peer.url, &peer.token_file, path, source)?;
+    let bytes =
+        coven_host::peer_command_for(castle, command, &peer.url, &peer.token_file, path, source)?;
     std::io::stdout().lock().write_all(&bytes)?;
     Ok(())
 }
@@ -127,27 +133,33 @@ fn daemon_client(home: &Path) -> Result<DaemonClient> {
     Ok(DaemonClient::new(DaemonEndpoint::discover(home)?))
 }
 
-pub(crate) fn run(command: Command) -> Result<()> {
+pub(crate) fn run(castle: CastleId, command: Command) -> Result<()> {
     use Command::*;
     let op = match command {
         Serve {
             storage,
             port,
             token_file,
+            castle_token,
         } => {
             let storage = match storage {
                 Some(storage) => storage,
                 None => defaults(".local/state/coven-host/server")?,
             };
-            return coven_host::peer::serve(
-                &storage,
-                port,
-                coven_host::folder::token_from(&token_file)?,
-            );
+            let mut castles = vec![(castle, coven_host::folder::token_from(&token_file)?)];
+            for registration in castle_token {
+                let (id, file) = registration
+                    .split_once('=')
+                    .context("expected ID=TOKEN_FILE")?;
+                castles.push((id.parse()?, coven_host::folder::token_from(file.as_ref())?));
+            }
+            return coven_host::peer::serve_castles(&storage, port, castles);
         }
-        Put { peer, path, source } => return peer_command("put", peer, Some(&path), Some(&source)),
-        Get { peer, path } => return peer_command("get", peer, Some(&path), None),
-        DemoResult { peer } => return peer_command("demo-result", peer, None, None),
+        Put { peer, path, source } => {
+            return peer_command(&castle, "put", peer, Some(&path), Some(&source))
+        }
+        Get { peer, path } => return peer_command(&castle, "get", peer, Some(&path), None),
+        DemoResult { peer } => return peer_command(&castle, "demo-result", peer, None, None),
         Init { root } => HostOperation::Init(HostInit {
             root: match root {
                 Some(p) => std::path::absolute(p)?,
@@ -176,9 +188,13 @@ pub(crate) fn run(command: Command) -> Result<()> {
     match op {
         HostOperation::Sync | HostOperation::Resolve(_) => {
             let sync = matches!(op, HostOperation::Sync);
-            let run: HostRun = serde_json::from_value(client.host(op)?)?;
+            let run: HostRun =
+                serde_json::from_value(client.host_for_castle(castle.as_str(), op)?)?;
             loop {
-                let reply = client.host(HostOperation::Result(HostRun { id: run.id.clone() }))?;
+                let reply = client.host_for_castle(
+                    castle.as_str(),
+                    HostOperation::Result(HostRun { id: run.id.clone() }),
+                )?;
                 if !reply.is_null() {
                     println!("{}", serde_json::to_string_pretty(&reply)?);
                     if sync && reply["phase"] != "synced" {
@@ -199,7 +215,7 @@ pub(crate) fn run(command: Command) -> Result<()> {
         HostOperation::Watch => {
             let mut previous = Value::Null;
             loop {
-                let next = client.host(HostOperation::Watch)?;
+                let next = client.host_for_castle(castle.as_str(), HostOperation::Watch)?;
                 if next != previous {
                     println!("{}", serde_json::to_string(&next)?);
                     std::io::stdout().flush()?;
@@ -209,7 +225,10 @@ pub(crate) fn run(command: Command) -> Result<()> {
             }
         }
         _ => {
-            println!("{}", serde_json::to_string_pretty(&client.host(op)?)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&client.host_for_castle(castle.as_str(), op)?)?
+            );
             Ok(())
         }
     }
