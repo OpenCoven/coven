@@ -105,10 +105,11 @@ pub(crate) enum Phase {
     RequestEnd,
 }
 
-#[cfg(feature = "threads-test-clock")]
+#[cfg(any(feature = "threads-test-clock", test))]
 impl Phase {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
+            #[cfg(feature = "threads-test-clock")]
             Self::RequestBegin => "request-begin",
             Self::BodyRead => "body-read",
             Self::Intake => "intake",
@@ -183,9 +184,13 @@ impl Phase {
             Self::SchedulerCursorBegin => "scheduler-cursor-begin",
             Self::SchedulerCursorReady => "scheduler-cursor-ready",
             Self::SchedulerPassReady => "scheduler-pass-ready",
+            #[cfg(feature = "threads-test-clock")]
             Self::TickLockWait => "tick-lock-wait",
+            #[cfg(feature = "threads-test-clock")]
             Self::TickLockAcquired => "tick-lock-acquired",
+            #[cfg(feature = "threads-test-clock")]
             Self::TickAuthorized => "tick-authorized",
+            #[cfg(feature = "threads-test-clock")]
             Self::TickWorkersReady => "tick-workers-ready",
             Self::GateReady => "gate-ready",
             Self::IdentityBegin => "identity-begin",
@@ -203,6 +208,7 @@ impl Phase {
             Self::HandlerReturned => "handler-returned",
             Self::ResponseBegin => "response-begin",
             Self::ResponseReady => "response-ready",
+            #[cfg(feature = "threads-test-clock")]
             Self::RequestEnd => "request-end",
         }
     }
@@ -270,6 +276,8 @@ pub(crate) fn begin(home: &Path, method: &str, path: &str) -> RequestTrace {
 }
 
 pub(crate) fn checkpoint(phase: Phase) {
+    #[cfg(test)]
+    test_recorder::record(phase);
     #[cfg(feature = "threads-test-clock")]
     ACTIVE.with(|active| {
         if let Some(state) = active.borrow_mut().as_mut() {
@@ -285,6 +293,99 @@ pub(crate) fn checkpoint(phase: Phase) {
         }
     });
     let _ = phase;
+}
+
+/// Test-only capture of the checkpoints one thread passes.
+///
+/// Unit tests do not enable `threads-test-clock`, so `checkpoint` is normally
+/// silent there. A synchronization guard that expires (#1811) then reports
+/// only that it timed out. A test installs a [`test_recorder::PhaseLog`] on the
+/// worker thread it is waiting for, and the guard's failure message names the
+/// last phase the worker reached and when.
+#[cfg(test)]
+pub(crate) mod test_recorder {
+    use super::Phase;
+    use std::cell::RefCell;
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static SINK: RefCell<Option<Arc<PhaseLog>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct PhaseLog {
+        started: Instant,
+        entries: Mutex<Vec<(&'static str, Duration)>>,
+    }
+
+    impl PhaseLog {
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                started: Instant::now(),
+                entries: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Record `label` now, for steps outside the `Phase` enum.
+        pub(crate) fn note(&self, label: &'static str) {
+            let elapsed = self.started.elapsed();
+            self.entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((label, elapsed));
+        }
+
+        /// Install this log as the current thread's sink until the guard drops.
+        pub(crate) fn record_on_this_thread(self: &Arc<Self>) -> RecordingGuard {
+            let previous = SINK.with(|sink| sink.replace(Some(Arc::clone(self))));
+            RecordingGuard { previous }
+        }
+
+        /// One line per recorded step, oldest first, with monotonic offsets
+        /// from the log's creation, plus the time since the last step.
+        pub(crate) fn render(&self) -> String {
+            let now = self.started.elapsed();
+            let entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut out = String::new();
+            if entries.is_empty() {
+                let _ = write!(out, "no phases recorded in {now:?}");
+                return out;
+            }
+            for (label, at) in entries.iter() {
+                let _ = writeln!(out, "  +{at:?} {label}");
+            }
+            let (last, at) = entries[entries.len() - 1];
+            let _ = write!(
+                out,
+                "  last phase `{last}`, {:?} before this report",
+                now.saturating_sub(at)
+            );
+            out
+        }
+    }
+
+    pub(crate) struct RecordingGuard {
+        previous: Option<Arc<PhaseLog>>,
+    }
+
+    impl Drop for RecordingGuard {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            SINK.with(|sink| sink.replace(previous));
+        }
+    }
+
+    pub(super) fn record(phase: Phase) {
+        SINK.with(|sink| {
+            if let Some(log) = sink.borrow().as_ref() {
+                log.note(phase.label());
+            }
+        });
+    }
 }
 
 #[cfg(feature = "threads-test-clock")]
