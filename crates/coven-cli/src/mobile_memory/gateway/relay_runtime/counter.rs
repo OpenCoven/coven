@@ -11,9 +11,34 @@ struct Key {
     counter: u64,
     endpoint: usize,
 }
+// A counter room's handshake progress, published by its worker.
+//
+// From HOST_PROOF_SENT on, the device may already have durably consumed the
+// room, so cancelling the worker before it commits loses that room (#1765).
+// The manager never cancels a worker in HOST_PROOF_SENT or PROOF_VERIFIED for
+// routing reasons; the handshake deadline still bounds how long it is held.
+// Policy changes (generation, revocation, endpoints) still cancel it.
 const WAITING_FOR_PROOF: u8 = 0;
-const PROOF_VERIFIED: u8 = 1;
-const CONSUMED: u8 = 2;
+const HOST_PROOF_SENT: u8 = 1;
+const PROOF_VERIFIED: u8 = 2;
+const CONSUMED: u8 = 3;
+// The established channel has ended; it no longer holds the device's session.
+const CLOSED: u8 = 4;
+
+/// Whether routing may cancel a worker in `state` without losing a room the
+/// device could already have consumed.
+fn routing_may_cancel(state: u8) -> bool {
+    !matches!(state, HOST_PROOF_SENT | PROOF_VERIFIED)
+}
+
+/// Marks the channel closed when `serve` stops serving it, on any exit path.
+struct MarkClosed<'a>(&'a AtomicU8);
+
+impl Drop for MarkClosed<'_> {
+    fn drop(&mut self) {
+        self.0.store(CLOSED, Ordering::Release);
+    }
+}
 
 struct CounterWorker {
     worker: Worker,
@@ -157,8 +182,13 @@ impl Workers {
             if let Some(winner) = winner {
                 // Preserve the established channel and its permit. Rebuild the
                 // next window only after it exits, never beyond W held rooms.
+                // A closed channel is never the winner, and a reconnect that is
+                // already past the host proof is kept so its room is not lost.
                 for (key, entry) in &self.workers {
-                    if key.id == id && *key != winner {
+                    if key.id == id
+                        && *key != winner
+                        && routing_may_cancel(entry.consumption.load(Ordering::Acquire))
+                    {
                         entry.worker.control.cancel();
                     }
                 }
@@ -333,14 +363,18 @@ fn serve(connection: Connection) -> Result<()> {
             )
         },
         |proof, deadline| {
-            v2::refresh_proof(
+            let current = v2::refresh_proof(
                 &state.coven_home,
                 &state.registry,
                 &snapshot.material.pairing,
                 Transport::Relay,
                 proof,
                 deadline,
-            )
+            )?;
+            // The host proof is signed and sent next. From here the device
+            // may durably consume this room before the host commits it.
+            consumption.store(HOST_PROOF_SENT, Ordering::Release);
+            Ok(current)
         },
         |proof| {
             // Publish verification before storage can make the new floor visible.
@@ -352,6 +386,7 @@ fn serve(connection: Connection) -> Result<()> {
             Ok(())
         },
     )?;
+    let _closed = MarkClosed(&consumption);
     connection.online()?;
     authenticated.store(true, Ordering::Release);
     while channel.is_open() {
@@ -523,5 +558,167 @@ mod tests {
             "unconsumed stale room retained until its challenge deadline"
         );
         workers.cancel();
+    }
+
+    /// One relay, four listener rooms (counters 0..WINDOW) for the pair, and
+    /// a manager pass closure. Rooms only listen; tests publish handshake
+    /// states directly so the close, reconnect and pass are strictly ordered.
+    struct RoomHarness {
+        _device_home: tempfile::TempDir,
+        _relay: Relay,
+        state: Arc<MobileGatewayState>,
+        host: Arc<SigningKey>,
+        endpoints: Vec<Arc<websocket::RelayEndpoint>>,
+        budget: Arc<budget::ListenerBudget>,
+        workers: Workers,
+        id: Uuid,
+    }
+
+    /// Run `test` against a fresh harness. The fixture is kept alive in this
+    /// frame: moving its state out would otherwise drop its Coven home.
+    fn with_rooms(test: impl FnOnce(&mut RoomHarness)) {
+        let (fixture, host, device_home) = admitted_pair();
+        let id = fixture.pairing.device_id;
+        let relay = Relay::start_literal();
+        let endpoints = vec![Arc::new(relay.configuration().parse().unwrap())];
+        let mut rooms = RoomHarness {
+            _device_home: device_home,
+            _relay: relay,
+            state: Arc::new(fixture.state),
+            host,
+            endpoints,
+            budget: budget::ListenerBudget::new(routing::WINDOW as usize).unwrap(),
+            workers: Workers::default(),
+            id,
+        };
+        rooms.pass();
+        assert_eq!(rooms.workers.workers.len(), routing::WINDOW as usize);
+        test(&mut rooms);
+        rooms.workers.cancel();
+    }
+
+    impl RoomHarness {
+        fn pass(&mut self) {
+            let legacy = BTreeMap::new();
+            let stop = Stop::default();
+            self.workers.tick(Tick {
+                state: &self.state,
+                signer: &self.host,
+                endpoints: &self.endpoints,
+                budget: &self.budget,
+                ids: &[self.id],
+                legacy: &legacy,
+                stop: &stop,
+            });
+        }
+
+        fn room(&self, counter: u64) -> (Arc<AtomicU8>, Arc<WorkerControl>) {
+            let entry = self
+                .workers
+                .workers
+                .get(&Key {
+                    id: self.id,
+                    generation: 0,
+                    counter,
+                    endpoint: 0,
+                })
+                .unwrap_or_else(|| panic!("room {counter} has no worker"));
+            (
+                Arc::clone(&entry.consumption),
+                Arc::clone(&entry.worker.control),
+            )
+        }
+    }
+
+    fn cancelled(control: &WorkerControl) -> bool {
+        control.0.lock().unwrap().0
+    }
+
+    #[test]
+    fn a_live_winner_never_cancels_a_next_room_worker_past_the_host_proof() {
+        for in_flight in [HOST_PROOF_SENT, PROOF_VERIFIED] {
+            with_rooms(|rooms| {
+                let (established, established_control) = rooms.room(0);
+                let (next, next_control) = rooms.room(1);
+                let (_, spare_control) = rooms.room(2);
+                // Room 0 is the established channel. Its socket has just
+                // closed, but the manager has not observed that yet, and the
+                // device has reconnected on room 1 and may have consumed it.
+                established.store(CONSUMED, Ordering::Release);
+                next.store(in_flight, Ordering::Release);
+                rooms.pass();
+                assert!(
+                    !cancelled(&next_control),
+                    "state {in_flight}: the reconnect past the host proof was cancelled"
+                );
+                assert!(!cancelled(&established_control));
+                assert!(
+                    cancelled(&spare_control),
+                    "an unproven spare room must still yield to the established channel"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn closing_the_winner_then_reconnecting_keeps_the_next_room_through_its_commit() {
+        with_rooms(|rooms| {
+            let (established, established_control) = rooms.room(0);
+            let (next, next_control) = rooms.room(1);
+            let (_, spare_control) = rooms.room(2);
+            // 1. Room 0 was established, and its channel has now closed.
+            established.store(CONSUMED, Ordering::Release);
+            established.store(CLOSED, Ordering::Release);
+            // 2. The device reconnects on room 1 and receives the host proof.
+            next.store(HOST_PROOF_SENT, Ordering::Release);
+            // 3. Manager passes during the reconnect's handshake. A closed channel
+            //    is not established, so neither the reconnect nor the spare room
+            //    the device could fall back to is cancelled.
+            rooms.pass();
+            assert!(
+                !cancelled(&next_control),
+                "closed winner cancelled the reconnect"
+            );
+            assert!(
+                !cancelled(&spare_control),
+                "closed winner cancelled a spare room"
+            );
+            next.store(PROOF_VERIFIED, Ordering::Release);
+            rooms.pass();
+            assert!(
+                !cancelled(&next_control),
+                "verified reconnect cancelled before commit"
+            );
+            // 4. The reconnect commits and becomes the established channel; only
+            //    then do the closed and unproven rooms yield to it.
+            next.store(CONSUMED, Ordering::Release);
+            rooms.pass();
+            assert!(
+                !cancelled(&next_control),
+                "the committed room was cancelled"
+            );
+            assert!(cancelled(&established_control));
+            assert!(cancelled(&spare_control));
+        });
+    }
+
+    #[test]
+    fn routing_may_cancel_only_outside_the_handshake_window() {
+        assert!(routing_may_cancel(WAITING_FOR_PROOF));
+        assert!(!routing_may_cancel(HOST_PROOF_SENT));
+        assert!(!routing_may_cancel(PROOF_VERIFIED));
+        assert!(routing_may_cancel(CONSUMED));
+        assert!(routing_may_cancel(CLOSED));
+    }
+
+    #[test]
+    fn mark_closed_publishes_closed_on_every_exit() {
+        let consumption = AtomicU8::new(CONSUMED);
+        let result: Result<()> = (|| {
+            let _closed = MarkClosed(&consumption);
+            anyhow::bail!("transport failed")
+        })();
+        assert!(result.is_err());
+        assert_eq!(consumption.load(Ordering::Acquire), CLOSED);
     }
 }
