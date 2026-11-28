@@ -11,6 +11,91 @@ const CAPS: &str = r#"{"engine_contract_version":1,"run_budget_version":1,"flag"
 
 struct Fixture(tempfile::TempDir);
 
+/// Serializes process creation in this test binary (#1814).
+///
+/// On macOS, std creates each pipe with `pipe()` and sets close-on-exec in a
+/// second call, and `posix_spawn` runs without `POSIX_SPAWN_CLOEXEC_DEFAULT`.
+/// With 15 tests spawning `coven` at once, a sibling spawn could land between
+/// those calls and inherit another test's pipe end. A leaked stdout read end
+/// kept `a_parsed_one_shot_receipt_survives_stdout_disconnect`'s "closed"
+/// pipe writable, so `coven` exited successfully. Holding one lock across
+/// `spawn()` only, where std creates and seals the pipes, closes that window
+/// while the tests still run in parallel.
+static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+trait SerializedSpawn {
+    fn spawn_serialized(&mut self) -> std::io::Result<std::process::Child>;
+    fn output_serialized(&mut self) -> std::io::Result<Output>;
+}
+
+impl SerializedSpawn for Command {
+    fn spawn_serialized(&mut self) -> std::io::Result<std::process::Child> {
+        let _spawning = SPAWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.spawn()
+    }
+
+    /// `output()` with its defaults (stdin null, stdout and stderr piped),
+    /// spawned under the lock and waited on outside it.
+    fn output_serialized(&mut self) -> std::io::Result<Output> {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_serialized()?
+            .wait_with_output()
+    }
+}
+
+/// Opt-in evidence for #1814: set `RUN_BUDGET_COVEN_FD_LOG` to a file path.
+///
+/// `coven` gives its engine only stdio (it closes everything else before
+/// exec), so a pipe leaked between tests can only be seen in the `coven`
+/// processes this binary starts. On macOS, std creates a pipe with `pipe()`
+/// and sets close-on-exec afterwards, and spawns without
+/// `POSIX_SPAWN_CLOEXEC_DEFAULT`, so a sibling test's concurrent spawn can
+/// inherit a pipe end. This shim records each `coven` child's inherited
+/// descriptors (fd, kind, inode) and then execs the real binary unchanged.
+/// Without the variable, tests launch `coven` directly, as before.
+const FD_LOG: &str = "RUN_BUDGET_COVEN_FD_LOG";
+const FD_SHIM: &str = r#"import os,sys,stat
+log,exe=sys.argv[1],sys.argv[2]
+fds=[]
+for fd in range(3,256):
+ try: st=os.fstat(fd)
+ except OSError: continue
+ kind='fifo' if stat.S_ISFIFO(st.st_mode) else 'sock' if stat.S_ISSOCK(st.st_mode) else 'reg' if stat.S_ISREG(st.st_mode) else oct(st.st_mode)
+ fds.append('%d:%s:%d' % (fd,kind,st.st_ino))
+line='child pid=%d args=%s fds=%s\n' % (os.getpid(),'/'.join(sys.argv[3:5]),','.join(fds))
+out=os.open(log,os.O_WRONLY|os.O_APPEND|os.O_CREAT|os.O_CLOEXEC,0o644)
+os.write(out,line.encode()); os.close(out)
+os.execv(exe,[exe]+sys.argv[3:])
+"#;
+
+/// Record the inode of a pipe end this test owns, so a leak of it into a
+/// sibling `coven` can be matched in the log.
+fn log_owned_pipe(label: &str, end: &impl std::os::fd::AsFd) {
+    use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(path) = std::env::var_os(FD_LOG) else {
+        return;
+    };
+    let ino = end
+        .as_fd()
+        .try_clone_to_owned()
+        .map(fs::File::from)
+        .and_then(|file| file.metadata())
+        .map_or(0, |meta| meta.ino());
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("unnamed")
+        .to_owned();
+    let line = format!("owner test={test} pipe={label} ino={ino}\n");
+    if let Ok(mut log) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = log.write_all(line.as_bytes());
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -41,7 +126,16 @@ sys.exit(int(os.environ.get('TEST_ENGINE_EXIT','0')))
     }
 
     fn command(&self) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_coven"));
+        let mut c = match std::env::var_os(FD_LOG) {
+            Some(log) => {
+                let mut shim = Command::new("/usr/bin/python3");
+                shim.args(["-I", "-S", "-c", FD_SHIM])
+                    .arg(log)
+                    .arg(env!("CARGO_BIN_EXE_coven"));
+                shim
+            }
+            None => Command::new(env!("CARGO_BIN_EXE_coven")),
+        };
         c.env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("HOME", self.0.path().join("home"))
@@ -88,7 +182,7 @@ fn transcript_prefill_and_ignored_frames_do_not_require_query_receipts() {
         fs::write(engine, source).unwrap();
         let mut child = f.command()
             .args(["run", "coven-code", "--max-turns", "12", "--stream-json", "--stream-json-input", "--", "work"])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn_serialized().unwrap();
         let input = format!("{prefix}{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"work\"}}}}\n{suffix}");
         child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
         let output = child.wait_with_output().unwrap();
@@ -134,7 +228,7 @@ fn later_streamed_input_needs_its_own_saved_result_before_continuation() {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .spawn_serialized()
             .unwrap();
         let input = format!("{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{}\"}}}}\n{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"second\"}}}}\n", "x".repeat(8192));
         child
@@ -171,7 +265,7 @@ fn later_streamed_input_needs_its_own_saved_result_before_continuation() {
                     "--",
                     "resume",
                 ])
-                .output()
+                .output_serialized()
                 .unwrap();
             assert!(!resumed.status.success(), "{resumed:?}");
             assert!(!f.0.path().join("argv.json").exists());
@@ -197,7 +291,7 @@ fn a_fresh_budgeted_history_is_pending_before_other_aliases_can_resume_it() {
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let mut reader = BufReader::new(child.stdout.take().unwrap());
     let mut first = String::new();
@@ -213,7 +307,7 @@ fn a_fresh_budgeted_history_is_pending_before_other_aliases_can_resume_it() {
             "--",
             "do not replay unfinished work",
         ])
-        .output()
+        .output_serialized()
         .unwrap();
     fs::write(f.0.path().join("release"), "").unwrap();
     let mut rest = String::new();
@@ -232,7 +326,7 @@ fn explicit_budget_is_forwarded_before_prompt_and_declared_to_consumers() {
     let listed = f
         .command()
         .args(["adapter", "list", "--json"])
-        .output()
+        .output_serialized()
         .unwrap();
     let list: Value = serde_json::from_slice(&listed.stdout).unwrap();
     let engine = list
@@ -253,7 +347,7 @@ fn explicit_budget_is_forwarded_before_prompt_and_declared_to_consumers() {
             "--",
             "--max-turns 999 is prompt data",
         ])
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let args = f.args();
@@ -270,7 +364,7 @@ fn invalid_and_unsupported_budgets_never_launch_work() {
         let o = f
             .command()
             .args(["run", "coven-code", "--max-turns", value, "--", "hello"])
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(!o.status.success());
         assert!(!f.0.path().join("argv.json").exists());
@@ -280,7 +374,7 @@ fn invalid_and_unsupported_budgets_never_launch_work() {
         .command()
         .env("TEST_BUDGET_CAPS", "{}")
         .args(["run", "coven-code", "--max-turns", "12", "--", "hello"])
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(!o.status.success());
     assert!(
@@ -317,7 +411,7 @@ fn typed_exhaustion_survives_successful_stream_process_exit() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     child
         .stdin
@@ -354,7 +448,7 @@ fn process_failure_cannot_be_erased_by_a_successful_budget_receipt() {
             "--",
             "hello",
         ])
-        .output()
+        .output_serialized()
         .unwrap();
     assert_eq!(o.status.code(), Some(7));
     assert_eq!(frames(&o).last().unwrap()["is_error"], true, "{o:?}");
@@ -388,7 +482,7 @@ fn streamed_provider_failure_stays_distinct_from_unconfirmed_query_history() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     child
         .stdin
@@ -421,7 +515,7 @@ fn continuation_uses_persisted_engine_identity_instead_of_ledger_identity() {
             "--",
             "hello",
         ])
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(o.status.success(), "{o:?}");
     let all = frames(&o);
@@ -441,7 +535,7 @@ fn continuation_uses_persisted_engine_identity_instead_of_ledger_identity() {
             "--",
             "continue",
         ])
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(resumed.status.success(), "{resumed:?}");
     let args = f.args();
@@ -466,7 +560,7 @@ fn one_shot_budget_success_accepts_the_existing_engine_result_envelope() {
             "--",
             "hello",
         ])
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(o.status.success(), "{o:?}");
     let all = frames(&o);
@@ -494,7 +588,7 @@ fn a_negotiated_budget_requires_a_matching_applied_receipt() {
                 "--",
                 "hello",
             ])
-            .output()
+            .output_serialized()
             .unwrap();
         assert_eq!(frames(&o).last().unwrap()["is_error"], true, "{o:?}");
     }
@@ -506,7 +600,7 @@ fn ordinary_budget_run_renders_text_and_retains_engine_continuity() {
     let first = f
         .command()
         .args(["run", "coven-code", "--max-turns", "12", "--", "hello"])
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(first.status.success(), "{first:?}");
     let stdout = String::from_utf8_lossy(&first.stdout);
@@ -526,7 +620,7 @@ fn ordinary_budget_run_renders_text_and_retains_engine_continuity() {
             "--",
             "again",
         ])
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(o.status.success(), "{o:?}");
     let args = f.args();
@@ -549,7 +643,7 @@ fn a_newer_unconfirmed_save_blocks_every_older_engine_alias() {
                 "--",
                 "first",
             ])
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(first.status.success(), "{first:?}");
         let values = frames(&first);
@@ -569,7 +663,7 @@ fn a_newer_unconfirmed_save_blocks_every_older_engine_alias() {
         if !ordinary {
             second.args(["--max-turns", "12", "--stream-json"]);
         }
-        let output = second.args(["--", "second"]).output().unwrap();
+        let output = second.args(["--", "second"]).output_serialized().unwrap();
         assert!(output.status.success(), "{output:?}");
         fs::remove_file(f.0.path().join("argv.json")).unwrap();
         let third = f
@@ -585,7 +679,7 @@ fn a_newer_unconfirmed_save_blocks_every_older_engine_alias() {
                 "--",
                 "third",
             ])
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(
             !third.status.success(),
@@ -617,9 +711,10 @@ fn a_parsed_one_shot_receipt_survives_stdout_disconnect() {
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     let pipe = child.stdout.take().unwrap();
+    log_owned_pipe("stdout-read", &pipe);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut lines = BufReader::new(pipe).lines();
@@ -649,7 +744,11 @@ fn a_parsed_one_shot_receipt_survives_stdout_disconnect() {
     let out = child.wait_with_output().unwrap();
     assert!(ready.unwrap(), "{out:?}");
     assert!(!out.status.success());
-    let listing = f.command().args(["sessions", "--json"]).output().unwrap();
+    let listing = f
+        .command()
+        .args(["sessions", "--json"])
+        .output_serialized()
+        .unwrap();
     let sessions: Value = serde_json::from_slice(&listing.stdout).unwrap();
     assert_eq!(
         sessions["sessions"][0]["conversation_id"], "engine-session",
@@ -696,7 +795,7 @@ fn budget_probe_is_bound_to_the_executable_that_launches_work() {
             "--",
             "hello",
         ])
-        .output()
+        .output_serialized()
         .unwrap();
     let selected = fs::read_to_string(f.0.path().join("selected-engine")).ok();
     if out.status.success() {
