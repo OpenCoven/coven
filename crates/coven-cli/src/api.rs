@@ -79,34 +79,52 @@ struct DirectApplyPauseState {
     released: bool,
     watchdog_expired: bool,
     fail_audit_directory_sync: bool,
+    /// Set when a traced worker returns without reaching the pause.
+    worker_returned: Option<String>,
 }
 
 #[cfg(test)]
 struct DirectApplyPause {
     state: Mutex<DirectApplyPauseState>,
     changed: std::sync::Condvar,
+    /// Checkpoints the traced worker passed, for the guard's failure message.
+    phases: std::sync::Arc<crate::threads_clock::request_diagnostics::test_recorder::PhaseLog>,
 }
 
 #[cfg(test)]
 impl DirectApplyPause {
     fn wait_until_reached(&self, description: &str) {
-        let deadline = std::time::Instant::now() + TEST_SYNC_TIMEOUT;
+        self.wait_until_reached_within(description, TEST_SYNC_TIMEOUT);
+    }
+
+    /// Wait for the worker to reach the pre-audit pause.
+    ///
+    /// The timeout is a hang guard, not a latency claim (#1811). When it
+    /// expires, the panic lists the checkpoints the traced worker passed, so
+    /// a starved run shows where it stalled. A traced worker that returns
+    /// early fails the wait at once with its response instead of a timeout.
+    fn wait_until_reached_within(&self, description: &str, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
         let mut state = self.state.lock().expect("direct apply pause lock poisoned");
         while !state.reached && !state.watchdog_expired {
+            if let Some(returned) = state.worker_returned.take() {
+                drop(state);
+                panic!(
+                    "{description}: the worker returned before reaching the pause: {returned}\n\
+                     phases:\n{}",
+                    self.phases.render()
+                );
+            }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 drop(state);
-                panic!("timed out after {TEST_SYNC_TIMEOUT:?} waiting for {description}");
+                self.panic_timed_out(description, timeout);
             }
-            let (next, timeout) = self
+            let (next, _) = self
                 .changed
                 .wait_timeout(state, remaining)
                 .expect("direct apply pause lock poisoned");
             state = next;
-            if timeout.timed_out() && !state.reached && !state.watchdog_expired {
-                drop(state);
-                panic!("timed out after {TEST_SYNC_TIMEOUT:?} waiting for {description}");
-            }
         }
         let watchdog_expired = state.watchdog_expired;
         drop(state);
@@ -114,6 +132,24 @@ impl DirectApplyPause {
             !watchdog_expired,
             "direct apply pre-audit pause watchdog expired before {description}"
         );
+    }
+
+    fn panic_timed_out(&self, description: &str, timeout: std::time::Duration) -> ! {
+        panic!(
+            "timed out after {timeout:?} waiting for {description}\nphases:\n{}",
+            self.phases.render()
+        );
+    }
+
+    fn worker_returned(&self, summary: String) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !state.reached {
+            state.worker_returned = Some(summary);
+            self.changed.notify_all();
+        }
     }
 
     fn release(&self) {
@@ -157,6 +193,33 @@ impl DirectApplyPauseGuard {
     fn fail_audit_directory_sync(&self) {
         self.pause.state.lock().unwrap().fail_audit_directory_sync = true;
     }
+
+    /// Wrap the worker that should reach this pause.
+    ///
+    /// The worker records its checkpoints into the pause's phase log, and
+    /// reports its response if it returns while the test is still waiting.
+    fn traced(
+        &self,
+        work: impl FnOnce() -> Result<ApiResponse> + Send + 'static,
+    ) -> impl FnOnce() -> Result<ApiResponse> + Send + 'static {
+        let pause = std::sync::Arc::clone(&self.pause);
+        move || {
+            let recording = pause.phases.record_on_this_thread();
+            pause.phases.note("worker-start");
+            let result = work();
+            pause.phases.note("worker-returned");
+            drop(recording);
+            pause.worker_returned(match &result {
+                Ok(response) => format!(
+                    "status {} body {}",
+                    response.status,
+                    response.body.chars().take(400).collect::<String>()
+                ),
+                Err(error) => format!("error {error:#}"),
+            });
+            result
+        }
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +253,7 @@ fn set_direct_apply_pause(coven_home: &Path, familiar_id: &str) -> DirectApplyPa
     let pause = std::sync::Arc::new(DirectApplyPause {
         state: Mutex::new(DirectApplyPauseState::default()),
         changed: std::sync::Condvar::new(),
+        phases: crate::threads_clock::request_diagnostics::test_recorder::PhaseLog::new(),
     });
     direct_apply_pauses()
         .lock()
@@ -348,6 +412,7 @@ fn maybe_pause_direct_apply_before_audit(coven_home: &Path, familiar_id: &str) {
         .state
         .lock()
         .expect("direct apply pause lock poisoned");
+    pause.phases.note("pre-audit-pause-reached");
     state.reached = true;
     pause.changed.notify_all();
     let deadline = std::time::Instant::now() + TEST_SYNC_TIMEOUT;
@@ -33002,12 +33067,15 @@ tier = 1
         let pause = set_direct_apply_pause(&home, "sage");
 
         let first_home = home.clone();
-        let first = TestWorker::spawn("first direct apply worker", move || {
-            post_edits(
-                &first_home,
-                r#"{"edits":[{"target":"notes/today.md","contents":"first"}]}"#,
-            )
-        });
+        let first = TestWorker::spawn(
+            "first direct apply worker",
+            pause.traced(move || {
+                post_edits(
+                    &first_home,
+                    r#"{"edits":[{"target":"notes/today.md","contents":"first"}]}"#,
+                )
+            }),
+        );
         pause.wait_until_reached("first direct apply to reach the pre-audit pause");
 
         let lock_probe = set_direct_apply_lock_probe(&home, "sage");
@@ -33042,6 +33110,92 @@ tier = 1
         Ok(())
     }
 
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn direct_apply_pause_fails_fast_when_the_traced_worker_returns_early() -> Result<()> {
+        // No familiar is seeded, so the edit is refused before the Ward lock
+        // and never reaches the pre-audit pause. The wait must report that
+        // response instead of spending its whole hang guard (#1811).
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().to_path_buf();
+        let pause = set_direct_apply_pause(&home, "sage");
+        let worker_home = home.clone();
+        let worker = TestWorker::spawn(
+            "early-returning direct apply worker",
+            pause.traced(move || {
+                post_edits(
+                    &worker_home,
+                    r#"{"edits":[{"target":"notes/today.md","contents":"x"}]}"#,
+                )
+            }),
+        );
+        let response = worker.wait()??;
+        assert_ne!(response.status, 200, "{}", response.body);
+
+        let message = panic_message(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pause.wait_until_reached("early worker to reach the pre-audit pause");
+            }))
+            .expect_err("an early return must fail the wait"),
+        );
+        assert!(
+            message.contains("the worker returned before reaching the pause")
+                && message.contains(&format!("status {}", response.status)),
+            "{message}"
+        );
+        for phase in ["worker-start", "intake", "worker-returned"] {
+            assert!(message.contains(phase), "missing {phase}: {message}");
+        }
+        assert!(!message.contains("pre-audit-pause-reached"), "{message}");
+        Ok(())
+    }
+
+    #[test]
+    fn direct_apply_pause_timeout_names_the_last_phase_reached() {
+        use crate::threads_clock::request_diagnostics::{checkpoint, Phase};
+        let temp = tempfile::tempdir().unwrap();
+        let pause = set_direct_apply_pause(temp.path(), "sage");
+        {
+            let _recording = pause.pause.phases.record_on_this_thread();
+            checkpoint(Phase::LockWait);
+            checkpoint(Phase::LockAcquired);
+            checkpoint(Phase::StoreOpen);
+        }
+        // Outside the recording guard, checkpoints are not captured.
+        checkpoint(Phase::StoreReady);
+
+        let message = panic_message(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pause
+                    .pause
+                    .wait_until_reached_within("a stalled worker", std::time::Duration::ZERO);
+            }))
+            .expect_err("a zero hang guard must expire"),
+        );
+        assert!(
+            message.starts_with("timed out after 0ns waiting for a stalled worker"),
+            "{message}"
+        );
+        assert!(message.contains("last phase `store-open`"), "{message}");
+        let order: Vec<usize> = ["lock-wait", "lock-acquired", "store-open"]
+            .iter()
+            .map(|phase| {
+                message
+                    .find(phase)
+                    .unwrap_or_else(|| panic!("missing {phase}: {message}"))
+            })
+            .collect();
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{message}");
+        assert!(!message.contains("store-ready"), "{message}");
+    }
+
     #[test]
     fn direct_and_approved_tier2_writes_share_commit_audit_serialization() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -33058,12 +33212,15 @@ tier = 1
         let pause = set_direct_apply_pause(&home, "sage");
 
         let direct_home = home.clone();
-        let direct = TestWorker::spawn("direct apply worker", move || {
-            post_edits(
-                &direct_home,
-                r#"{"edits":[{"target":"notes/direct.md","contents":"direct"}]}"#,
-            )
-        });
+        let direct = TestWorker::spawn(
+            "direct apply worker",
+            pause.traced(move || {
+                post_edits(
+                    &direct_home,
+                    r#"{"edits":[{"target":"notes/direct.md","contents":"direct"}]}"#,
+                )
+            }),
+        );
         pause.wait_until_reached("direct apply to reach the pre-audit pause");
 
         let lock_probe = set_proposal_write_lock_probe(&home, &proposal_id);
