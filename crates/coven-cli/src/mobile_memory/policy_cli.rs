@@ -2,13 +2,14 @@
 //! is read transiently from outside `COVEN_HOME`, used to sign one exact action
 //! after the owner reviews every signed field, and never persisted by Coven.
 
+use crate::timestamp::Rfc3339;
 use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use serde::Serialize;
@@ -485,7 +486,7 @@ fn join(ids: &[Uuid]) -> String {
 }
 
 fn timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+    value.millis_z()
 }
 
 #[cfg(test)]

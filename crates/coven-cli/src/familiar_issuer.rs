@@ -17,11 +17,12 @@
 //! first. Every issued binding is recorded, and its projection is the
 //! execution binding's `familiar` member, mapped to Coven's vocabulary.
 
+use crate::timestamp::Rfc3339;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde_json::{json, Value};
 
@@ -463,7 +464,7 @@ fn projection(
 }
 
 fn timestamp(at: DateTime<Utc>) -> String {
-    at.to_rfc3339_opts(SecondsFormat::Millis, true)
+    at.millis_z()
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -27,11 +27,12 @@
 //! signs the store as it bears on one decision, and [`consume_in`] consumes a
 //! decision at most once.
 
+use crate::timestamp::Rfc3339;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use chrono::{DateTime, DurationRound, SecondsFormat, TimeDelta, Utc};
+use chrono::{DateTime, DurationRound, TimeDelta, Utc};
 use coven_threads_core::automation_authority::{
     canonical_digest, evaluate_authorization, sign_artifact, verify_decision_bundle,
     ArtifactSigner, AuthorityError, Domain, ErrorCode, Keyring, SignatureVerifier,
@@ -640,7 +641,7 @@ fn whole_millis(value: DateTime<Utc>) -> DateTime<Utc> {
 }
 
 fn timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+    value.millis_z()
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 //! at least one trusted device. WebAuthn ES256 assertions are verified here in
 //! Rust; there is no vendor SDK or hosted account service in the decision.
 
+use crate::timestamp::Rfc3339;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -592,18 +593,8 @@ fn render_registration_review(
         ("allowed origins", registration.origins.join(", ")),
         ("nonce", action.nonce.clone()),
         ("effect digest", action.effect_digest.clone()),
-        (
-            "issued at",
-            action
-                .issued_at
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        ),
-        (
-            "expires at",
-            action
-                .expires_at
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        ),
+        ("issued at", action.issued_at.millis_z()),
+        ("expires at", action.expires_at.millis_z()),
     ] {
         writeln!(review, "  {name:<28} {value}")?;
     }

@@ -5,6 +5,7 @@
 //! runtime ownership begins; terminal settlement happens only after the
 //! session ledger contains completion evidence.
 
+use crate::timestamp::Rfc3339;
 use std::{
     cell::{Cell, RefCell},
     path::{Path, PathBuf},
@@ -113,7 +114,7 @@ pub(crate) fn recover_restart_containment(
             .map_err(|error| format!("failed to read containment recovery candidate: {error}"))?;
         candidates
     };
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let now_iso = now.millis_z();
     let mut recovered = 0;
     for (session_id, created_at, occurrence_kind, lease_owner) in candidates {
         let created_at = DateTime::parse_from_rfc3339(&created_at)
@@ -211,8 +212,8 @@ pub(crate) fn fail_unlaunched_manual_claims(
                WHERE automation_missions.occurrence_id = automation_occurrences.id
            )",
         rusqlite::params![
-            now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            startup_cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            now.millis_z(),
+            startup_cutoff.millis_z(),
             MANUAL_CLAIM_RESTART_REASON,
         ],
     )
@@ -441,7 +442,7 @@ fn persist_launch_with_clock(
         rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("failed to begin durable automation launch: {error}"))?;
     let now = clock().max(context.not_before);
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let now_iso = now.millis_z();
     let existing_run: bool = transaction
         .query_row(
             "SELECT EXISTS(
@@ -778,7 +779,7 @@ fn publish_runtime_ownership(
         require_current_scheduler_fence(&transaction, occurrence_id, fence)
             .map_err(anyhow::Error::msg)?;
     }
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let now_iso = now.millis_z();
     let ownership_published = crate::store::update_session_status_if_current(
         &transaction,
         session_id,
@@ -1046,7 +1047,7 @@ fn settle_rejected_launch(
     if let Some(fence) = scheduler_fence {
         require_current_scheduler_fence(&transaction, occurrence_id, fence)?;
     }
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let now_iso = now.millis_z();
     crate::store::update_session_terminal_if_active(
         &transaction,
         session_id,
@@ -1126,7 +1127,7 @@ fn settle_rejected_launch(
         let next_attempt_number = attempt_number + 1;
         let retry_at =
             retry_backoff_timing(&definition.retry, run_id, next_attempt_number, now).not_before;
-        let retry_at_iso = retry_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let retry_at_iso = retry_at.millis_z();
         transaction
             .execute(
                 "INSERT INTO automation_attempts
@@ -1259,7 +1260,7 @@ fn hold_failed_preownership_attempt_in(
          )",
         rusqlite::params![run_id, occurrence_id,
             format!("{reason}; held for an operator retry until the run's deadline"),
-            now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true), MAX_ATTEMPT_NUMBER],
+            now.millis_z(), MAX_ATTEMPT_NUMBER],
     ).map_err(|error| format!("failed to retain pre-ownership retry hold: {error}"))?;
     Ok(changed == 1)
 }
@@ -1824,10 +1825,7 @@ fn restore_preownership_launch_for_retry_in(
                  failure_reason = NULL,
                  updated_at = ?2
              WHERE id = ?1 AND state = 'claimed' AND lease_owner = 'daemon'",
-            rusqlite::params![
-                occurrence_id,
-                now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-            ],
+            rusqlite::params![occurrence_id, now.millis_z()],
         )
         .map_err(|error| format!("failed to restore cancelled automation occurrence: {error}"))?;
     if restored_occurrence != 1 {
@@ -1959,7 +1957,7 @@ fn retry_proven_preownership_lease_expiry_in(
         .map_err(|error| format!("failed to read expired automation attempt: {error}"))?;
     let attempt_number = u8::try_from(attempt_number)
         .map_err(|_| "expired attempt number exceeds supported range".to_string())?;
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let now_iso = now.millis_z();
     crate::store::update_session_terminal_if_active(conn, session_id, "failed", None, &now_iso)
         .map_err(|error| format!("failed to settle expired automation session: {error:#}"))?;
     let settled = conn
@@ -1982,7 +1980,7 @@ fn retry_proven_preownership_lease_expiry_in(
         let next_attempt_number = attempt_number + 1;
         let retry_at =
             retry_backoff_timing(&definition.retry, run_id, next_attempt_number, now).not_before;
-        let retry_at_iso = retry_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let retry_at_iso = retry_at.millis_z();
         conn.execute(
             "INSERT INTO automation_attempts
                 (id, run_id, occurrence_id, attempt_number, adoption_key,
@@ -2345,7 +2343,7 @@ fn dispatch_claimed_occurrences_inner(
             recover_expired_leases(conn, now)?;
         }
     }
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let now_iso = now.millis_z();
     let batch_limit =
         i64::try_from(super::occurrences::SCHEDULER_PASS_BATCH_LIMIT).map_err(|error| {
             format!("automation dispatch batch limit exceeds SQLite range: {error}")
@@ -2440,7 +2438,7 @@ fn dispatch_claimed_occurrences_inner(
                 )",
                 rusqlite::params![
                     occurrence_id,
-                    check_now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    check_now.millis_z(),
                     scheduler_fence.map(|fence| fence.generation()),
                     scheduler_fence.map(|fence| fence.owner_id()),
                 ],
@@ -2757,7 +2755,7 @@ fn restore_unlaunched_daemon_claims_for_retry_inner(
                )
            )",
             rusqlite::params![
-                now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                now.millis_z(),
                 scheduler_fence.map(|fence| fence.generation()),
                 scheduler_fence.map(|fence| fence.owner_id()),
             ],
@@ -2793,7 +2791,7 @@ pub fn recover_abandoned_launches(
     runtime: &dyn SessionRuntime,
     now: DateTime<Utc>,
 ) -> Result<Vec<String>, String> {
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let now_iso = now.millis_z();
     let candidates: Vec<(String, String)> = {
         let mut statement = conn
             .prepare(
@@ -2933,7 +2931,7 @@ pub(super) fn settle_waiting_retry_timeout_in(
     occurrence_id: &str,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let now_iso = now.millis_z();
     let reason = "automation retry wait exceeded run timeout";
     let settled_attempt = conn
         .execute(
@@ -3242,9 +3240,8 @@ pub(crate) fn claim_stop_fence(
 ) -> Result<StopFenceClaim, String> {
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|error| format!("failed to begin automation stop reservation: {error}"))?;
-    let acquired_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let execution_expires_at =
-        (now + chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let acquired_at = now.millis_z();
+    let execution_expires_at = (now + chrono::Duration::seconds(30)).millis_z();
     let inserted = transaction
         .execute(
             "INSERT INTO automation_stop_fences (
@@ -3438,7 +3435,7 @@ pub(crate) fn settle_confirmed_stop(
     let transaction = conn
         .unchecked_transaction()
         .map_err(|error| format!("failed to begin automation stop settlement: {error}"))?;
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let now_iso = now.millis_z();
     if !crate::store::update_session_terminal_if_active(
         &transaction,
         session_id,
@@ -3776,7 +3773,7 @@ fn mark_unconfirmed_stop_for_recovery_in(
     state_reason: &str,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let now_iso = now.millis_z();
     let attempt_changed = conn
         .execute(
             "UPDATE automation_attempts
@@ -3876,7 +3873,7 @@ pub(crate) fn mark_terminal_stop_for_recovery(
     let transaction = conn
         .unchecked_transaction()
         .map_err(|error| format!("failed to begin terminal stop recovery: {error}"))?;
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let now_iso = now.millis_z();
     let attempt_changed = transaction
         .execute(
             "UPDATE automation_attempts
@@ -3949,7 +3946,7 @@ pub fn mark_active_attempts_for_restart_reconciliation(
     let transaction = conn
         .unchecked_transaction()
         .map_err(|error| format!("failed to begin shutdown reconciliation: {error}"))?;
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let now_iso = now.millis_z();
     let reason = "daemon shutdown requires restart reconciliation";
     let attempts = transaction
         .execute(
@@ -4558,7 +4555,7 @@ pub(crate) fn settle_finished_runs_with(
                         run_id,
                         attempt_status,
                         reason,
-                        settlement_time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        settlement_time.millis_z(),
                         attempt_number,
                     ],
                 )
@@ -4961,7 +4958,7 @@ fn hold_runtime_authority_terminal_settlement_in(
     reason: &str,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let now_iso = now.millis_z();
     conn.execute(
         "UPDATE automation_attempts
              SET state_reason = ?2
@@ -6565,11 +6562,7 @@ mod tests {
             "UPDATE automation_definitions
              SET created_at = ?2, updated_at = ?2
              WHERE id = ?1",
-            rusqlite::params![
-                routine.id,
-                (now - chrono::Duration::days(1))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-            ],
+            rusqlite::params![routine.id, (now - chrono::Duration::days(1)).millis_z()],
         )
         .unwrap();
         let first = super::super::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
@@ -6612,11 +6605,7 @@ mod tests {
             "UPDATE automation_definitions
              SET created_at = ?2, updated_at = ?2
              WHERE id = ?1",
-            rusqlite::params![
-                routine.id,
-                (now - chrono::Duration::days(1))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-            ],
+            rusqlite::params![routine.id, (now - chrono::Duration::days(1)).millis_z()],
         )
         .unwrap();
         let leadership =
@@ -6669,11 +6658,7 @@ mod tests {
             "UPDATE automation_definitions
              SET created_at = ?2, updated_at = ?2
              WHERE id = ?1",
-            rusqlite::params![
-                routine.id,
-                (now - chrono::Duration::days(1))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-            ],
+            rusqlite::params![routine.id, (now - chrono::Duration::days(1)).millis_z()],
         )
         .unwrap();
         let leadership =
@@ -6726,11 +6711,7 @@ mod tests {
             "UPDATE automation_definitions
              SET created_at = ?2, updated_at = ?2
              WHERE id = ?1",
-            rusqlite::params![
-                routine.id,
-                (now - chrono::Duration::days(1))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-            ],
+            rusqlite::params![routine.id, (now - chrono::Duration::days(1)).millis_z()],
         )
         .unwrap();
         let leadership =
@@ -6988,7 +6969,7 @@ mod tests {
         let receipt_id = state
             .receipt_id
             .expect("terminal Runtime Authority receipt");
-        let terminal_time = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let terminal_time = now.millis_z();
         assert_eq!(state.occurrence_state, "failed");
         assert_eq!(
             state.occurrence_reason.as_deref(),
@@ -8168,8 +8149,7 @@ mod tests {
              WHERE id = ?1",
             rusqlite::params![
                 routine.id,
-                (launched_at - chrono::Duration::days(1))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                (launched_at - chrono::Duration::days(1)).millis_z()
             ],
         )
         .unwrap();
@@ -8376,8 +8356,7 @@ mod tests {
              WHERE id = ?1",
             rusqlite::params![
                 routine.id,
-                (launched_at - chrono::Duration::days(1))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                (launched_at - chrono::Duration::days(1)).millis_z()
             ],
         )
         .unwrap();
@@ -8514,7 +8493,7 @@ mod tests {
                 session_id: session_id.clone(),
                 kind: "output".to_owned(),
                 payload_json: json!({ "data": output }).to_string(),
-                created_at: launched_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                created_at: launched_at.millis_z(),
             },
         )
         .unwrap();
@@ -8524,7 +8503,7 @@ mod tests {
             &session_id,
             "completed",
             Some(0),
-            &finished_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &finished_at.millis_z(),
         )
         .unwrap();
         (launched_at, finished_at)
@@ -8708,7 +8687,7 @@ mod tests {
             session_id,
             "completed",
             Some(0),
-            &finished_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &finished_at.millis_z(),
         )
         .unwrap();
 
@@ -8781,7 +8760,7 @@ mod tests {
                     }
                 })
                 .to_string(),
-                launched_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                launched_at.millis_z(),
             ],
         )
         .unwrap();
@@ -8791,7 +8770,7 @@ mod tests {
             session_id,
             "completed",
             Some(0),
-            &terminal_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &terminal_at.millis_z(),
         )
         .unwrap();
 
@@ -8943,7 +8922,7 @@ mod tests {
             &run.session_id,
             "completed",
             Some(0),
-            &terminal_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &terminal_at.millis_z(),
         )
         .unwrap();
         terminal_at
@@ -9371,7 +9350,7 @@ mod tests {
             session_id,
             "completed",
             Some(0),
-            &terminal_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &terminal_at.millis_z(),
         )
         .unwrap();
 
@@ -9609,11 +9588,7 @@ mod tests {
                 'legacy-normalized', 'Legacy normalized', 'ACTIVE', ?1, 1, ?2, 'active',
                 NULL, 0, ?3, ?3
              )",
-            rusqlite::params![
-                definition_json,
-                digest,
-                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-            ],
+            rusqlite::params![definition_json, digest, Utc::now().millis_z()],
         )
         .unwrap();
         let definition: RoutineDefinition = serde_json::from_str(definition_json).unwrap();
@@ -9763,8 +9738,7 @@ mod tests {
              WHERE id = ?1",
             rusqlite::params![
                 "stale-sampled-time",
-                (Utc::now() - chrono::Duration::seconds(1))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                (Utc::now() - chrono::Duration::seconds(1)).millis_z()
             ],
         )
         .unwrap();
@@ -9980,7 +9954,7 @@ mod tests {
             terminal_id,
             "completed",
             Some(0),
-            &launched_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &launched_at.millis_z(),
         )
         .unwrap();
         let terminal_receipt = containment_receipt_path(temp.path(), terminal_id);
@@ -10032,7 +10006,7 @@ mod tests {
             outcome.session_id.as_deref().unwrap(),
             "completed",
             Some(0),
-            &completed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &completed_at.millis_z(),
         )
         .unwrap();
 
@@ -10098,7 +10072,7 @@ mod tests {
             session_id,
             "completed",
             Some(0),
-            &finished_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &finished_at.millis_z(),
         )
         .unwrap();
         let report = settle_finished_runs(&conn, finished_at).unwrap();
@@ -10128,7 +10102,7 @@ mod tests {
             session_id,
             "failed",
             Some(17),
-            &finished_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &finished_at.millis_z(),
         )
         .unwrap();
 
@@ -10191,7 +10165,7 @@ mod tests {
             session_id,
             "cancelled",
             None,
-            &cancelled_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &cancelled_at.millis_z(),
         )
         .unwrap();
 
@@ -10241,7 +10215,7 @@ mod tests {
             session_id,
             "completed",
             Some(0),
-            &completed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &completed_at.millis_z(),
         )
         .unwrap());
         assert!(!crate::store::update_session_terminal_if_active(
@@ -10249,8 +10223,7 @@ mod tests {
             session_id,
             "cancelled",
             None,
-            &(completed_at + chrono::Duration::seconds(1))
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &(completed_at + chrono::Duration::seconds(1)).millis_z(),
         )
         .unwrap());
 
@@ -10295,7 +10268,7 @@ mod tests {
             outcome.session_id.as_deref().unwrap(),
             "cancelled",
             None,
-            &cancelled_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &cancelled_at.millis_z(),
         )
         .unwrap();
 
@@ -10488,7 +10461,7 @@ mod tests {
                 session,
                 "completed",
                 Some(0),
-                &now.to_rfc3339(),
+                &now.rfc3339_offset(),
             )
             .unwrap();
             assert_eq!(
@@ -10641,7 +10614,7 @@ mod tests {
                     session,
                     "completed",
                     Some(0),
-                    &now.to_rfc3339(),
+                    &now.rfc3339_offset(),
                 )
                 .unwrap();
             }
@@ -10794,7 +10767,7 @@ mod tests {
                 "INSERT INTO automation_stop_fences
                     (run_id, session_id, owner, operation_key, acquired_at, execution_expires_at)
                  VALUES (?1, ?2, 'cancellation', 'adopt:cancel:healthy', ?3, X'80')",
-                rusqlite::params![runs[1].0, runs[1].1, now.to_rfc3339()],
+                rusqlite::params![runs[1].0, runs[1].1, now.rfc3339_offset()],
             )
             .unwrap();
             let runtime = RecordingStops::default();
@@ -10901,7 +10874,7 @@ mod tests {
                 session,
                 status,
                 exit_code,
-                &past_deadline.to_rfc3339(),
+                &past_deadline.rfc3339_offset(),
             )
             .unwrap();
             assert_eq!(
@@ -10999,7 +10972,7 @@ mod tests {
             session,
             "killed",
             None,
-            &past_deadline.to_rfc3339(),
+            &past_deadline.rfc3339_offset(),
         )
         .unwrap();
         // Whatever the unknown-stop path decides, it must not settle the
@@ -11934,8 +11907,7 @@ mod tests {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily")).unwrap();
         let now = Utc::now();
-        let old_scheduled_for =
-            (now - chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let old_scheduled_for = (now - chrono::Duration::hours(1)).millis_z();
         conn.execute(
             "INSERT INTO automation_occurrences
                 (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
@@ -12130,8 +12102,8 @@ mod tests {
         assert_eq!(
             crate::store::mark_stale_created_sessions_failed(
                 &conn,
-                &now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                &now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                &now.millis_z(),
+                &now.millis_z(),
             )
             .unwrap(),
             0,
@@ -12217,13 +12189,12 @@ mod tests {
             )
             .unwrap();
         let adoption_key = "adopt:cancel:fenced-abandoned:0001";
-        let execution_expires_at = (now + chrono::Duration::seconds(30))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let execution_expires_at = (now + chrono::Duration::seconds(30)).millis_z();
         conn.execute(
             "INSERT INTO automation_command_reservations (
                  adoption_key, request_digest, command, reserved_at
              ) VALUES (?1, 'digest', 'run.cancel.v1', ?2)",
-            rusqlite::params![adoption_key, launched_at.to_rfc3339()],
+            rusqlite::params![adoption_key, launched_at.rfc3339_offset()],
         )
         .unwrap();
         conn.execute(
@@ -12240,7 +12211,7 @@ mod tests {
                 "fenced-abandoned-run",
                 attempt_id,
                 "fenced-abandoned-session",
-                launched_at.to_rfc3339(),
+                launched_at.rfc3339_offset(),
                 execution_expires_at
             ],
         )
@@ -12783,8 +12754,7 @@ mod tests {
                 outcome.session_id.as_deref().expect("linked session"),
                 "completed",
                 Some(0),
-                &(timed_out_at + chrono::Duration::milliseconds(1))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                &(timed_out_at + chrono::Duration::milliseconds(1)).millis_z(),
             )
             .unwrap(),
             "a late completion must lose to the already-recorded timeout stop"
@@ -12882,7 +12852,7 @@ mod tests {
                 session,
                 "completed",
                 Some(0),
-                &self.at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                &self.at.millis_z(),
             )?;
             if !self.acknowledged {
                 anyhow::bail!("stop acknowledgement lost");
@@ -12961,7 +12931,7 @@ mod tests {
             outcome.session_id.as_deref().expect("linked session"),
             "completed",
             Some(0),
-            &completed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &completed_at.millis_z(),
         )
         .unwrap());
         let settlement = settle_finished_runs(&conn, completed_at).unwrap();
@@ -13016,7 +12986,7 @@ mod tests {
                 outcome.session_id.as_deref().expect("linked session"),
                 "killed",
                 None,
-                &timed_out_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                &timed_out_at.millis_z(),
             )
             .unwrap(),
             "a timeout observed after completion must not rewrite the session terminal state"
@@ -13087,7 +13057,7 @@ mod tests {
             session_id,
             "completed",
             Some(0),
-            &finished_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &finished_at.millis_z(),
         )
         .unwrap();
         conn.execute_batch(
@@ -13185,10 +13155,9 @@ mod tests {
                  WHERE id = ?5",
                 rusqlite::params![
                     occurrence_id,
-                    scheduled_for.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    (now + chrono::Duration::minutes(60))
-                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    scheduled_for.millis_z(),
+                    (now + chrono::Duration::minutes(60)).millis_z(),
+                    now.millis_z(),
                     automation_id,
                 ],
             )
@@ -13285,7 +13254,7 @@ mod tests {
             session_id: session_id.clone(),
             kind: kind.to_owned(),
             payload_json: payload.to_string(),
-            created_at: ended.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            created_at: ended.millis_z(),
         };
         // Both reads reached the service, so the stream shows both.
         let stream = crate::automations::stream_observation::test_support::stream(
@@ -13299,7 +13268,7 @@ mod tests {
             &session_id,
             "completed",
             Some(0),
-            &ended.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &ended.millis_z(),
         )
         .unwrap());
         crate::store::insert_event(
@@ -13469,7 +13438,7 @@ mod tests {
             &session_id,
             "completed",
             Some(0),
-            &ended.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &ended.millis_z(),
         )
         .unwrap());
         let settled = settle_finished_runs(conn, ended).expect("BaseV1 settlement proceeds");

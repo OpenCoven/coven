@@ -1,4 +1,5 @@
 use crate::automations::owner_grants::CommandAuthority;
+use crate::timestamp::Rfc3339;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -1935,7 +1936,7 @@ fn command_request_fields(payload: &Value, fields: &[&str]) -> Value {
 }
 
 fn now_iso() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    chrono::Utc::now().millis_z()
 }
 
 fn automation_tick_payload(
@@ -2715,11 +2716,7 @@ mod tests {
             "UPDATE automation_definitions
              SET created_at = ?1, updated_at = ?1
              WHERE id = ?2",
-            rusqlite::params![
-                (now - chrono::Duration::days(1))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                definition.id
-            ],
+            rusqlite::params![(now - chrono::Duration::days(1)).millis_z(), definition.id],
         )
         .unwrap();
 
@@ -3564,8 +3561,7 @@ mod tests {
                     &conn,
                     &id,
                     automation,
-                    &(scheduled + chrono::Duration::seconds(offset))
-                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    &(scheduled + chrono::Duration::seconds(offset)).millis_z(),
                     if index % 2 == 0 { "claimed" } else { "running" },
                 );
                 if leased {

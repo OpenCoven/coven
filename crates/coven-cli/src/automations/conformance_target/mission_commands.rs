@@ -19,10 +19,11 @@
 //!   first step, so a repeated request is the same request;
 //! - `{{bytes:N}}` is N bytes of text.
 
+use crate::timestamp::Rfc3339;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -419,7 +420,7 @@ fn token_value(
             if !(-1_440..=1_440).contains(&minutes) {
                 return Err(invalid);
             }
-            (start + Duration::minutes(minutes)).to_rfc3339_opts(SecondsFormat::Millis, true)
+            (start + Duration::minutes(minutes)).millis_z()
         }
     })
 }

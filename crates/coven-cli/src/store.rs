@@ -1,3 +1,4 @@
+use crate::timestamp::Rfc3339;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -9,7 +10,7 @@ use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
-use chrono::{Duration, SecondsFormat, Utc};
+use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -4953,10 +4954,8 @@ fn storage_health_with_free_disk(
     }
     let config = privacy::load_with_settings(coven_home, crate::settings::cached())
         .context("failed to load privacy settings for storage health")?;
-    let retention_cutoff = retention_cutoff(
-        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-        config.log_retention_days.max(1),
-    )?;
+    let retention_cutoff =
+        retention_cutoff(&Utc::now().nanos_z(), config.log_retention_days.max(1))?;
     parse_rfc3339_utc(&retention_cutoff).context("failed to parse calculated retention cutoff")?;
     let store_path = coven_home.join("coven.sqlite3");
     let conn = open_existing_store_read_only(&store_path)?
@@ -5002,10 +5001,8 @@ fn storage_health_snapshot_from_connection(
 
     let config = privacy::load_with_settings(coven_home, crate::settings::cached())
         .context("failed to load privacy settings for storage health")?;
-    let retention_cutoff = retention_cutoff(
-        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-        config.log_retention_days.max(1),
-    )?;
+    let retention_cutoff =
+        retention_cutoff(&Utc::now().nanos_z(), config.log_retention_days.max(1))?;
     let retention_cutoff = parse_rfc3339_utc(&retention_cutoff)
         .context("failed to parse calculated retention cutoff")?;
     // `MIN(created_at)` is NULL on an empty ledger, so the column type has to be
@@ -5174,7 +5171,7 @@ pub fn retention_cutoff(now: &str, days: u64) -> Result<String> {
     let cutoff = parsed
         .checked_sub_signed(retention_duration(days)?)
         .context("retention cutoff timestamp exceeds the supported date range")?;
-    Ok(cutoff.to_rfc3339_opts(SecondsFormat::Nanos, true))
+    Ok(cutoff.nanos_z())
 }
 
 fn retention_expires_at(created_at: &str, days: u64) -> Result<String> {
@@ -5184,7 +5181,7 @@ fn retention_expires_at(created_at: &str, days: u64) -> Result<String> {
     let expires_at = parsed
         .checked_add_signed(retention_duration(days)?)
         .context("retention expiry timestamp exceeds the supported date range")?;
-    Ok(expires_at.to_rfc3339_opts(SecondsFormat::Nanos, true))
+    Ok(expires_at.nanos_z())
 }
 
 pub fn artifact_payload(record: &SensitiveArtifactRecord) -> EncryptedPayload {
@@ -8427,8 +8424,7 @@ END;
         let start =
             chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")?.with_timezone(&Utc);
         for day in 0..65 {
-            let created_at =
-                (start + Duration::days(day)).to_rfc3339_opts(SecondsFormat::Nanos, true);
+            let created_at = (start + Duration::days(day)).nanos_z();
             let conn = open_store(&path)?;
             insert_event(
                 &conn,

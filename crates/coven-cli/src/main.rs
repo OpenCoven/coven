@@ -1,3 +1,4 @@
+use crate::timestamp::Rfc3339;
 use std::collections::HashSet;
 use std::env::VarError;
 use std::ffi::{OsStr, OsString};
@@ -12,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
@@ -105,6 +106,7 @@ mod stream_json;
 mod stream_turn_state;
 mod theme;
 mod threads_clock;
+mod timestamp;
 mod tui;
 mod verification;
 mod ward_audit_census;
@@ -3035,7 +3037,7 @@ fn run_sessions_search(query: &str, json: bool) -> Result<()> {
     // so they become searchable. This is a one-time cost per session: once
     // `transcript_indexed_at` is set the ingest function is a no-op.
     let coven_home = coven_home_dir()?;
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let now = chrono::Utc::now().nanos_z();
     let mut ingest_warned = false;
     match store::list_uningest_external_sessions(&conn) {
         Ok(pending) => {
@@ -5958,7 +5960,7 @@ fn run_session(
     let coven_home = coven_home_dir()?;
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
-    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let now = Utc::now().nanos_z();
 
     // Expand @path / @T-<id> / @@search refs before dispatching to the harness.
     // Keep the original `prompt` for session title and human-facing output so titles
@@ -7161,7 +7163,7 @@ fn joined_prompt(prompt_args: &[String]) -> Result<String> {
 }
 
 pub(crate) fn current_timestamp() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
+    Utc::now().nanos_z()
 }
 
 fn session_title(title: Option<&str>, prompt: &str) -> String {

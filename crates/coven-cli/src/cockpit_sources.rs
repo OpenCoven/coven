@@ -1,3 +1,4 @@
+use crate::timestamp::Rfc3339;
 use std::collections::HashSet;
 use std::error::Error;
 use std::ffi::OsString;
@@ -752,8 +753,7 @@ impl MemoryRoot {
                     .unwrap_or_else(|| "—".to_string());
                 let modified_utc: chrono::DateTime<chrono::Utc> =
                     modified.unwrap_or(SystemTime::UNIX_EPOCH).into();
-                let updated_at_iso =
-                    modified_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let updated_at_iso = modified_utc.secs_z();
                 records.push(MemoryRecord {
                     id,
                     familiar_id: familiar_id.clone(),
@@ -982,7 +982,7 @@ pub fn memory_overview(coven_home: &Path) -> Result<MemoryOverviewDto> {
         .map(|record| record.updated_at_iso.as_str())
         .max()
         .map(str::to_string);
-    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let generated_at = chrono::Utc::now().secs_z();
 
     Ok(MemoryOverviewDto {
         generated_at: generated_at.clone(),

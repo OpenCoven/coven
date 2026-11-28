@@ -22,11 +22,12 @@
 //! [`authority_keys::ensure_role_keys`] before the launch transaction opens.
 //! Only a `permit` dispatches. Approvals are slice 7.
 
+use crate::timestamp::Rfc3339;
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, DurationRound, SecondsFormat, TimeDelta, Utc};
+use chrono::{DateTime, DurationRound, TimeDelta, Utc};
 use coven_threads_core::automation_authority::{canonical_digest, verify_dispatch, Domain};
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -413,7 +414,7 @@ impl<'a> TrustedAuthority<'a> {
     }
 
     fn timestamp(&self, value: DateTime<Utc>) -> String {
-        value.to_rfc3339_opts(SecondsFormat::Millis, true)
+        value.millis_z()
     }
 
     fn extension_bag(binding: Value, receipt_evidence: Value) -> Result<ExtensionBag> {
@@ -588,7 +589,7 @@ impl RequestInputs<'_> {
                 "nonce": self.owner.nonce,
                 "adoption_key": request.adoption_key,
                 "issued_at": issued_at,
-                "expires_at": self.owner.valid_until.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "expires_at": self.owner.valid_until.millis_z(),
             },
             "familiar": { "id": self.familiar_root_id, "embodiment_digest": self.embodiment_digest },
             "automation": {
@@ -678,7 +679,7 @@ impl RequestInputs<'_> {
                 "risk_classes": [self.authority.risk_class],
                 "capabilities": self.authority.capabilities,
                 "scopes": self.authority.scopes,
-                "expires_at": self.owner.valid_until.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "expires_at": self.owner.valid_until.millis_z(),
                 "max_uses": uses + 1,
                 "uses": uses,
             }));

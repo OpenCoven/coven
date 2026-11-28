@@ -3,6 +3,7 @@
 //! introducer, authenticated over the gateway, may approve it. Every authority
 //! decision runs through `IntroductionAuthority`; clients only display and sign.
 
+use crate::timestamp::Rfc3339;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, TryLockError};
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -640,7 +641,7 @@ pub fn run_introduce(_envelope_path: &Path, _assume_yes: bool) -> Result<()> {
 }
 
 fn timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+    value.millis_z()
 }
 
 #[cfg(test)]

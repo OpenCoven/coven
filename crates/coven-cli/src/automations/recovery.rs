@@ -26,7 +26,8 @@
 //! and state change share one transaction, and an exact replay returns the
 //! first answer.
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use crate::timestamp::Rfc3339;
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -510,7 +511,7 @@ fn typed_error(code: ErrorCode, message: impl Into<String>) -> ErrorEnvelope {
 }
 
 fn iso(now: DateTime<Utc>) -> String {
-    now.to_rfc3339_opts(SecondsFormat::Millis, true)
+    now.millis_z()
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 //! Bounded, owner-local lease diagnostics. These reads never renew or recover.
+use crate::timestamp::Rfc3339;
 use base64::Engine as _;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -230,7 +231,7 @@ fn project(row: RawLease, now: DateTime<Utc>) -> Result<Lease, ReadError> {
         }
     };
     let (expires, expiry) = classify_expiry(row.expires.as_deref().map(str::as_bytes), now);
-    let lease_expires_at = expires.map(|value| value.to_rfc3339_opts(SecondsFormat::AutoSi, true));
+    let lease_expires_at = expires.map(|value| value.auto_z());
     match expiry {
         Expiry::Missing => issues.push("missing_expiry".to_owned()),
         Expiry::Invalid => issues.push("invalid_expiry".to_owned()),

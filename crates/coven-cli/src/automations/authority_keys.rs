@@ -29,12 +29,13 @@
 //!
 //! Nothing here constructs Runtime Authority or signs a production artifact.
 
+use crate::timestamp::Rfc3339;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -681,7 +682,7 @@ fn persisted(value: DateTime<Utc>) -> Result<DateTime<Utc>> {
 }
 
 fn timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+    value.millis_z()
 }
 
 fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {

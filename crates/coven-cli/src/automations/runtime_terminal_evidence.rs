@@ -3,10 +3,11 @@
 //! This module deliberately exposes only internal Rust APIs. There is no
 //! daemon action or other public submission path in this slice.
 
+use crate::timestamp::Rfc3339;
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result as AnyhowResult};
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 
@@ -394,7 +395,7 @@ pub(crate) fn store_runtime_terminal_evidence_in(
             verified.evidence.integrity.value.as_str(),
             verified.classification.as_str(),
             verified.evidence.produced_at.as_str(),
-            Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            Utc::now().millis_z(),
             canonical,
         ],
     )

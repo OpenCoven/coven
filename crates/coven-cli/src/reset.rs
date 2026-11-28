@@ -4,6 +4,7 @@
 //! `COVEN_HOME`. It never reads file contents, follows symlinks, contacts a
 //! network service, or accepts arbitrary user-provided paths.
 
+use crate::timestamp::Rfc3339;
 use std::ffi::{OsStr, OsString};
 #[cfg(test)]
 use std::fs;
@@ -13,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::{ambient_authority, fs::Dir};
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -1431,9 +1432,7 @@ fn rollback_moves(home: &RootedHome, moved: &[(PathBuf, PathBuf)]) -> Vec<String
 fn backup_id() -> String {
     format!(
         "{}-{}",
-        Utc::now()
-            .to_rfc3339_opts(SecondsFormat::Secs, true)
-            .replace(':', "-"),
+        Utc::now().secs_z().replace(':', "-"),
         Uuid::new_v4().simple()
     )
 }

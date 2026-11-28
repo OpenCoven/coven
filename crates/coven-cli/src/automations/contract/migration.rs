@@ -1,7 +1,8 @@
 //! Additive adoption of the Automations v1 history sidecars.
 
+use crate::timestamp::Rfc3339;
 use anyhow::{Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
@@ -252,7 +253,7 @@ pub fn migrate_legacy_contract_metadata(conn: &Connection) -> Result<()> {
             unverifiable_definitions,
             unverifiable_occurrences,
             unverifiable_runs,
-            Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            Utc::now().millis_z(),
         ],
     )
     .context("failed to record automation contract migration")?;

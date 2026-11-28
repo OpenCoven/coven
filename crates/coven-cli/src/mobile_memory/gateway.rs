@@ -1,3 +1,4 @@
+use crate::timestamp::Rfc3339;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -1806,9 +1807,9 @@ fn parse_assurance_headers(headers: &HashMap<String, String>) -> AssuranceProofI
     };
     let parse_timestamp = |name: &str| {
         let raw = &headers[name];
-        raw.parse::<DateTime<Utc>>().ok().filter(|timestamp| {
-            timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) == *raw
-        })
+        raw.parse::<DateTime<Utc>>()
+            .ok()
+            .filter(|timestamp| timestamp.millis_z() == *raw)
     };
     let Some(issued_at) = parse_timestamp("x-coven-assurance-issued-at") else {
         return AssuranceProofInput::Invalid;

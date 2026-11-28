@@ -4,6 +4,7 @@
 // evidence without deriving unsupported result or delivery claims.
 #![allow(dead_code)]
 
+use crate::timestamp::Rfc3339;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
@@ -67,8 +68,7 @@ fn build_authority_receipt(
     produced_at: DateTime<Utc>,
     observation: ReceiptObservation,
 ) -> Result<AutomationReceipt> {
-    let produced_at =
-        Timestamp::new(produced_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))?;
+    let produced_at = Timestamp::new(produced_at.millis_z())?;
     let mut receipt = AutomationReceipt {
         schema_version: SchemaVersion::V1,
         receipt_id: ReceiptId::new(receipt_id.to_string())?,
@@ -1488,7 +1488,8 @@ pub(super) mod tests {
     use crate::automations::runs::{record_run_finish, record_run_start, RunFinish, RunStart};
     use crate::automations::store::insert_definition;
     use crate::store::initialize_store;
-    use chrono::{DateTime, SecondsFormat, Utc};
+    use crate::timestamp::Rfc3339;
+    use chrono::{DateTime, Utc};
     use rusqlite::Connection;
     use serde_json::{json, Value};
     use std::path::PathBuf;
@@ -1580,8 +1581,7 @@ pub(super) mod tests {
                  WHERE id = 'occurrence-daily-1'",
                 rusqlite::params![
                     attempt_occurrence_id,
-                    (opened_at + chrono::Duration::seconds(1))
-                        .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                    (opened_at + chrono::Duration::seconds(1)).nanos_z(),
                 ],
             )
             .unwrap();
@@ -1618,9 +1618,8 @@ pub(super) mod tests {
                 attempt_occurrence_id,
                 "automation:run-daily-1:1",
                 authority_extension_json,
-                opened_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-                (opened_at + chrono::Duration::seconds(5))
-                    .to_rfc3339_opts(SecondsFormat::Millis, true),
+                opened_at.millis_z(),
+                (opened_at + chrono::Duration::seconds(5)).millis_z(),
             ],
         )
         .unwrap();
@@ -1669,7 +1668,7 @@ pub(super) mod tests {
                 "disposition": "succeeded",
                 "recoveryDisposition": "not_required"
             },
-            "producedAt": fixture.produced_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            "producedAt": fixture.produced_at.millis_z(),
             "producer": {
                 "component": "coven-daemon",
                 "instanceId": "local-authority",
@@ -1836,9 +1835,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             receipt_value["producedAt"],
-            json!(fixture
-                .produced_at
-                .to_rfc3339_opts(SecondsFormat::Millis, true))
+            json!(fixture.produced_at.millis_z())
         );
         assert_eq!(receipt_value["integrity"]["authentication"], json!("none"));
         assert_eq!(

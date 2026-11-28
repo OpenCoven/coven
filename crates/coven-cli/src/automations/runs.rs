@@ -5,8 +5,9 @@
 //! code, terminal status, and output-commit state. The ledger is the single
 //! observability surface Cave's UI reads — never a per-harness history file.
 
+use crate::timestamp::Rfc3339;
 use anyhow::{Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::definition::OutputTarget;
@@ -148,7 +149,7 @@ pub const AUTOMATION_ATTEMPTS_SCHEMA_SQL: &str = "
 const LOG_ENTRY_MAX_CHARS: usize = 64 * 1024;
 
 fn iso(instant: DateTime<Utc>) -> String {
-    instant.to_rfc3339_opts(SecondsFormat::Millis, true)
+    instant.millis_z()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

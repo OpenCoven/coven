@@ -36,6 +36,7 @@ use crate::mobile_memory::{
         websocket, Channel, Records,
     },
 };
+use crate::timestamp::Rfc3339;
 use rustls::{pki_types::ServerName, ClientConfig, ClientConnection, RootCertStore};
 use std::sync::Condvar;
 
@@ -716,7 +717,7 @@ impl Phone {
         .canonical_bytes();
         let signature: Signature = self.step_up.sign(&bytes);
         proof.signature = encode(signature.to_der().as_bytes());
-        let text = |time: DateTime<Utc>| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let text = |time: DateTime<Utc>| time.millis_z();
         vec![
             ("x-coven-assurance-context", "request".into()),
             ("x-coven-assurance-challenge", encode(proof.challenge)),

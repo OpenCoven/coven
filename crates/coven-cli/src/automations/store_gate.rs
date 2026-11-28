@@ -28,11 +28,12 @@
 //! ([`super::scoped_read_settlement`]), which settlement reconciles with these
 //! rows (#1606).
 
+use crate::timestamp::Rfc3339;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 
@@ -424,7 +425,7 @@ impl StoreGate {
                     refusal,
                     digest,
                     bytes.map(|bytes| i64::try_from(bytes).unwrap_or(i64::MAX)),
-                    now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                    now.millis_z(),
                 ],
             )
             .map_err(|_| Refusal::AttemptClosed)?;

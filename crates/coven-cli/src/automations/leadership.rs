@@ -1,3 +1,4 @@
+use crate::timestamp::Rfc3339;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -90,10 +91,7 @@ impl SchedulerLeadership {
                      generation = generation + 1,
                      acquired_at = ?2
                  WHERE id = 1",
-                params![
-                    owner_id,
-                    now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                ],
+                params![owner_id, now.millis_z()],
             )
             .context("failed to advance automations scheduler fence")?;
         let generation = transaction

@@ -1,10 +1,11 @@
 //! Durable Automations v1 event streams.
 
+use crate::timestamp::Rfc3339;
 use std::collections::HashSet;
 use std::fmt;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -540,7 +541,7 @@ pub fn backfill_definition_event_baselines(conn: &Connection) -> Result<()> {
         .context("failed to read automation event baselines")?;
     drop(statement);
 
-    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let completed_at = Utc::now().millis_z();
     for (id, revision, digest, lifecycle_state, tombstoned_at, updated_at) in definitions {
         if stream_head(conn, "automation", &id)?.is_some() {
             continue;
@@ -697,7 +698,7 @@ pub fn read_events(
     let issued = DateTime::parse_from_rfc3339(issued_at)
         .map_err(|error| EventStoreError::Contract(anyhow::Error::new(error)))?
         .with_timezone(&Utc);
-    let prune_before = (issued - Duration::days(7)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let prune_before = (issued - Duration::days(7)).millis_z();
     conn.execute(
         "DELETE FROM automation_event_checkpoints
          WHERE checkpoint IN (
@@ -709,7 +710,7 @@ pub fn read_events(
          )",
         [&prune_before],
     )?;
-    let expires_at = (issued + Duration::hours(24)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let expires_at = (issued + Duration::hours(24)).millis_z();
     let checkpoint = format!("ecp{}", Uuid::new_v4().simple());
     conn.execute(
         "INSERT INTO automation_event_checkpoints (

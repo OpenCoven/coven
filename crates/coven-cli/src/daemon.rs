@@ -1,3 +1,4 @@
+use crate::timestamp::Rfc3339;
 use std::collections::HashMap;
 use std::io::Write;
 #[cfg(unix)]
@@ -3315,8 +3316,7 @@ pub const STALE_CREATED_TTL_SECS: i64 = 600;
 /// exit path will ever fail it; only age proves it dead.
 pub fn recover_stale_created_sessions(coven_home: &Path, updated_at: &str) -> Result<usize> {
     let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
-    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(STALE_CREATED_TTL_SECS))
-        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(STALE_CREATED_TTL_SECS)).nanos_z();
     crate::store::mark_stale_created_sessions_failed(&conn, &cutoff, updated_at)
 }
 
@@ -10382,7 +10382,7 @@ mod tests {
                     "created",
                     "running",
                     None,
-                    &chrono::Utc::now().to_rfc3339(),
+                    &chrono::Utc::now().rfc3339_offset(),
                 )?;
                 anyhow::ensure!(changed, "created row did not publish running");
                 let _ = published_tx.send(());

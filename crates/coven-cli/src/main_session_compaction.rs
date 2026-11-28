@@ -40,6 +40,7 @@
 //! Codex has no native compaction on its daemon path; its summary-and-rotation
 //! slice is separate, so only Claude main sessions are compacted here.
 
+use crate::timestamp::Rfc3339;
 use std::{
     fs,
     io::{Read, Write},
@@ -47,7 +48,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Duration, Local, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, Local, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -247,7 +248,7 @@ pub fn latest(conn: &Connection, record: &MainSessionRecord) -> Result<Option<Co
 }
 
 fn timestamp(instant: DateTime<Utc>) -> String {
-    instant.to_rfc3339_opts(SecondsFormat::Nanos, true)
+    instant.nanos_z()
 }
 
 /// Token counts are stored as SQLite integers.

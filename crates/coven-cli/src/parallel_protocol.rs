@@ -1,3 +1,4 @@
+use crate::timestamp::Rfc3339;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -5,7 +6,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, SecondsFormat};
+use chrono::DateTime;
 const CLAIM_TTL_SECONDS: u64 = 60 * 60;
 /// Passes allowed through the acquire loop. Each pass either settles the claim
 /// or loses a race to another agent, and a loser only re-runs after the winner
@@ -318,7 +319,7 @@ fn format_epoch_utc(epoch_seconds: u64) -> String {
     i64::try_from(epoch_seconds)
         .ok()
         .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
-        .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .map(|timestamp| timestamp.secs_z())
         .unwrap_or_else(|| epoch_seconds.to_string())
 }
 

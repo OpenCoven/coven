@@ -1,6 +1,7 @@
 //! Chat application state, behavior, and helpers. Owns `App` and all of its
 //! methods; provides `discover_agents` and the spinner-frame data.
 
+use crate::timestamp::Rfc3339;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -2483,8 +2484,7 @@ impl App {
                     } else {
                         crate::coven_calls::CovenCallStatus::Failed
                     };
-                    let ended_at =
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    let ended_at = chrono::Utc::now().millis_z();
                     if let Err(_err) = crate::coven_calls::emit_terminal(
                         home,
                         &call_id,
@@ -2520,8 +2520,7 @@ impl App {
                 if let (Some(call_id), Some(home)) =
                     (self.active_call_id.take(), self.coven_home.as_deref())
                 {
-                    let ended_at =
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    let ended_at = chrono::Utc::now().millis_z();
                     if let Err(_err) = crate::coven_calls::emit_terminal(
                         home,
                         &call_id,

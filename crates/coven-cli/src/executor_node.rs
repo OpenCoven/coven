@@ -17,6 +17,7 @@
 //! - Stationary and compute executors share this base protocol and only
 //!   differ in the role and capabilities they advertise.
 
+use crate::timestamp::Rfc3339;
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
@@ -26,7 +27,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -664,7 +665,7 @@ fn rejected_envelope(job_id: &str, error: String) -> ExecutorResultEnvelope {
 }
 
 fn current_timestamp() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    Utc::now().millis_z()
 }
 
 fn run_process_with_timeout(

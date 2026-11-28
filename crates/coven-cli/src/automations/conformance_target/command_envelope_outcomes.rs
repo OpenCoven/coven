@@ -4,9 +4,10 @@
 //! and reopens that store where the case restarts. Only the router commits,
 //! replays or refuses; this suite compares what it answers.
 
+use crate::timestamp::Rfc3339;
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{types::Value as SqlValue, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -171,8 +172,7 @@ fn case_matches(case: &Case) -> Result<bool, &'static str> {
         };
         let before = durable_state(&conn)?;
         let minutes = i64::try_from(index).map_err(|_| "conformance vector is invalid")?;
-        let recorded_at = (first_recorded_at + Duration::minutes(minutes))
-            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        let recorded_at = (first_recorded_at + Duration::minutes(minutes)).millis_z();
         let (_, response) = command_envelope::route(
             &json!({ "action": command_envelope::ACTION, "envelope": envelope }),
             &conn,

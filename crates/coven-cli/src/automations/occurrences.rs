@@ -7,6 +7,7 @@
 //! `UNIQUE(automation_id, scheduled_for)` fence makes planning idempotent
 //! across ticks, replicas, and restarts.
 
+use crate::timestamp::Rfc3339;
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
@@ -114,10 +115,7 @@ pub fn ensure_occurrence_kind(conn: &Connection) -> Result<()> {
                 "UPDATE automation_occurrences
                  SET kind = 'manual', scheduled_for = ?2
                  WHERE id = ?1",
-                params![
-                    id,
-                    scheduled_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
-                ],
+                params![id, scheduled_at.nanos_z()],
             )
             .with_context(|| format!("failed to migrate manual occurrence `{id}`"))?;
         }
@@ -545,7 +543,7 @@ pub fn insert_claimed_occurrence(
     }
     let expires = now + chrono::Duration::minutes(lease_minutes);
     let now_iso = iso(now);
-    let manual_scheduled_for = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let manual_scheduled_for = now.nanos_z();
     let expires_iso = iso(expires);
     conn.execute(
         "INSERT OR IGNORE INTO automation_occurrences
@@ -904,7 +902,7 @@ fn tick_inner(
 }
 
 pub(crate) fn iso(instant: DateTime<Utc>) -> String {
-    instant.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    instant.millis_z()
 }
 
 #[derive(Debug)]
@@ -2221,8 +2219,7 @@ mod tests {
         // Backdate creation one day so at least one 09:00 slot is missed at
         // any tick hour (today's 09:00 when now is past it, yesterday's
         // otherwise).
-        let old_created = (real_now() - chrono::Duration::days(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let old_created = (real_now() - chrono::Duration::days(1)).millis_z();
         conn.execute(
             "UPDATE automation_definitions
              SET created_at = ?1, updated_at = ?1
@@ -2346,8 +2343,7 @@ mod tests {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
         // Simulate a routine created four days ago.
-        let old_created = (real_now() - chrono::Duration::days(4))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let old_created = (real_now() - chrono::Duration::days(4)).millis_z();
         conn.execute(
             "UPDATE automation_definitions
              SET created_at = ?1, updated_at = ?1
@@ -2735,8 +2731,7 @@ mod tests {
     fn claims_the_earliest_due_occurrence_with_a_lease() {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
-        let old_created = (real_now() - chrono::Duration::days(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let old_created = (real_now() - chrono::Duration::days(1)).millis_z();
         conn.execute(
             "UPDATE automation_definitions
              SET created_at = ?1, updated_at = ?1
@@ -2920,8 +2915,7 @@ mod tests {
     fn recovers_expired_leases_to_failed() {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
-        let old_created = (real_now() - chrono::Duration::days(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let old_created = (real_now() - chrono::Duration::days(1)).millis_z();
         conn.execute(
             "UPDATE automation_definitions
              SET created_at = ?1, updated_at = ?1
@@ -3081,8 +3075,7 @@ mod tests {
             insert_definition(&conn, &definition(id, "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
         }
         let now = real_now();
-        let created_at =
-            (now - chrono::Duration::days(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let created_at = (now - chrono::Duration::days(1)).millis_z();
         conn.execute(
             "UPDATE automation_definitions
              SET created_at = ?1, updated_at = ?1
@@ -3757,8 +3750,7 @@ mod tests {
     fn settles_claimed_work_but_never_planned() {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
-        let old_created = (real_now() - chrono::Duration::days(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let old_created = (real_now() - chrono::Duration::days(1)).millis_z();
         conn.execute(
             "UPDATE automation_definitions
              SET created_at = ?1, updated_at = ?1

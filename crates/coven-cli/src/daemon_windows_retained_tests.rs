@@ -3,6 +3,7 @@
 //! These tests require execution on Windows and do not model physical I/O.
 #![cfg(windows)]
 use super::*;
+use crate::timestamp::Rfc3339;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::process::{Child, Command, Stdio};
 
@@ -208,7 +209,7 @@ fn windows_retained_owner_fixture() {
         return;
     };
     let _profile = crate::state_lock::acquire_shared(&home).unwrap();
-    let result = serve_forever(&home, chrono::Utc::now().to_rfc3339(), None, &[]);
+    let result = serve_forever(&home, chrono::Utc::now().rfc3339_offset(), None, &[]);
     std::fs::write(
         home.join("serve-result"),
         match result {
@@ -319,7 +320,7 @@ fn windows_legacy_owner_fixture() {
         .unwrap();
     let status = DaemonStatus {
         pid: std::process::id(),
-        started_at: chrono::Utc::now().to_rfc3339(),
+        started_at: chrono::Utc::now().rfc3339_offset(),
         socket: name,
         process_creation_time: Some(
             WindowsProcessCreationTime::new(

@@ -29,12 +29,13 @@
 //
 // Writes are atomic: tmp file in the same directory + `fs::rename`.
 
+use crate::timestamp::Rfc3339;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -212,7 +213,7 @@ fn save_file(path: &Path, file: &CovenCallsFile) -> Result<()> {
 }
 
 fn now_iso() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    Utc::now().millis_z()
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
