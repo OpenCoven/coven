@@ -1,3 +1,7 @@
+#[path = "support/serialized_spawn.rs"]
+mod serialized_spawn;
+use serialized_spawn::SerializedSpawn;
+
 use std::process::Command;
 
 #[cfg(any(unix, windows))]
@@ -35,7 +39,7 @@ fn inspection_reads_real_daemon_records_without_mutating_them() -> anyhow::Resul
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log)?);
-    let mut daemon = Daemon(command.spawn()?);
+    let mut daemon = Daemon(command.spawn_serialized()?);
     let started = Instant::now();
     let mut client = loop {
         if let Ok(endpoint) = DaemonEndpoint::discover(&home) {
@@ -123,7 +127,7 @@ fn inspection_reads_real_daemon_records_without_mutating_them() -> anyhow::Resul
             .arg("automations")
             .args(&args)
             .env("COVEN_HOME", &home)
-            .output()?;
+            .output_serialized()?;
         assert!(
             output.status.success(),
             "{args:?}: {}",
@@ -158,7 +162,7 @@ fn inspection_reads_real_daemon_records_without_mutating_them() -> anyhow::Resul
             .args(args)
             .arg("--json")
             .env("COVEN_HOME", &home)
-            .output()?;
+            .output_serialized()?;
         assert!(!missing.status.success());
         assert!(missing.stdout.is_empty());
         assert_eq!(
@@ -181,7 +185,7 @@ fn inspection_reads_real_daemon_records_without_mutating_them() -> anyhow::Resul
             "--json",
         ])
         .env("COVEN_HOME", &home)
-        .output()?;
+        .output_serialized()?;
     assert!(!refused.status.success());
     assert!(refused.stdout.is_empty());
     assert_eq!(
@@ -245,7 +249,7 @@ fn inspection_refuses_unavailable_daemon_without_creating_home() {
             .arg("automations")
             .args(&args)
             .env("COVEN_HOME", &home)
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(!output.status.success(), "{args:?}");
         assert!(output.stdout.is_empty(), "{args:?}");
@@ -263,7 +267,7 @@ fn inspection_help_exposes_reads_without_initializing_state() {
     let output = Command::new(env!("CARGO_BIN_EXE_coven"))
         .args(["automations", "--help"])
         .env("COVEN_HOME", &home)
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
@@ -338,7 +342,7 @@ fn retry_refuses_bad_arguments_before_reaching_a_daemon() {
             .args(["automations", "retry", "run-1"])
             .args(&args)
             .env("COVEN_HOME", &home)
-            .output()
+            .output_serialized()
             .unwrap();
         assert!(!output.status.success(), "{args:?}");
         assert!(output.stdout.is_empty(), "{args:?}");
@@ -351,7 +355,7 @@ fn retry_refuses_bad_arguments_before_reaching_a_daemon() {
         .args(["automations", "retry", "run 1", "--prior-attempt", "1"])
         .args(["--prior-disposition", "failed"])
         .env("COVEN_HOME", &home)
-        .output()
+        .output_serialized()
         .unwrap();
     assert_eq!(
         String::from_utf8(spaced.stderr).unwrap(),

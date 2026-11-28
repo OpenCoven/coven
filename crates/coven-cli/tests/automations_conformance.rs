@@ -1,3 +1,7 @@
+#[path = "support/serialized_spawn.rs"]
+mod serialized_spawn;
+use serialized_spawn::SerializedSpawn;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -80,7 +84,7 @@ fn run_target(coven_home: &Path, operation: &str, input: Option<&Value>) -> anyh
     if input.is_some() {
         command.stdin(Stdio::piped());
     }
-    let mut child = command.spawn()?;
+    let mut child = command.spawn_serialized()?;
     if let Some(input) = input {
         child
             .stdin
@@ -104,7 +108,7 @@ fn run_target_bytes(coven_home: &Path, operation: &str, input: &[u8]) -> anyhow:
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn_serialized()?;
     child
         .stdin
         .take()
@@ -639,7 +643,7 @@ fn run_startup_diagnostic_target(
         .stdin(Stdio::from(std::fs::File::open(input)?))
         .stdout(Stdio::from(std::fs::File::create(&stdout)?))
         .stderr(Stdio::from(std::fs::File::create(&stderr)?))
-        .spawn()?;
+        .spawn_serialized()?;
     let mut owned = OwnedChild {
         child,
         root: Some(root),

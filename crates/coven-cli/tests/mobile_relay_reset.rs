@@ -1,3 +1,7 @@
+#[path = "support/serialized_spawn.rs"]
+mod serialized_spawn;
+use serialized_spawn::SerializedSpawn;
+
 use std::{fs, path::Path, process::Command};
 
 use serde_json::json;
@@ -7,7 +11,7 @@ fn relay(home: &Path, args: &[&str]) -> std::process::Output {
         .env("COVEN_HOME", home)
         .args(["memory", "mobile", "relay"])
         .args(args)
-        .output()
+        .output_serialized()
         .unwrap()
 }
 
