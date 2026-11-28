@@ -4,8 +4,9 @@
 //! scheduler and run ledger join on `id`; the definition row is the identity
 //! anchor, so updates mutate in place while the id stays stable.
 
+use crate::timestamp::Rfc3339;
 use anyhow::{Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
@@ -185,7 +186,7 @@ pub(crate) fn ensure_mission_columns(conn: &Connection) -> Result<()> {
 }
 
 fn now_iso() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    Utc::now().millis_z()
 }
 
 pub(crate) fn monotonic_definition_timestamp(

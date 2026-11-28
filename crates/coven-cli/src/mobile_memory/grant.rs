@@ -1,8 +1,9 @@
+use crate::timestamp::Rfc3339;
 use std::fmt;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -302,8 +303,8 @@ pub struct DeviceActionIntent {
 impl DeviceActionIntent {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ActionIntentError> {
         self.validate()?;
-        let issued_at = self.issued_at.to_rfc3339_opts(SecondsFormat::Millis, true);
-        let expires_at = self.expires_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let issued_at = self.issued_at.millis_z();
+        let expires_at = self.expires_at.millis_z();
         let mut encoded = b"COVEN-ACTION/1\0".to_vec();
         for field in [
             self.scope.as_str().as_bytes(),

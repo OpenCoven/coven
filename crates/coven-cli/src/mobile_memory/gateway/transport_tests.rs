@@ -4,6 +4,7 @@ use super::super::{
     transport::{storage, Pairing},
 };
 use super::*;
+use crate::timestamp::Rfc3339;
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
     pkcs8::DecodePrivateKey,
@@ -238,7 +239,7 @@ fn exercise_relay_daemon_process(stall_tls: bool) {
     const TEST: &str = "mobile_memory::gateway::transport_tests::relay_daemon_process_stops_after_authenticated_idle_connection";
     if std::env::var_os(CHILD_ENV).is_some() {
         let home = crate::coven_home_dir().unwrap();
-        crate::daemon::serve_forever(&home, Utc::now().to_rfc3339(), None, &[]).unwrap();
+        crate::daemon::serve_forever(&home, Utc::now().rfc3339_offset(), None, &[]).unwrap();
         return;
     }
     struct OwnedDaemon(Child);

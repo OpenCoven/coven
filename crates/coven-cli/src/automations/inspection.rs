@@ -1,5 +1,6 @@
+use crate::timestamp::Rfc3339;
 use anyhow::{Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +101,7 @@ pub fn list_occurrences(
         OccurrenceView::Due => list_by_query(
             &transaction,
             "state = 'planned' AND scheduled_for <= ?1",
-            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            &now.millis_z(),
             bounded,
             automation_id,
         )?,

@@ -41,11 +41,12 @@
 //! issuer's trusted-ledger observation carries it, so a binding names the exact
 //! ledger state it was decided against.
 
+use crate::timestamp::Rfc3339;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Map, Value};
 
@@ -1286,7 +1287,7 @@ fn get(conn: &Connection, payload: &Value) -> Result<std::result::Result<Value, 
 /// The millisecond UTC form both the Familiar Contract and Coven's authority
 /// timestamps accept.
 fn timestamp(at: DateTime<Utc>) -> String {
-    at.to_rfc3339_opts(SecondsFormat::Millis, true)
+    at.millis_z()
 }
 
 fn random_hex() -> Result<String> {

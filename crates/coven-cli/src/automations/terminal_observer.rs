@@ -26,8 +26,9 @@
 //!   operation the service ran. A committed result that was never written, a
 //!   channel that never closed, or any mismatch leaves coverage partial.
 
+use crate::timestamp::Rfc3339;
 use anyhow::{Context, Result};
-use chrono::{DateTime, DurationRound, SecondsFormat, TimeDelta, Utc};
+use chrono::{DateTime, DurationRound, TimeDelta, Utc};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
@@ -301,7 +302,7 @@ pub(crate) fn observe(
             "runtimeId": binding.runtime.runtime_id,
             "descriptorDigest": binding.runtime.descriptor_digest,
         },
-        "producedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        "producedAt": now.millis_z(),
         "disposition": observation.disposition,
         "sideEffects": side_effects,
         "exercisedCapabilities": capabilities,

@@ -1,11 +1,12 @@
 //! The gate's predicate and its commitments, against a dispatched trusted
 //! attempt (proposal §4, tests 1 to 6).
 
+use crate::timestamp::Rfc3339;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chrono::{SecondsFormat, TimeDelta, Utc};
+use chrono::{TimeDelta, Utc};
 use serde_json::json;
 
 use super::*;
@@ -159,8 +160,7 @@ fn withdrawals() -> Vec<Withdraw> {
             .unwrap();
         }),
         ("run timed out", |d| {
-            let past =
-                (Utc::now() - TimeDelta::seconds(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
+            let past = (Utc::now() - TimeDelta::seconds(1)).millis_z();
             d.conn()
                 .execute(
                     "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
@@ -534,7 +534,7 @@ fn a_crash_after_commit_keeps_the_row_and_restart_sweeps_the_channel() {
     assert_eq!(channels(), 1);
 
     // The next daemon starts.
-    let restarted = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let restarted = Utc::now().millis_z();
     crate::daemon::recover_orphaned_sessions(&home, &restarted).unwrap();
     crate::daemon::recover_stale_scoped_read_channels(&home);
     assert_eq!(channels(), 0, "the stale channel is swept");
@@ -573,19 +573,15 @@ impl Timeline {
     /// A timeline whose run, `dispatched`'s, ends at a fixed `timeout_at` an
     /// hour away, and whose clock reads a millisecond before it.
     fn new(dispatched: &Dispatched) -> (Self, DateTime<Utc>) {
-        let timeout_at = DateTime::parse_from_rfc3339(
-            &(Utc::now() + TimeDelta::hours(1)).to_rfc3339_opts(SecondsFormat::Millis, true),
-        )
-        .unwrap()
-        .with_timezone(&Utc);
+        let timeout_at =
+            DateTime::parse_from_rfc3339(&(Utc::now() + TimeDelta::hours(1)).millis_z())
+                .unwrap()
+                .with_timezone(&Utc);
         dispatched
             .conn()
             .execute(
                 "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
-                rusqlite::params![
-                    dispatched.run,
-                    timeout_at.to_rfc3339_opts(SecondsFormat::Millis, true)
-                ],
+                rusqlite::params![dispatched.run, timeout_at.millis_z()],
             )
             .unwrap();
         let timeline = Self {
@@ -613,10 +609,7 @@ impl Timeline {
         let timeline = self.clone();
         gate.clock.replaced = Some(Box::new(move || {
             let now = *timeline.now.lock().unwrap();
-            timeline.note(format!(
-                "gate read the time: {}",
-                now.to_rfc3339_opts(SecondsFormat::Millis, true)
-            ));
+            timeline.note(format!("gate read the time: {}", now.millis_z()));
             now
         }));
         gate.locking = Some(Box::new(locking));
@@ -680,7 +673,7 @@ fn a_deadline_that_passes_during_the_write_lock_wait_withholds_the_result() {
     timeline.set(timeout_at);
     timeline.note(format!(
         "the run's timeout_at passed: {}",
-        timeout_at.to_rfc3339_opts(SecondsFormat::Millis, true)
+        timeout_at.millis_z()
     ));
     holder.execute_batch("COMMIT").unwrap();
     let verdict = committing.join().unwrap();
@@ -692,7 +685,7 @@ fn a_deadline_that_passes_during_the_write_lock_wait_withholds_the_result() {
         "served after the deadline: {trace:#?}"
     );
     assert_eq!(dispatched.rows(), [withheld(1)], "{trace:#?}");
-    let expired = timeout_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let expired = timeout_at.millis_z();
     assert_eq!(committed_at(&dispatched), std::slice::from_ref(&expired));
     assert_eq!(
         trace,
@@ -773,8 +766,8 @@ fn a_commitment_before_the_deadline_stands_and_one_at_it_is_withheld() {
     assert_eq!(
         committed_at(&dispatched),
         [
-            (timeout_at - TimeDelta::milliseconds(1)).to_rfc3339_opts(SecondsFormat::Millis, true),
-            timeout_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            (timeout_at - TimeDelta::milliseconds(1)).millis_z(),
+            timeout_at.millis_z(),
         ]
     );
 }

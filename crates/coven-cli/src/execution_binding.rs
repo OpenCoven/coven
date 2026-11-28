@@ -4,9 +4,10 @@
 //! validates syntax, expiry, and exact-match comparison, but never
 //! interprets field meaning. See `specs/psyche/O2_CONTRACT_DESIGN.md`.
 
+use crate::timestamp::Rfc3339;
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -153,7 +154,7 @@ fn parse_expiry(value: &str) -> Option<DateTime<Utc>> {
     let parsed = DateTime::parse_from_rfc3339(value)
         .ok()?
         .with_timezone(&Utc);
-    (parsed.to_rfc3339_opts(SecondsFormat::Secs, true) == value).then_some(parsed)
+    (parsed.secs_z() == value).then_some(parsed)
 }
 
 impl ExecutionBinding {

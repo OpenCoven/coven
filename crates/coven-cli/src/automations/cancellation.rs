@@ -1,4 +1,5 @@
-use chrono::{DateTime, SecondsFormat, Utc};
+use crate::timestamp::Rfc3339;
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -2240,7 +2241,7 @@ fn valid_adoption_key(body: &Value) -> Option<String> {
 }
 
 fn iso(now: DateTime<Utc>) -> String {
-    now.to_rfc3339_opts(SecondsFormat::Millis, true)
+    now.millis_z()
 }
 
 #[cfg(test)]

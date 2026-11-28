@@ -1,3 +1,4 @@
+use crate::timestamp::Rfc3339;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -564,7 +565,7 @@ fn print_device(device: &DeviceView) {
         "Expires: {}",
         device
             .expires_at
-            .map(|expires_at| expires_at.to_rfc3339())
+            .map(|expires_at| expires_at.rfc3339_offset())
             .unwrap_or_else(|| "unbounded legacy grant".to_owned())
     );
     println!("Revocation epoch: {}", device.revocation_epoch);

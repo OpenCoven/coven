@@ -6,6 +6,7 @@ mod proposal_revision;
 #[cfg(test)]
 use crate::proposal_store::read_scheduler_cursor;
 use crate::proposal_store::{scheduler_candidate_batch, write_scheduler_cursor};
+use crate::timestamp::Rfc3339;
 use proposal_apply_intent::{
     append_proposal_apply_intent, invalid_proposal_apply_intent, load_proposal_apply_intent,
     ProposalApplyingState, ProposalBeforeImage,
@@ -29,7 +30,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use chrono::{Duration, SecondsFormat, Utc};
+use chrono::{Duration, Utc};
 use flate2::{write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1687,11 +1688,9 @@ fn generate_travel_profile(coven_home: &Path, body: Option<&str>) -> Result<ApiR
     )?;
 
     let now = Utc::now();
-    let generated_at = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
-    let expires_at =
-        (now + Duration::seconds(expires_in_seconds)).to_rfc3339_opts(SecondsFormat::Nanos, true);
-    let stale_after =
-        (now + Duration::seconds(stale_after_seconds)).to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let generated_at = now.nanos_z();
+    let expires_at = (now + Duration::seconds(expires_in_seconds)).nanos_z();
+    let stale_after = (now + Duration::seconds(stale_after_seconds)).nanos_z();
     let profile_id = format!("travel_{}", Uuid::new_v4());
     let source_revision = json!({
         "memoryRevision": format!("mem_{}", Uuid::new_v4()),
@@ -15335,7 +15334,7 @@ fn session_action_id<'a>(path: &'a str, suffix: &str) -> &'a str {
 }
 
 pub(crate) fn current_timestamp() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
+    Utc::now().nanos_z()
 }
 
 #[cfg(feature = "threads-test-clock")]
@@ -15552,8 +15551,7 @@ fn reap_stale_created_sessions_throttled(conn: &rusqlite::Connection) {
         // Another connection claimed this tick.
         return;
     }
-    let cutoff = (Utc::now() - Duration::seconds(crate::daemon::STALE_CREATED_TTL_SECS))
-        .to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let cutoff = (Utc::now() - Duration::seconds(crate::daemon::STALE_CREATED_TTL_SECS)).nanos_z();
     let _ = store::mark_stale_created_sessions_failed(conn, &cutoff, &current_timestamp());
 }
 
@@ -16180,7 +16178,7 @@ pub(crate) mod tests {
             "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
             rusqlite::params![
                 run_id,
-                (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
+                (Utc::now() - chrono::Duration::seconds(1)).rfc3339_offset()
             ],
         )?;
         drop(conn);
@@ -16265,7 +16263,7 @@ pub(crate) mod tests {
         assert!(crashed.is_err(), "the fixture must simulate a crash");
 
         let conn = store::open_store(&store_path(temp_dir.path()))?;
-        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).rfc3339_offset();
         conn.execute(
             "UPDATE automation_cancellations
                      SET execution_expires_at = ?2
@@ -16586,7 +16584,7 @@ pub(crate) mod tests {
             Utc::now(),
         )
         .map_err(anyhow::Error::msg)?;
-        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).rfc3339_offset();
         conn.execute(
             "UPDATE automation_cancellations
              SET execution_expires_at = ?2
@@ -16661,7 +16659,7 @@ pub(crate) mod tests {
             Some(0),
             &current_timestamp(),
         )?);
-        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).rfc3339_offset();
         conn.execute(
             "UPDATE automation_cancellations
              SET execution_expires_at = ?2
@@ -16767,7 +16765,7 @@ pub(crate) mod tests {
                 "pending cancellation must adopt its recovery outcome before aggregate settlement"
             );
         }
-        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).rfc3339_offset();
         conn.execute(
             "UPDATE automation_cancellations
              SET execution_expires_at = ?2
@@ -16925,7 +16923,7 @@ pub(crate) mod tests {
         };
         let settled = if retry_window { "running" } else { "failed" };
         assert_eq!(read_run()?, (settled.into(), "failed".into()));
-        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).rfc3339_offset();
         conn.execute(
             "UPDATE automation_cancellations
              SET execution_expires_at = ?2
@@ -17045,7 +17043,7 @@ pub(crate) mod tests {
         conn: &rusqlite::Connection,
         adoption_key: &str,
     ) -> anyhow::Result<usize> {
-        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).rfc3339_offset();
         conn.execute(
             "UPDATE automation_cancellations
              SET execution_expires_at = ?2
@@ -17559,7 +17557,7 @@ pub(crate) mod tests {
              WHERE adoption_key = ?1 AND state = 'stopping'",
             rusqlite::params![
                 "adopt:cancel:cancellation-target:crash-window",
-                (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()
+                (Utc::now() - chrono::Duration::minutes(1)).rfc3339_offset()
             ],
         )?;
 
@@ -17628,7 +17626,7 @@ pub(crate) mod tests {
 
         let conn = store::open_store(&store_path(temp_dir.path()))?;
         let reconciled_at = Utc::now();
-        let expired = (reconciled_at - chrono::Duration::seconds(1)).to_rfc3339();
+        let expired = (reconciled_at - chrono::Duration::seconds(1)).rfc3339_offset();
         conn.execute(
             "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
             rusqlite::params![run_id, expired],
@@ -17727,7 +17725,7 @@ pub(crate) mod tests {
         .is_err());
 
         let conn = store::open_store(&store_path(temp_dir.path()))?;
-        let expired = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let expired = (Utc::now() - chrono::Duration::seconds(1)).rfc3339_offset();
         conn.execute(
             "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
             rusqlite::params![run_id, expired],
@@ -17827,7 +17825,7 @@ pub(crate) mod tests {
 
         let conn = store::open_store(&store_path(temp_dir.path()))?;
         let reconciled_at = Utc::now();
-        let expired = (reconciled_at - chrono::Duration::seconds(1)).to_rfc3339();
+        let expired = (reconciled_at - chrono::Duration::seconds(1)).rfc3339_offset();
         conn.execute(
             "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
             rusqlite::params![run_id, expired],
@@ -17924,7 +17922,7 @@ pub(crate) mod tests {
         paused_rx.recv()?;
 
         let conn = store::open_store(&store_path(temp_dir.path()))?;
-        let expired = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let expired = (Utc::now() - chrono::Duration::seconds(1)).rfc3339_offset();
         conn.execute(
             "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
             rusqlite::params![run_id, expired],

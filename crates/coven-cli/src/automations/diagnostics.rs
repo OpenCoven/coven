@@ -1,3 +1,4 @@
+use crate::timestamp::Rfc3339;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -292,7 +293,7 @@ pub fn scheduler_status(conn: &Connection, now: DateTime<Utc>) -> Result<Schedul
 }
 
 fn iso(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    value.millis_z()
 }
 
 fn sqlite_count(value: Option<usize>, label: &str) -> Result<Option<i64>> {

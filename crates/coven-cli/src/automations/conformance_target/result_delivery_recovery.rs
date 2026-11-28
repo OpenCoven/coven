@@ -1,8 +1,9 @@
 //! Actual result-delivery deferral, rollback and failure isolation through the
 //! production discharge path. No runtime launch, inbox turn or release claim.
+use crate::timestamp::Rfc3339;
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::{ffi::SQLITE_CONSTRAINT_TRIGGER, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -164,7 +165,7 @@ pub(super) fn at(base: DateTime<Utc>, seconds: i64) -> DateTime<Utc> {
 }
 
 pub(super) fn iso(instant: DateTime<Utc>) -> String {
-    instant.to_rfc3339_opts(SecondsFormat::Millis, true)
+    instant.millis_z()
 }
 
 /// Starts and settles one run through the production run record, which writes

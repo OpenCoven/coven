@@ -16,6 +16,7 @@
 //! worker is this executable's `worker_fixture` entry, not `coven
 //! mobile-gateway-worker`.
 use super::*;
+use crate::timestamp::Rfc3339;
 use std::process::{Child, Command, Stdio};
 
 const CHILD_ENV: &str = "COVEN_TEST_V2_JOURNEY_DAEMON_CHILD";
@@ -176,7 +177,7 @@ fn assert_closed(phone: &Phone, host: &Host, live: Vec<Live>, direct_error: Opti
 fn integrated_v2_journey_survives_daemon_process_restarts() {
     if std::env::var_os(CHILD_ENV).is_some() {
         let home = crate::coven_home_dir().unwrap();
-        crate::daemon::serve_forever(&home, Utc::now().to_rfc3339(), None, &[]).unwrap();
+        crate::daemon::serve_forever(&home, Utc::now().rfc3339_offset(), None, &[]).unwrap();
         return;
     }
     let _guard = super::super::super::tests::TEST_GATEWAY_LOCK

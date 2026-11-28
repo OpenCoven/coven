@@ -3,6 +3,7 @@
 //! startup_mobile_stop_tests. Requires only the scoped test start hook below.
 #![cfg(unix)]
 use super::*;
+use crate::timestamp::Rfc3339;
 use std::process::{Child, Command, Stdio};
 
 const FIXTURE: &str = "daemon::startup_mobile_stop_tests::startup_sigterm_daemon_fixture";
@@ -14,7 +15,7 @@ fn startup_sigterm_daemon_fixture() {
         return;
     };
     let _profile = crate::state_lock::acquire_shared(&home).unwrap();
-    let result = serve_forever(&home, chrono::Utc::now().to_rfc3339(), None, &[]);
+    let result = serve_forever(&home, chrono::Utc::now().rfc3339_offset(), None, &[]);
     std::fs::write(
         home.join("startup-return"),
         match result {

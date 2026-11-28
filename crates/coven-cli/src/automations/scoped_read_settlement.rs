@@ -26,8 +26,9 @@
 //! Like a commitment, a close holds no file content, no path, no search
 //! pattern and no entry name.
 
+use crate::timestamp::Rfc3339;
 use anyhow::{Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
@@ -107,7 +108,7 @@ pub(crate) fn record(
             channel_id,
             i64::try_from(closed.len()).context("the operation count fits")?,
             text,
-            now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            now.millis_z(),
         ],
     )
     .context("failed to record the scoped read close")?;

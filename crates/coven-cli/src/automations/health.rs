@@ -5,6 +5,7 @@
 //! consecutive failures, and any live lease or stale/degraded reason. The
 //! values come only from the Coven store — no harness history files.
 
+use crate::timestamp::Rfc3339;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -64,7 +65,7 @@ pub fn routine_health(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result
     } else {
         next_due(&definition.rrule, definition.timezone, now)
             .map_err(|error| anyhow::anyhow!("{error}"))?
-            .map(|slot| slot.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            .map(|slot| slot.millis_z())
     };
 
     let last_planned_at = max_iso(

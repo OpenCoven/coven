@@ -16,6 +16,7 @@
 //
 // Exit codes (surfaced by main.rs): 0 ok · 3 refused · 1 error.
 
+use crate::timestamp::Rfc3339;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -385,7 +386,7 @@ impl Layout {
 // ── Small helpers ────────────────────────────────────────────────────────────
 
 fn now() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    Utc::now().millis_z()
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {

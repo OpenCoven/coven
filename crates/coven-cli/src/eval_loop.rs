@@ -22,12 +22,13 @@
 //
 // Author: Sage 🌿 · 2026-06-05
 
+use crate::timestamp::Rfc3339;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -282,7 +283,7 @@ pub fn enqueue_run(coven_home: &Path, familiar_id: &str, track: &str) -> Result<
         run_id: Uuid::new_v4().to_string(),
         familiar_id: familiar_id.to_string(),
         track: track.to_string(),
-        requested_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        requested_at: Utc::now().millis_z(),
     };
 
     // Write spec first, then lock — the familiar watches for lock disappearance
@@ -393,7 +394,7 @@ pub(crate) fn eval_loop_lock(workspace: &Path) -> EvalLoopLockDto {
         .ok()
         .map(|modified| {
             let dt: DateTime<Utc> = modified.into();
-            dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+            dt.millis_z()
         });
     let stale = locked
         && (!run_json_exists
@@ -692,8 +693,7 @@ mod tests {
         let eval_dir = workspace.join(EVAL_LOOP_DIR);
         fs::create_dir_all(&eval_dir).unwrap();
         fs::write(workspace.join(RESULTS_TSV), "").unwrap();
-        let requested_at =
-            (Utc::now() - chrono::Duration::hours(2)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        let requested_at = (Utc::now() - chrono::Duration::hours(2)).millis_z();
         fs::write(
             eval_dir.join(RUN_SPEC_FILE),
             format!(r#"{{"runId":"old-run","requestedAt":"{requested_at}"}}"#),
@@ -757,8 +757,7 @@ mod tests {
         let eval_dir = workspace.join(EVAL_LOOP_DIR);
         fs::create_dir_all(&eval_dir).unwrap();
         let lock_path = eval_dir.join(RUN_LOCK_FILE);
-        let requested_at =
-            (Utc::now() - chrono::Duration::hours(2)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        let requested_at = (Utc::now() - chrono::Duration::hours(2)).millis_z();
         fs::write(
             eval_dir.join(RUN_SPEC_FILE),
             format!(r#"{{"runId":"old-run","requestedAt":"{requested_at}"}}"#),

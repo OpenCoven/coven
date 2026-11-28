@@ -1,3 +1,4 @@
+use crate::timestamp::Rfc3339;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5,7 +6,7 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -4399,10 +4400,7 @@ fn scheduler_leadership_contender_acquired(
         "--home",
     ])
     .arg(scheduler_home)
-    .args([
-        "--at",
-        &second_attempt_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-    ])
+    .args(["--at", &second_attempt_at.millis_z()])
     .output()
     .map_err(|_| "conformance suite execution failed")?;
     if !output.status.success() {
@@ -4716,7 +4714,7 @@ fn canonical_timestamp(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|timestamp| timestamp.with_timezone(&Utc))
-        .filter(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Millis, true) == value)
+        .filter(|timestamp| timestamp.millis_z() == value)
 }
 
 fn evaluate_occurrence_fence_uniqueness(vector: &Value) -> Result<bool, &'static str> {
@@ -4760,12 +4758,8 @@ fn evaluate_occurrence_fence_uniqueness(vector: &Value) -> Result<bool, &'static
 fn valid_occurrence_fence_input(input: &OccurrenceFenceInput) -> bool {
     OccurrenceId::new(input.occurrence_id.clone()).is_ok()
         && AutomationId::new(input.automation_id.clone()).is_ok()
-        && DateTime::parse_from_rfc3339(&input.scheduled_for).is_ok_and(|timestamp| {
-            timestamp
-                .with_timezone(&Utc)
-                .to_rfc3339_opts(SecondsFormat::Millis, true)
-                == input.scheduled_for
-        })
+        && DateTime::parse_from_rfc3339(&input.scheduled_for)
+            .is_ok_and(|timestamp| timestamp.with_timezone(&Utc).millis_z() == input.scheduled_for)
 }
 
 fn occurrence_fence_scenario_matches(case: &OccurrenceFenceVectorCase) -> bool {

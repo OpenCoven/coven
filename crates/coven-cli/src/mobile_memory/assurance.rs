@@ -1,3 +1,4 @@
+use crate::timestamp::Rfc3339;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -242,12 +243,8 @@ impl CanonicalAssuranceProof {
     }
 
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let issued_at = self
-            .issued_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let expires_at = self
-            .expires_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let issued_at = self.issued_at.millis_z();
+        let expires_at = self.expires_at.millis_z();
         let revocation_epoch = self.revocation_epoch.to_be_bytes();
         let mut encoded = ASSURANCE_DOMAIN.to_vec();
         for field in [

@@ -4,6 +4,7 @@
 //! panic hook; the retained-native-worker extension is described separately.
 #![cfg(unix)]
 use super::*;
+use crate::timestamp::Rfc3339;
 use std::process::{Child, Command, Stdio};
 
 const ENTRY: &str = "daemon::panic_retained_tests::panic_hook_process_fixture";
@@ -123,7 +124,7 @@ fn retained_mobile_daemon_process_fixture() {
     // Normal CLI main owns this lease outside serve_forever. Keep the same
     // real lease while the fixture invokes the actual daemon implementation.
     let _profile = crate::state_lock::acquire_shared(&home).unwrap();
-    let result = serve_forever(&home, chrono::Utc::now().to_rfc3339(), None, &[]);
+    let result = serve_forever(&home, chrono::Utc::now().rfc3339_offset(), None, &[]);
     std::fs::write(
         home.join("serve-result"),
         match result {

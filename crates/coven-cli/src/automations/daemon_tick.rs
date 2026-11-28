@@ -3,6 +3,8 @@
 //! The daemon reconciles terminal session evidence before planning, recovering,
 //! claiming, and dispatching occurrences on a 60-second cadence.
 
+#[cfg(test)]
+use crate::timestamp::Rfc3339;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
@@ -922,8 +924,7 @@ mod tests {
         let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
         insert_definition(&conn, &definition("daily")).unwrap();
         // Backdate creation so the 09:00 slot is due at any tick hour.
-        let old_created = (chrono::Utc::now() - chrono::Duration::days(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let old_created = (chrono::Utc::now() - chrono::Duration::days(1)).millis_z();
         conn.execute(
             "UPDATE automation_definitions
              SET created_at = ?1, updated_at = ?1
@@ -1303,8 +1304,7 @@ mod tests {
         let routine = definition("startup-order");
         insert_definition(&conn, &routine).unwrap();
         let previous_started = Utc::now();
-        let created_at = (previous_started - chrono::Duration::days(2))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let created_at = (previous_started - chrono::Duration::days(2)).millis_z();
         set_created_at(&conn, "startup-order", &created_at);
         let previous = super::super::runner::run_routine_now(
             &conn,
@@ -1319,7 +1319,7 @@ mod tests {
             previous.session_id.as_deref().unwrap(),
             "completed",
             Some(0),
-            &previous_finished.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &previous_finished.millis_z(),
         )
         .unwrap();
         drop(conn);
@@ -1820,7 +1820,7 @@ mod tests {
             assert_eq!(row.identity.4, previous_authority.1);
             assert!(row.identity.6 >= 1);
         }
-        let restarted_iso = restarted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let restarted_iso = restarted_at.millis_z();
         assert_eq!(
             crate::store::mark_running_sessions_orphaned(&conn, &restarted_iso).unwrap(),
             3

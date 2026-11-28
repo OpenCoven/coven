@@ -1,3 +1,4 @@
+use crate::timestamp::Rfc3339;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -869,7 +870,7 @@ pub fn render_pairing_invitation(
         .build();
     Ok(format!(
         "{qr}\n{pairing_url}\nExpires: {}\nWaiting for device…\nPress Ctrl-C to cancel pairing.",
-        expires_at.to_rfc3339()
+        expires_at.rfc3339_offset()
     ))
 }
 

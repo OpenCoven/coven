@@ -10,8 +10,9 @@
 //! bounded ids and failure-class tokens leave; prompts, quarantine reasons,
 //! validation text, lease owners and authority profiles do not.
 
+use crate::timestamp::Rfc3339;
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
@@ -895,7 +896,7 @@ pub(crate) fn explain(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result
             .map_err(|_| anyhow!("the routine schedule could not be evaluated"))?
             .ok_or_else(|| anyhow!("the routine schedule has no next slot"))?;
         conditions.push(Condition {
-            at: Some(slot.to_rfc3339_opts(SecondsFormat::Millis, true)),
+            at: Some(slot.millis_z()),
             ..condition(Code::NextSlot, NextStep::None)
         });
     }
@@ -913,7 +914,7 @@ pub(crate) fn explain(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result
         automation_id: record.id,
         revision: record.revision,
         lifecycle_state: record.lifecycle_state,
-        observed_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        observed_at: now.millis_z(),
         conditions,
         work,
         work_truncated,
@@ -1065,9 +1066,7 @@ fn work(
             Some(rowid) => reads_cancellation(conn, rowid)?,
             None => false,
         };
-        let deadline_at = deadline
-            .flatten()
-            .map(|(deadline, _)| deadline.to_rfc3339_opts(SecondsFormat::Millis, true));
+        let deadline_at = deadline.flatten().map(|(deadline, _)| deadline.millis_z());
         // A stop fence the pass defers to. Each stop and settlement parse
         // its expiry whole, and skip the run when they cannot. A fence of a
         // stopping cancellation does not fence the run: that cancellation's
@@ -1328,11 +1327,9 @@ fn condition(code: Code, next_step: NextStep) -> Condition {
 
 /// A stored timestamp leaves only in canonical form; anything else is omitted.
 fn canonical(stored: &str) -> Option<String> {
-    DateTime::parse_from_rfc3339(stored).ok().map(|instant| {
-        instant
-            .with_timezone(&Utc)
-            .to_rfc3339_opts(SecondsFormat::Millis, true)
-    })
+    DateTime::parse_from_rfc3339(stored)
+        .ok()
+        .map(|instant| instant.with_timezone(&Utc).millis_z())
 }
 
 /// Failure classes are snake_case tokens; the free-form reason beside them is

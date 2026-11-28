@@ -333,6 +333,7 @@ pub(crate) mod test_support {
     //! 2.1.305, and a project folder outside `COVEN_HOME` holding a granted
     //! note and a sibling the grant does not name.
 
+    use crate::timestamp::Rfc3339;
     use std::fs;
     use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
@@ -452,8 +453,7 @@ pub(crate) mod test_support {
             // The routine was created a moment ago, so no slot of its daily
             // schedule is due yet: date its revision two days back, as if it
             // had been active since, so the latest slot is.
-            let since =
-                (now - TimeDelta::days(2)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let since = (now - TimeDelta::days(2)).millis_z();
             conn.execute(
                 "UPDATE automation_definitions SET created_at = ?2, updated_at = ?2 WHERE id = ?1",
                 rusqlite::params![id, since],
@@ -716,6 +716,8 @@ pub(crate) mod test_support {
 mod tests {
     use std::os::unix::fs::symlink;
 
+    use crate::timestamp::Rfc3339;
+
     use chrono::Utc;
     use serde_json::{json, Value};
 
@@ -971,7 +973,7 @@ mod tests {
             &session,
             "completed",
             Some(0),
-            &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            &Utc::now().millis_z(),
         )
         .unwrap());
         assert_eq!(
@@ -1007,7 +1009,7 @@ mod tests {
             let session = session_of(&fixture, &run);
             let conn = &fixture.home.conn;
             crate::automations::cancellation::ensure_cancellation_schema(conn).unwrap();
-            let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let now = Utc::now().millis_z();
             conn.execute(
                 "INSERT INTO automation_cancellations
                     (adoption_key, request_digest, automation_id, run_id, attempt_id, session_id,

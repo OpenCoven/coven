@@ -1,6 +1,7 @@
 //! Reconciling a scoped read attempt's commitments with its channel's close
 //! (#1606).
 
+use crate::timestamp::Rfc3339;
 use std::io::{self, Cursor, Write};
 use std::time::Duration;
 
@@ -554,7 +555,7 @@ fn a_crash_after_commit_leaves_the_attempt_unreconciled_and_restart_invents_noth
 
     // The next daemon starts and recovers the session: it opens no channel,
     // adopts none and writes no close, so the attempt stays unreconciled.
-    let restarted = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let restarted = Utc::now().millis_z();
     crate::daemon::recover_orphaned_sessions(fixture.home.path(), &restarted).unwrap();
     crate::daemon::recover_stale_scoped_read_channels(fixture.home.path());
     assert_eq!(

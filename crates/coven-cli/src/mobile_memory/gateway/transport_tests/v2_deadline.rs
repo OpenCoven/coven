@@ -31,6 +31,7 @@ use crate::mobile_memory::transport::{
     test_support::Relay,
     websocket, Records,
 };
+use crate::timestamp::Rfc3339;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -78,7 +79,7 @@ fn daemon_child_entry() {
         return;
     }
     let home = crate::coven_home_dir().unwrap();
-    crate::daemon::serve_forever(&home, Utc::now().to_rfc3339(), None, &[]).unwrap();
+    crate::daemon::serve_forever(&home, Utc::now().rfc3339_offset(), None, &[]).unwrap();
 }
 
 /// One line per observation on the real stderr, so hosted logs show what each

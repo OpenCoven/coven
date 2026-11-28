@@ -23,10 +23,11 @@
 //! [`AUTHORITY_UNAVAILABLE_REASON`], which the mission view reports as
 //! `unavailable`.
 
+use crate::timestamp::Rfc3339;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 
@@ -966,7 +967,7 @@ fn typed_error(code: ErrorCode, message: impl Into<String>) -> ErrorEnvelope {
 }
 
 fn iso(at: DateTime<Utc>) -> String {
-    at.to_rfc3339_opts(SecondsFormat::Millis, true)
+    at.millis_z()
 }
 
 #[cfg(test)]

@@ -20,10 +20,11 @@
 //! principals' scopes are not certified until runs bind principal authority
 //! (coven#857).
 
+use crate::timestamp::Rfc3339;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 
@@ -72,7 +73,7 @@ pub struct DeliveryReport {
 }
 
 fn iso(instant: DateTime<Utc>) -> String {
-    instant.to_rfc3339_opts(SecondsFormat::Millis, true)
+    instant.millis_z()
 }
 
 /// The inbox scope a certified target delivers to.

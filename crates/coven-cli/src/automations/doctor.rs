@@ -1,4 +1,5 @@
 //! Minimized persisted observations. Missing evidence is never a healthy result.
+use crate::timestamp::Rfc3339;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{ensure, Result};
@@ -1860,7 +1861,7 @@ pub(super) fn inspect(conn: &Connection, now: DateTime<Utc>) -> Result<Report> {
     let due_planned = if due_available && !invalid_occurrence_state {
         let value: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM main.automation_occurrences WHERE state = 'planned' AND scheduled_for <= ?1",
-            [now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)], |row| row.get(0),
+            [now.millis_z()], |row| row.get(0),
         )?;
         let value = u64::try_from(value)?;
         ensure!(value <= MAX_SAFE, "doctor count exceeds supported range");
@@ -2807,7 +2808,7 @@ pub(super) fn inspect(conn: &Connection, now: DateTime<Utc>) -> Result<Report> {
     transaction.commit()?;
     let report = Report {
         schema_version: SCHEMA.to_owned(),
-        observed_at: now.to_rfc3339(),
+        observed_at: now.rfc3339_offset(),
         observations,
     };
     report.validate()?;
