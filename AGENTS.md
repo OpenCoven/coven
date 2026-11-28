@@ -89,91 +89,64 @@ Do not initialize a separate local tracking database or sync branch.
 
 ## CI gates — run locally before opening the PR
 
-CI (`.github/workflows/ci.yml`) rejects on any of these. Run them first:
+CI (`.github/workflows/ci.yml`) rejects a PR through the required `PR gate`.
+Reproduce it with the repository's verification runner, not a hand-copied
+command list:
 
 ```sh
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
-python scripts/check-secrets.py        # secret scan — must be clean
-python3 scripts/check-coven-privacy.py --staged   # privacy guard on your staged changes
+git fetch origin main                      # the runner never fetches for you
+bash scripts/dev-verify.sh --pr            # pre-PR gate over origin/main...HEAD
+bash scripts/dev-verify.sh --pr --plan     # print what it would run; runs nothing
+bash scripts/dev-verify.sh --quick         # fast inner loop while you work
 ```
 
-If you touched the **npm/TypeScript** packages, also:
-
-```sh
-npm run build
-npm test
-```
+`--pr` runs the toolchain pin checks, `cargo fmt --check`, `cargo check`,
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace --locked`, the secret scan, the privacy and
+documentation-ownership guards, every command of the CI `Policy guard` job,
+`cargo deny`, and the npm/TypeScript package checks that
+`scripts/classify-ci-changes.py` routes for your changed paths. Pass a different
+base with `--range <base>...HEAD`. The full contract, including the CI-only
+suites that no local tier proves, is in
+[`docs/development/dev-verification.md`](docs/development/dev-verification.md).
 
 `-D warnings` has **no exceptions**. Fix lints; don't `#[allow(...)]` without a
 justifying comment.
 
-### The `Policy guard` job
+### What the runner does and does not prove
 
-The five commands above are **not** the whole gate. `cargo test` does not run
-any of the repo's guard scripts, so a branch can be green locally and still fail
-the required `PR gate` on `Policy guard` — a ~40-step job whose failures show up
-only after you push. Two of its steps have bitten recent PRs: the documentation
-ownership guard (#1089) and the CI workflow guard (#1118).
-
-Reproduce the whole job before pushing. The subshell keeps a failing guard from
-closing your terminal, and still reports a non-zero status, so a printed
-`FAILED:` line cannot be lost in the scroll. Run it with `bash`: zsh does not
-word-split the unquoted two-file `node --test` lines, so they fail spuriously.
-The Cloud suites need Python 3.11+ on `PATH` as `python3`.
-
-```sh
-(
-  fail=0
-  for s in check-coven-privacy-test.py check-secrets-test.py \
-           check-api-contract-docs-test.py check-api-contract-docs.py \
-           check-docs-ownership-test.py check-security-policy-test.py \
-           check-security-policy.py check-theme-tokens-test.py \
-           check-theme-tokens.py check-secrets.py \
-           classify-ci-changes-test.py check-reliability-scorecard-test.py \
-           check-reliability-scorecard.py check-workflows-test.py \
-           check-ci-workflow-test.py install-native-link-dependencies-test.py \
-           bootstrap-contract/runner-test.py cloud/config-test.py \
-           cloud/runtime-test.py cloud/provision-test.py cloud/bootstrap-test.py \
-           cloud/readiness-test.py delivery/checkpoint-test.py \
-           delivery/preflight-test.py; do
-    python3 "scripts/$s" || { echo "FAILED: $s"; fail=1; }
-  done
-  bash -n scripts/cloud/bootstrap.sh scripts/cloud/readiness.sh || fail=1
-  python3 scripts/dev-verify-test.py || fail=1
-  python3 scripts/task-worktree-test.py || fail=1
-  python3 scripts/branch-triage-test.py || fail=1
-  python3 scripts/propose-engine-bump-test.py || fail=1
-  npm ci --prefix scripts/browser --ignore-scripts --no-audit --no-fund || fail=1
-  node --test scripts/browser-capability.test.mjs || fail=1
-
-  node --test scripts/package-github-release-test.mjs || fail=1
-  node --test scripts/release-governance.test.mjs || fail=1
-  node --test scripts/authorize-release-publication.test.mjs || fail=1
-  node --test scripts/package-automations-protocol.test.mjs scripts/script-entrypoint.test.mjs || fail=1
-  node --test scripts/package-automations-authority-profile.test.mjs || fail=1
-  node --test scripts/check-action-pins.test.mjs || fail=1
-  node --test scripts/release-receipt.test.mjs scripts/release-dependency-inventory.test.mjs || fail=1
-  node --test conformance/automations/runner/conformance.test.mjs conformance/automations/runner/audit.test.mjs || fail=1
-  node --test scripts/release-stress-test.mjs || fail=1
-  node --test scripts/verify-release-tag.test.mjs || fail=1
-  node --test scripts/benchmark-cli.test.mjs scripts/benchmark-chaos.test.mjs || fail=1
-  bash scripts/check-workflows.sh || fail=1
-
-  exit "$fail"
-)
-echo "Policy guard (local): $?"
-```
-
-A trailing `Policy guard (local): 0` is the pass signal. Do not read a clean
-tail of the output as success — several of these guards print nothing when they
-pass, and the earlier failure may be thousands of lines up.
+- **The Policy guard inventory is drift-checked.** `cargo test` runs none of
+  the repo's guard scripts, so a branch can be green locally and still fail
+  `Policy guard`. Recent examples are the documentation ownership guard (#1089)
+  and the CI workflow guard (#1118). The runner's copy of that job,
+  `scripts/dev-verify-policy.json`, is pinned to a SHA-256 of the `policy-guard`
+  job in `ci.yml`. If the job changes, the run fails with
+  `policy inventory drift` instead of silently running a stale list. A PR that
+  changes the job must update the inventory and its digest in the same change.
+- **Read the result, not the tail of the output.** Independent checks keep
+  running after a failure, and several guards print nothing when they pass.
+  Each check ends in a `PASS`, `FAIL` or `SKIP` line. The last line is
+  `Local pr result: <status>`, and only `0` (also the exit status) is a pass.
+  Search the output for `FAIL` before concluding anything; an early failure can
+  be thousands of lines up.
+- **A missing tool is a failure, not a skip.** The runner installs nothing.
+  `cargo-deny`, Node at `.node-version`, Python 3.11+ on `PATH` as `python3`
+  (the Cloud suites need it) and pnpm (for OpenClaw changes) must already be
+  installed. If one is missing, its check fails and the run stays red. Install
+  the tool rather than reading the remaining checks as a pass.
+- **Verify the committed checkout.** The secret scanner reads tracked files and
+  history. It does not read the index or untracked files. Commit, then run
+  `--pr` on the exact head you will publish.
+- **CI remains final merge authority.** Other-OS runners, the Automations
+  bundle artifacts and the release-target matrices are CI-only. The run's
+  summary lists them as unverified. For the host-runnable feature suites, use
+  `--full` (see the contract above).
 
 ### Two guards that only inspect what your branch changed
 
-These take a revision range, and CI passes the PR's base...head. Run them the
-same way — `--staged` is not equivalent, because it misses anything you have
+`--pr` runs the documentation-ownership and privacy guards over its committed
+range, which matches CI's PR base...head. To rerun one alone, pass the same
+range. `--staged` is not equivalent, because it misses anything you have
 already committed:
 
 ```sh
