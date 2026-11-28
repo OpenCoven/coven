@@ -17,6 +17,10 @@
 //! The recorder observes tokens after shell parsing, rather than echoing `%*`
 //! and accidentally treating a split argument as successful forwarding.
 
+#[path = "support/serialized_spawn.rs"]
+mod serialized_spawn;
+use serialized_spawn::SerializedSpawn;
+
 use std::ffi::OsString;
 use std::fs;
 #[cfg(unix)]
@@ -90,7 +94,7 @@ fn write_recording_harness(
                 )
                 .arg("-o")
                 .arg(&binary)
-                .output()?;
+                .output_serialized()?;
             anyhow::ensure!(
                 output.status.success(),
                 "native parity probe compilation failed: {}",
@@ -104,7 +108,9 @@ fn write_recording_harness(
     if name == "coven-code" {
         // Coven resolves the shared claim directory through Git before launch.
         // Proxy only Git, rather than exposing the inherited provider PATH.
-        let output = Command::new("where.exe").arg("git.exe").output()?;
+        let output = Command::new("where.exe")
+            .arg("git.exe")
+            .output_serialized()?;
         anyhow::ensure!(
             output.status.success(),
             "Git is required by the parity fixture"
@@ -200,7 +206,10 @@ fn hermetic_path(bin_dir: &Path) -> OsString {
 
 fn init_git_repo(repo: &Path) -> anyhow::Result<()> {
     let git = |args: &[&str]| -> anyhow::Result<()> {
-        let output = Command::new("git").args(args).current_dir(repo).output()?;
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output_serialized()?;
         anyhow::ensure!(
             output.status.success(),
             "git {args:?} failed: {}",
@@ -263,7 +272,7 @@ impl Fixture {
                 }),
             )
             .current_dir(&self.project)
-            .output()
+            .output_serialized()
             .map_err(Into::into)
     }
 

@@ -1,3 +1,7 @@
+#[path = "support/serialized_spawn.rs"]
+mod serialized_spawn;
+use serialized_spawn::SerializedSpawn;
+
 #[path = "fixtures/daemon_startup_diagnostics.rs"]
 mod daemon_startup_diagnostics;
 
@@ -233,7 +237,7 @@ fn exercise_startup_with(
     let mut daemon = OwnedChild(
         command(&root, &["daemon", "serve"])
             .stderr(File::create(&stderr_path)?)
-            .spawn()?,
+            .spawn_serialized()?,
     );
     after_launch(&home, &mut daemon)?;
     // A harness hang guard, not a startup-performance assertion or a change
@@ -258,7 +262,7 @@ fn exercise_startup_with(
             let mut probe = OwnedChild(
                 command(&root, &["daemon", "status", "--json"])
                     .stdout(File::create(&output)?)
-                    .spawn()?,
+                    .spawn_serialized()?,
             );
             let status = wait_exit(&mut probe, deadline)?;
             let result = read_bounded(&output)?;
@@ -324,7 +328,7 @@ fn a_starting_daemon_removes_the_launch_folder_a_crash_left() -> Result<()> {
         format!("coven-scoped-launch/1\n{digest}\n"),
     )?;
 
-    let _daemon = OwnedChild(command(&root, &["daemon", "serve"]).spawn()?);
+    let _daemon = OwnedChild(command(&root, &["daemon", "serve"]).spawn_serialized()?);
 
     // A harness hang guard, not a startup-performance assertion.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -374,7 +378,7 @@ impl Drop for BackgroundCleanup<'_> {
     fn drop(&mut self) {
         // The normal stop command authenticates the instance in this isolated
         // home; never signal a PID obtained from unauthenticated metadata.
-        if let Ok(child) = command(self.0, &["daemon", "stop"]).spawn() {
+        if let Ok(child) = command(self.0, &["daemon", "stop"]).spawn_serialized() {
             let _ = wait_exit(
                 &mut OwnedChild(child),
                 Instant::now() + Duration::from_secs(30),
@@ -414,7 +418,7 @@ fn exercise_background_failure(action: &str) -> Result<()> {
     let mut launch = OwnedChild(
         command(&root, &["daemon", action])
             .stderr(File::create(&stderr)?)
-            .spawn()?,
+            .spawn_serialized()?,
     );
     let exit = wait_exit(&mut launch, Instant::now() + Duration::from_secs(30))?;
     assert!(!exit.success(), "invalid enabled gateway must fail startup");
@@ -446,13 +450,13 @@ fn exercise_background_failure(action: &str) -> Result<()> {
     // Explicit operator correction, retaining the rejected file for recovery.
     let rejected = mobile.join("gateway.rejected.json");
     fs::rename(&config, &rejected)?;
-    let mut launch = OwnedChild(command(&root, &["daemon", action]).spawn()?);
+    let mut launch = OwnedChild(command(&root, &["daemon", action]).spawn_serialized()?);
     assert!(wait_exit(&mut launch, Instant::now() + Duration::from_secs(30))?.success());
     let output = root.join("status.json");
     let mut probe = OwnedChild(
         command(&root, &["daemon", "status", "--json"])
             .stdout(File::create(&output)?)
-            .spawn()?,
+            .spawn_serialized()?,
     );
     assert!(wait_exit(&mut probe, Instant::now() + Duration::from_secs(30))?.success());
     let status: serde_json::Value = serde_json::from_str(&read_bounded(&output)?)?;
@@ -524,7 +528,7 @@ fn early_errors_and_unwinds_report_only_bounded_startup_checkpoints() -> Result<
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(File::create(&output)?);
-        let mut fixture = OwnedChild(fixture.spawn()?);
+        let mut fixture = OwnedChild(fixture.spawn_serialized()?);
         let status = wait_exit(&mut fixture, Instant::now() + Duration::from_secs(30))?;
         assert!(!status.success(), "injected fixture must still fail");
         let report = read_bounded(&output)?;

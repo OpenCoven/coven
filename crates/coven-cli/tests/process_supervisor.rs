@@ -1,3 +1,7 @@
+#[path = "support/serialized_spawn.rs"]
+mod serialized_spawn;
+use serialized_spawn::SerializedSpawn;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
@@ -28,7 +32,7 @@ fn compile_probe(build_dir: &Path) -> Result<PathBuf> {
         .args(["--edition=2021", "-o"])
         .arg(&executable)
         .arg(source)
-        .output()?;
+        .output_serialized()?;
     anyhow::ensure!(
         output.status.success(),
         "failed compiling process-supervisor probe: {}",
@@ -57,7 +61,7 @@ fn launch_supervisor_with_command(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn_serialized()?;
     let mut stdin = child.stdin.take().context("supervisor stdin")?;
     let request = serde_json::json!({
         "version": 1,
@@ -311,7 +315,7 @@ fn invalid_supervisor_request_fails_before_ready() -> Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn_serialized()?;
     child.stdin.take().unwrap().write_all(b"{}\n")?;
     let output = child.wait_with_output()?;
     assert_eq!(output.status.code(), Some(70));

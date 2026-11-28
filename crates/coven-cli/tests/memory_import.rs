@@ -1,3 +1,7 @@
+#[path = "support/serialized_spawn.rs"]
+mod serialized_spawn;
+use serialized_spawn::SerializedSpawn;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -739,7 +743,7 @@ fn run_coven(coven_home: &Path, args: &[&str]) -> Result<Output> {
     Ok(Command::new(coven_bin())
         .args(args)
         .env("COVEN_HOME", coven_home)
-        .output()?)
+        .output_serialized()?)
 }
 
 fn run_coven_at(coven_home: &Path, current_dir: &Path, args: &[&str]) -> Result<Output> {
@@ -747,7 +751,7 @@ fn run_coven_at(coven_home: &Path, current_dir: &Path, args: &[&str]) -> Result<
         .args(args)
         .env("COVEN_HOME", coven_home)
         .current_dir(current_dir)
-        .output()?)
+        .output_serialized()?)
 }
 
 fn assert_success(output: &Output) {

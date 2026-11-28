@@ -9,6 +9,10 @@
 //! or claude to be installed: we synthesize `system.init` + `user` + `result`
 //! around a session that never actually launches a harness.
 
+#[path = "support/serialized_spawn.rs"]
+mod serialized_spawn;
+use serialized_spawn::SerializedSpawn;
+
 use std::process::{Command, Stdio};
 
 /// Regression test for #307: with a non-claude harness that spews raw PTY
@@ -86,7 +90,8 @@ fn stream_json_stdout_stays_jsonl_when_harness_spews_pty_noise() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)
         .expect("failed to spawn coven binary");
 
     assert!(
@@ -223,7 +228,8 @@ printf '%s\n' '{"type":"turn.completed"}'
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)
         .expect("failed to spawn coven binary");
 
     assert!(
@@ -311,7 +317,8 @@ printf '%s\n' '{"type":"turn.completed"}'
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)
         .expect("failed to spawn resumed coven binary");
     assert!(
         resumed.status.success(),
@@ -369,7 +376,7 @@ printf '%s\n' '{"type":"turn.completed"}'
         .current_dir(&project_root)
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &path)
-        .output()
+        .output_serialized()
         .expect("failed to run unknown-target check");
     assert!(!missing.status.success(), "unknown continuation must fail");
     assert!(
@@ -441,7 +448,8 @@ printf '%s\n' '{"type":"turn.completed"}'
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)
         .expect("failed to spawn coven binary");
     assert!(
         out.status.success(),
@@ -519,7 +527,8 @@ printf '%s\n' '{"type":"turn.completed"}'
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)
         .expect("failed to spawn resumed coven binary");
     assert!(
         resumed.status.success(),
@@ -621,7 +630,8 @@ exit 0
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)
         .expect("failed to spawn coven binary");
 
     assert!(
@@ -689,7 +699,7 @@ fn continuation_selects_and_accepts_only_the_requested_harness() {
         .current_dir(&project_root)
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &path)
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(seed.status.success());
     let conn = rusqlite::Connection::open(coven_home.join("coven.sqlite3")).unwrap();
@@ -713,7 +723,7 @@ fn continuation_selects_and_accepts_only_the_requested_harness() {
         .current_dir(&project_root)
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &path)
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(
         automatic.status.success(),
@@ -740,7 +750,7 @@ fn continuation_selects_and_accepts_only_the_requested_harness() {
         .current_dir(&project_root)
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &path)
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -793,7 +803,7 @@ printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"ty
         .current_dir(&project_root)
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &path)
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(first.status.success());
     let first_frames: Vec<serde_json::Value> = String::from_utf8(first.stdout)
@@ -816,7 +826,7 @@ printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"ty
         .current_dir(&project_root)
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &path)
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(resumed.status.success());
     let frames: Vec<serde_json::Value> = String::from_utf8(resumed.stdout)
@@ -889,7 +899,8 @@ exit 1
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)
         .expect("failed to spawn coven binary");
 
     assert_eq!(
@@ -1025,7 +1036,7 @@ fn native_failure_fixture_with_stderr(
         } else {
             fs::File::create(&stderr_path).unwrap().into()
         })
-        .spawn()
+        .spawn_serialized()
         .unwrap();
     if close_stdout {
         use std::io::BufRead;
@@ -1226,7 +1237,7 @@ fn command_construction_failure_marks_created_row_failed() {
         .current_dir(&project_root)
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &path)
-        .output()
+        .output_serialized()
         .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("model id is unsafe"));
@@ -1292,7 +1303,7 @@ while :; do sleep 1; done
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_serialized()
         .expect("failed to spawn coven binary");
 
     let descendant_path = project_root.join("descendant.pid");
@@ -1365,7 +1376,7 @@ while :; do sleep 1; done
         alive = Command::new("kill")
             .args(["-0", &descendant_pid])
             .stderr(Stdio::null())
-            .status()
+            .status_serialized()
             .map(|status| status.success())
             .unwrap_or(false);
         if !alive {
@@ -1437,7 +1448,7 @@ fn install_official_windows_codex_fixture(root: &std::path::Path) -> std::path::
         .args(["--edition=2021", "-o"])
         .arg(&native)
         .arg(&fixture)
-        .output()
+        .output_serialized()
         .expect("failed to compile native Codex JSON probe");
     assert!(
         compile.status.success(),
@@ -1498,7 +1509,8 @@ description = "Windows Codex regression fixture"
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)
         .expect("failed to spawn coven binary");
 
     assert!(
@@ -1574,7 +1586,8 @@ description = "Windows Codex regression fixture"
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)
         .expect("failed to spawn resumed coven binary");
     assert!(
         second.status.success(),
@@ -1623,7 +1636,8 @@ fn windows_silent_official_codex_emits_terminal_error_and_marks_session_failed()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)
         .expect("failed to spawn coven binary");
 
     assert!(
@@ -1680,7 +1694,9 @@ fn stream_json_emits_init_and_result_for_codex_dry_run() {
         .args(["run", "codex", "--stream-json", "--detach", "ping"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .stdin(Stdio::null())
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)
         .expect("failed to spawn coven binary");
 
     assert!(
@@ -1736,7 +1752,9 @@ fn stream_json_init_echoes_requested_model_verbatim() {
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .stdin(Stdio::null())
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)
         .expect("failed to spawn coven binary");
 
     assert!(

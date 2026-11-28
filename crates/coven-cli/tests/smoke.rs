@@ -1,5 +1,9 @@
 #![cfg(unix)]
 
+#[path = "support/serialized_spawn.rs"]
+mod serialized_spawn;
+use serialized_spawn::SerializedSpawn;
+
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
@@ -16,7 +20,9 @@ use serde_json::{json, Value};
 
 #[test]
 fn claude_write_scope_cli_advertises_a_distinct_contract() -> anyhow::Result<()> {
-    let output = Command::new(coven_bin()).args(["run", "--help"]).output()?;
+    let output = Command::new(coven_bin())
+        .args(["run", "--help"])
+        .output_serialized()?;
     assert!(output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("--write-scope"),
@@ -82,7 +88,7 @@ fn chat_context_admission_cli_fences_refs_detach_stream_and_resume() -> anyhow::
     let initialized = Command::new("git")
         .args(["init", "--quiet"])
         .current_dir(&root)
-        .output()?;
+        .output_serialized()?;
     assert_success("initialize isolated context fixture", &initialized);
     // If reference expansion runs, reading this directory as text fails.
     fs::create_dir(root.join("unselected.md"))?;
@@ -371,7 +377,11 @@ fn daemon_start_does_not_hand_the_callers_descriptors_to_the_daemon() -> anyhow:
             Ok(())
         });
     }
-    let start = command.output()?;
+    let start = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)?;
     assert_success("daemon start while holding pipes on fd 3 and 100", &start);
     wait_for_daemon_health(&coven_home)?;
 
@@ -599,7 +609,7 @@ fn host_resolve_waits_for_a_peer_beyond_one_daemon_response_deadline() -> anyhow
             .args(args)
             .env("COVEN_HOME", &home)
             .env_remove("COVEN_HOST_STATE")
-            .output()
+            .output_serialized()
     };
     assert_success(
         "initialize folder",
@@ -701,7 +711,7 @@ fn host_status_recovers_a_stale_socket_after_daemon_crash() -> anyhow::Result<()
             .args(args)
             .env("COVEN_HOME", &coven_home)
             .env_remove("COVEN_HOST_STATE")
-            .output()
+            .output_serialized()
     };
     assert_success(
         "initial host init",
@@ -978,7 +988,7 @@ fn daemon_stop_kills_piped_tree_stalled_before_runtime_publication() -> anyhow::
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &path)
         .env("COVEN_TEST_PIPED_PREPUBLICATION_BARRIER_DIR", &barrier_dir)
-        .output()?;
+        .output_serialized()?;
     assert_success("daemon start for pre-publication containment", &start);
     wait_for_daemon_health(&coven_home)?;
 
@@ -1043,7 +1053,7 @@ fn stalled_tcp_request_cannot_exhaust_daemon_stop_deadline() -> anyhow::Result<(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
+        .spawn_serialized()?;
     wait_for_daemon_health(&coven_home)?;
 
     let mut stalled = TcpStream::connect(&tcp_addr)?;
@@ -1125,12 +1135,12 @@ fn concurrent_daemon_start_commands_share_one_daemon() -> anyhow::Result<()> {
         .args(["daemon", "start"])
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &path)
-        .spawn()?;
+        .spawn_serialized()?;
     let second = Command::new(&coven)
         .args(["daemon", "start"])
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &path)
-        .spawn()?;
+        .spawn_serialized()?;
 
     let first = first.wait_with_output()?;
     let second = second.wait_with_output()?;
@@ -1174,7 +1184,7 @@ fn daemon_serve_refuses_to_take_over_a_healthy_socket() -> anyhow::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
+        .spawn_serialized()?;
     wait_until("duplicate daemon to exit on its own", || {
         Ok(duplicate.try_wait()?.is_some())
     })?;
@@ -1393,7 +1403,7 @@ fn doctor_json_reports_blocking_failure_when_no_harness_is_available() -> anyhow
         .env_remove("COVEN_ENGINE_BIN")
         .env("PATH", &empty_path)
         .env("HOME", &fake_home)
-        .output()?;
+        .output_serialized()?;
 
     // Same exit contract as prose doctor: blocking problems exit 1.
     assert_failure("doctor --json without harnesses", &output);
@@ -1527,7 +1537,7 @@ fn adapter_doctor_json_reports_each_adapter() -> anyhow::Result<()> {
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &empty_path)
         .env("HOME", &fake_home)
-        .output()?;
+        .output_serialized()?;
     assert_failure("adapter doctor codex --json (missing)", &output);
     let value = parse_stdout_json("adapter doctor codex --json (missing)", &output)?;
     assert_eq!(value["ok"], Value::Bool(false));
@@ -1646,7 +1656,7 @@ fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<(
         .env_remove("COVEN_ENGINE_BIN")
         .env("PATH", &empty_path)
         .env("HOME", &fake_home)
-        .output()?;
+        .output_serialized()?;
 
     // No harness available is a blocking problem: doctor must exit 1 so
     // scripts can gate on it, while still printing the full setup loop.
@@ -2043,7 +2053,10 @@ fn piped_run_output_has_no_eof_control_artifact() -> anyhow::Result<()> {
         .env("PATH", &path)
         .current_dir(&project)
         .stdin(Stdio::null())
-        .output()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn_serialized()
+        .and_then(std::process::Child::wait_with_output)?;
 
     assert_success("piped run", &output);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2587,7 +2600,7 @@ struct ChildGuard {
 impl ChildGuard {
     fn spawn(command: &mut Command) -> anyhow::Result<Self> {
         Ok(Self {
-            child: command.spawn()?,
+            child: command.spawn_serialized()?,
         })
     }
 
@@ -2637,7 +2650,7 @@ fn run_coven(
         .args(args)
         .env("COVEN_HOME", coven_home)
         .env("PATH", path)
-        .output()
+        .output_serialized()
         .map_err(Into::into)
 }
 
@@ -2653,7 +2666,7 @@ fn run_coven_with_engine(
         .env("COVEN_HOME", coven_home)
         .env("COVEN_ENGINE_BIN", engine)
         .env("PATH", path)
-        .output()
+        .output_serialized()
         .map_err(Into::into)
 }
 
@@ -2676,7 +2689,7 @@ fn run_coven_in(
     for (key, value) in envs {
         command.env(key, value);
     }
-    command.output().map_err(Into::into)
+    command.output_serialized().map_err(Into::into)
 }
 
 /// Parse a command's entire stdout as one JSON document. Fails when anything
@@ -2693,7 +2706,10 @@ fn parse_stdout_json(label: &str, output: &Output) -> anyhow::Result<Value> {
 
 fn init_git_repo(repo: &Path) -> anyhow::Result<()> {
     let git = |args: &[&str]| -> anyhow::Result<()> {
-        let output = Command::new("git").args(args).current_dir(repo).output()?;
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output_serialized()?;
         anyhow::ensure!(
             output.status.success(),
             "git {args:?} failed:\n{}",
@@ -2915,7 +2931,7 @@ fn compile_unix_base_daemon_fixture(output: &Path) -> anyhow::Result<()> {
         .args(["--edition=2021", "-o"])
         .arg(output)
         .arg(source)
-        .output()?;
+        .output_serialized()?;
     assert_success("compile BASE daemon fixture", &compile);
     Ok(())
 }
@@ -3119,7 +3135,7 @@ fn pid_is_alive(pid: u32) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .status_serialized()
         .map(|status| status.success())
         .unwrap_or(false)
 }
