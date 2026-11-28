@@ -10,7 +10,7 @@ source_adjacent_reason: "Proposes producer-owned adoption lookup and admission f
 
 **Baseline:** Coven `6b5caaec`, with O2 implemented through #732 and O3 through #753/#754. Read this alongside [O3](./O3_CONTRACT_DESIGN.md), [W1 audit §8](./COVEN_W1_AUDIT.md#8-accepted-gap-dependency-order), [Coven prerequisites](./COVEN_PREREQUISITES.md), and the current [API contract](../../docs/API-CONTRACT.md). The API contract's O4-O8 exclusions remain accurate until a separately approved implementation lands.
 
-**Scope:** O4 only: lookup, explicit unknown/non-adoption proof, authoritative return-or-fence, immutable-binding query, and compatible retention for C-S5, C-S6, C-M6, and C-M7. O8 denial behavior is specified alongside this primitive. This proposal neither defines nor replaces `coven.familiar.identityRebind.v1`.
+**Scope:** O4 only: lookup, explicit unknown/non-adoption proof, authoritative return-or-fence, immutable-binding query, and compatible retention for C-S5, C-S6, C-M6, and C-M7. O8 denial behavior is specified alongside this primitive. This proposal neither defines nor replaces `coven.familiar.identityRebind.v1`. [psyche#12 ADR 1](https://github.com/OpenCoven/psyche/issues/12#issuecomment-7117320214) replaces that action through an explicit old-to-current mapping, kept in [IDENTITY_REBIND_MAPPING.md](./IDENTITY_REBIND_MAPPING.md); O4 supplies evidence for some of its Coven rows once implemented.
 
 ## 1. Purpose and existing boundary
 
@@ -176,7 +176,7 @@ The final evidence packet must retain source SHA, real daemon artifact digest, n
 | 2026-10-20 #1230 matrix obligation | O4 contribution / remaining owner |
 |---|---|
 | Client-intent idempotency/adoption lookup | C-S5 read-only exact lookup and retained non-adoption proof; C-S6 durable admission exclusion. Coven contract/storage owns this proposal; O3 remains delivered replay/conflict substrate. |
-| Pre-existing adoption unknown before rebind | C-S6 returns an existing adoption or excludes an absent one; C-M7 applies the same rules to children. Already adopted execution still needs authoritative containment. No rebind mapping or equivalence is asserted. |
+| Pre-existing adoption unknown before rebind | C-S6 returns an existing adoption or excludes an absent one; C-M7 applies the same rules to children. Already adopted execution still needs authoritative containment. O4 alone asserts no rebind equivalence; its rows in the [ADR 1 mapping](./IDENTITY_REBIND_MAPPING.md) (H6, H9, H19) stay open until #1629 lands with tests. |
 | Termination/stall during adoption and blocked routes | O4 race/crash denials plus C-M6 discovery provide evidence; O5 and O7 must complete cancellation and recovery. Psyche preserves route/lane blocking. |
 | Capability present but denied | O8's O4-specific taxonomy plus the real consumer side-effect/fallback assertions; does not satisfy every authorization/profile denial. |
 
@@ -187,8 +187,8 @@ The final evidence packet must retain source SHA, real daemon artifact digest, n
 | O6 input/output content-addressed artifact/result binding design | Psyche metadata owner and Coven protected-resource owner, coordinated by @BunsDev through #1230 and psyche#12. |
 | O7 crash/restart design across O2–O6 | Coven storage/runtime and Psyche recovery owners after O5/O6 contracts; assignment coordinated by @BunsDev. |
 | O8 complete denial taxonomy | Coven contract owner alongside every primitive; this document proposes only O4 states. Psyche verifies consumer behavior; @BunsDev approves ownership. |
-| Historical `coven.familiar.identityRebind.v1` old-to-current mapping and executable equivalence criteria | @BunsDev on [psyche#12](https://github.com/OpenCoven/psyche/issues/12), with Familiar/Threads/Psyche/Coven owners. Explicitly unresolved; O2–O4 composition is not an approved equivalent. |
-| Recover or explicitly correct historical spec pin `9b07c500ad10a8d509d451d64b9739a1bdc4dc0f` | @BunsDev on psyche#12; original artifact or approved provenance correction required. Current source is a proposal baseline, not a replacement historical pin. |
+| Historical `coven.familiar.identityRebind.v1` old-to-current mapping and executable equivalence criteria | Decided: [psyche#12 ADR 1](https://github.com/OpenCoven/psyche/issues/12#issuecomment-7117320214) replaces it through an explicit old-to-current mapping, recorded in [IDENTITY_REBIND_MAPPING.md](./IDENTITY_REBIND_MAPPING.md). The rows remain open until each has executable evidence; O2–O4 composition is not an equivalent as a whole. No familiar or person authority is added to Coven. |
+| Recover or explicitly correct historical spec pin `9b07c500ad10a8d509d451d64b9739a1bdc4dc0f` | Decided: [psyche#12 ADR 2](https://github.com/OpenCoven/psyche/issues/12#issuecomment-7117320214) records the pin as unrecoverable. The #1230 acceptance text and the 20 October matrix retain each obligation, and every obligation stays open. No replacement SHA is inferred; current source is a proposal baseline, not a replacement historical pin. |
 
 The W1 §8 row is authoritative for the O5 cancellation / O6 artifacts numbering; older summaries that label O5/O6 together as artifacts or attach artifacts to O8 do not change that row. No individual production implementer is assigned by this proposal. #1237 remains gated on the complete #1230 real-daemon packet, and production child dispatch remains gated on G6.
 
