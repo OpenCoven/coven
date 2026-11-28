@@ -22,6 +22,37 @@ use setup::{
     SetupRuntime, SystemClock, SystemExecutableDiscovery, SystemProcessLauncher, TerminalState,
 };
 
+/// Every launch in this binary goes through setup's test-build spawn lock, the
+/// same one `SystemProcessLauncher` and the version probe take, so no test's
+/// half-made pipe leaks into another test's child (coven#1843).
+trait SerializedSpawn {
+    fn spawn_serialized(&mut self) -> io::Result<std::process::Child>;
+    /// `output()` with its defaults (stdin null, stdout and stderr piped),
+    /// spawned under the lock and waited on outside it.
+    fn output_serialized(&mut self) -> io::Result<std::process::Output>;
+    /// `status()` with its default (inherited stdio), spawned under the lock
+    /// and waited on outside it.
+    fn status_serialized(&mut self) -> io::Result<std::process::ExitStatus>;
+}
+
+impl SerializedSpawn for Command {
+    fn spawn_serialized(&mut self) -> io::Result<std::process::Child> {
+        setup::process::spawn_serialized(self)
+    }
+
+    fn output_serialized(&mut self) -> io::Result<std::process::Output> {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_serialized()?
+            .wait_with_output()
+    }
+
+    fn status_serialized(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.spawn_serialized()?.wait()
+    }
+}
+
 fn coven_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_coven"))
 }
@@ -49,7 +80,7 @@ fn write_script(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
         .arg(path)
         .arg(std::ffi::OsStr::from_bytes(contents.as_ref()))
         .stdin(Stdio::null())
-        .status()
+        .status_serialized()
         .with_context(|| format!("spawning the writer for {}", path.display()))?;
     anyhow::ensure!(
         status.success(),
@@ -98,7 +129,7 @@ fn compile_setup_provider_probe(root: &Path) -> Result<PathBuf> {
         .arg("-o")
         .arg(&executable)
         .arg(source)
-        .output()
+        .output_serialized()
         .context("compile setup provider probe")?;
     anyhow::ensure!(
         output.status.success(),
@@ -165,7 +196,7 @@ fn setup_cli_parses_all_selectors_and_verification_modes() -> Result<()> {
     for selector in ["codex", "claude", "copilot", "all"] {
         let output = Command::new(coven_bin())
             .args(["setup", selector, "--help"])
-            .output()?;
+            .output_serialized()?;
         assert!(
             output.status.success(),
             "selector {selector} was rejected:\n{}",
@@ -175,17 +206,17 @@ fn setup_cli_parses_all_selectors_and_verification_modes() -> Result<()> {
 
     let invalid = Command::new(coven_bin())
         .args(["setup", "other"])
-        .output()?;
+        .output_serialized()?;
     assert!(!invalid.status.success());
 
     let conflicting = Command::new(coven_bin())
         .args(["setup", "codex", "--verify", "--verify-only"])
-        .output()?;
+        .output_serialized()?;
     assert!(!conflicting.status.success());
 
     let report_without_verification = Command::new(coven_bin())
         .args(["setup", "codex", "--report-json", "report.json"])
-        .output()?;
+        .output_serialized()?;
     assert!(!report_without_verification.status.success());
     Ok(())
 }
@@ -197,7 +228,7 @@ fn setup_cli_refuses_non_tty_without_waiting_or_launching() -> Result<()> {
         .args(["setup", "codex"])
         .env("COVEN_HOME", temp.path().join("home"))
         .stdin(Stdio::null())
-        .output()?;
+        .output_serialized()?;
 
     assert!(!output.status.success());
     assert_eq!(
@@ -1152,7 +1183,7 @@ fn inherited_terminal_io_stays_separate_from_the_redacted_report() -> Result<()>
         .stdin(Stdio::piped())
         .stdout(fs::File::create(&stdout_path)?)
         .stderr(fs::File::create(&stderr_path)?)
-        .spawn()?;
+        .spawn_serialized()?;
     child
         .stdin
         .as_mut()
@@ -1293,7 +1324,7 @@ fn copilot_fixture_inherits_terminal_streams_and_records_exact_login() -> Result
         .stdin(Stdio::piped())
         .stdout(fs::File::create(&stdout_path)?)
         .stderr(fs::File::create(&stderr_path)?)
-        .spawn()?;
+        .spawn_serialized()?;
     child
         .stdin
         .as_mut()
@@ -1385,7 +1416,7 @@ fn every_provider_inherits_hostile_streams_without_report_leakage() -> Result<()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?;
+            .spawn_serialized()?;
         child
             .stdin
             .as_mut()
@@ -1447,7 +1478,9 @@ fn every_provider_login_and_verify_timeout_reaps_descendants() -> Result<()> {
     }
     let temp = test_tempdir()?;
     let executable = compile_setup_provider_probe(temp.path())?;
-    let warmup = Command::new(&executable).arg("--version").output()?;
+    let warmup = Command::new(&executable)
+        .arg("--version")
+        .output_serialized()?;
     anyhow::ensure!(
         warmup.status.success(),
         "setup provider probe warmup failed:\n{}",
@@ -1473,7 +1506,7 @@ fn every_provider_login_and_verify_timeout_reaps_descendants() -> Result<()> {
                 .env("COVEN_SETUP_PROBE_MODE", "timeout")
                 .env("COVEN_SETUP_PROBE_STATE", &state_path)
                 .stdin(Stdio::null())
-                .output()?;
+                .output_serialized()?;
             assert!(
                 output.status.success(),
                 "{} {action} timeout helper failed\nstdout:\n{}\nstderr:\n{}",
@@ -1621,7 +1654,7 @@ fn verify_ephemeral_state_reaches_provider_then_is_removed() -> Result<()> {
         .stdin(Stdio::null())
         .stdout(fs::File::create(&stdout_path)?)
         .stderr(fs::File::create(&stderr_path)?)
-        .status()?;
+        .status_serialized()?;
     assert!(
         status.success(),
         "verification helper failed with {status}\nstdout:\n{}\nstderr:\n{}",

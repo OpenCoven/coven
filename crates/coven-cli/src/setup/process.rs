@@ -3,10 +3,34 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
+#[cfg(test)]
+use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Serializes process creation in test builds (coven#1843).
+///
+/// On macOS, std makes each pipe with `pipe()` and sets close-on-exec in a
+/// second call, and `posix_spawn` runs without `POSIX_SPAWN_CLOEXEC_DEFAULT`.
+/// A spawn on another test thread can land between the two calls and inherit
+/// that pipe end. A leaked write end delays the owner's EOF until the
+/// inheriting process exits. `tests/setup_cli.rs` compiles this module into
+/// its binary and routes its own launches through [`spawn_serialized`], so
+/// setup's launches and the test's launches share one lock. Release builds
+/// spawn directly.
+#[cfg(test)]
+static TEST_SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+/// `command.spawn()`, holding the test-build spawn lock across the call only.
+pub(crate) fn spawn_serialized(command: &mut Command) -> io::Result<Child> {
+    #[cfg(test)]
+    let _spawning = TEST_SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    command.spawn()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchRequest {
@@ -318,7 +342,7 @@ fn spawn_managed(command: &mut Command) -> io::Result<SystemRunningProcess> {
         command.creation_flags(CREATE_SUSPENDED);
     }
 
-    let child = command.spawn()?;
+    let child = spawn_serialized(command)?;
 
     #[cfg(windows)]
     let (child, job) = {
